@@ -189,14 +189,14 @@ function Invoke-GenSSL {
     $sslDir = Join-Path $ConfigsDir "ssl"
     New-Item -ItemType Directory -Path $sslDir -Force | Out-Null
 
-    $altNames = "DNS.1 = localhost`nDNS.2 = coder.local`nIP.1  = 127.0.0.1`n"
+    $altNames = "DNS.1 = localhost`nDNS.2 = coder.local`nDNS.3 = host.docker.internal`nIP.1  = 127.0.0.1`n"
     $cnName   = "localhost"
     if ($ServerHost) {
         $cnName = $ServerHost
         if ($ServerHost -match '^\d+\.\d+\.\d+\.\d+$') {
             $altNames += "IP.2  = $ServerHost`n"
         } else {
-            $altNames += "DNS.3 = $ServerHost`n"
+            $altNames += "DNS.4 = $ServerHost`n"
         }
         Write-Info "  SAN includes server address: $ServerHost"
     }
@@ -293,7 +293,7 @@ function Invoke-GenSSL {
     } else {
         Write-Warn "openssl not found (install Git for Windows to get openssl)."
         Write-Warn "Falling back to PowerShell New-SelfSignedCertificate..."
-        $dnsNames = @("localhost", "coder.local")
+        $dnsNames = @("localhost", "coder.local", "host.docker.internal")
         if ($ServerHost -and ($ServerHost -notmatch '^\d')) { $dnsNames += $ServerHost }
         $cert = New-SelfSignedCertificate `
             -DnsName $dnsNames `

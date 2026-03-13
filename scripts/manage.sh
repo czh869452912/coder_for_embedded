@@ -222,6 +222,7 @@ gen_ssl() {
     local alt_names
     alt_names="DNS.1 = localhost
 DNS.2 = coder.local
+DNS.3 = host.docker.internal
 IP.1  = 127.0.0.1"
 
     if [ -n "$server_host" ]; then
@@ -230,7 +231,7 @@ IP.1  = 127.0.0.1"
 IP.2  = ${server_host}"
         else
             alt_names="${alt_names}
-DNS.3 = ${server_host}"
+DNS.4 = ${server_host}"
         fi
         echo -e "${BLUE}  SAN 包含服务器地址: $server_host${NC}"
     fi

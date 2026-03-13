@@ -141,6 +141,8 @@ bash scripts/manage.sh up
 | `ANTHROPIC_API_KEY` | Claude Code API key (shared across all workspaces) |
 | `ANTHROPIC_BASE_URL` | Internal LLM proxy URL (optional) |
 
+When `SERVER_HOST=localhost`, the workspace container still downloads the Coder agent from `https://host.docker.internal:8443`, so the generated TLS certificate must also include `host.docker.internal` in its SAN list.
+
 ### Claude Code API options
 
 | Option | Use case | Config |
@@ -231,6 +233,8 @@ coder_production/
 - The SSL cert must be baked into the workspace image *after* running `ssl <IP>`
 - Re-run `build` after generating/changing the SSL cert
 - Verify build output contains "Coder server SSL cert trusted"
+- If the workspace log shows `curl: (60)` and `no alternative certificate subject name matches target host name 'host.docker.internal'`, regenerate the cert with the updated `ssl` command and rebuild the workspace image
+- After updating the cert/image, restart the affected workspace so it retries the agent download with the corrected certificate
 
 **Terraform provider not found**
 - Connected environment: providers download automatically (internet fallback is enabled)
