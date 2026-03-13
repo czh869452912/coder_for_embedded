@@ -1,0 +1,44 @@
+# Docker 构建上下文忽略文件
+# 减少构建上下文大小，加快 docker build 速度
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# 文档（保留 README）
+*.md
+!README.md
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 日志
+logs/
+*.log
+
+# 镜像包（大文件，不需要进构建上下文）
+images/
+*.tar
+
+# 环境配置（不包含在镜像中，运行时通过 -e 传入）
+docker/.env
+docker/.setup-done
+docker/.env.*
+
+# workspace-template（Terraform 文件，不需要进镜像）
+workspace-template/
+
+# Python
+__pycache__/
+*.pyc
+
+# 注意：configs/ssl/ 不在忽略列表中
+# Dockerfile.workspace 需要 configs/ssl/server.crt 以便信任自签名证书

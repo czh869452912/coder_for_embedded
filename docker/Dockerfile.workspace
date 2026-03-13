@@ -1,0 +1,312 @@
+# ============================================================
+# Coder Workspace 镜像
+# 基于 agentic_web_dev 的嵌入式开发环境改造而来：
+#   - 保留完整嵌入式工具链（ARM GNU、Clang、OpenOCD、QEMU 等）
+#   - 保留 Claude Code CLI + VS Code 扩展
+#   - 移除 nginx/filebrowser（由 Coder 平台层管理）
+#   - 无 ENTRYPOINT（由 Coder init_script 接管启动）
+#   - code-server 使用 --auth none（Coder 负责认证）
+#
+# 构建上下文：项目根目录（docker build -f docker/Dockerfile.workspace .）
+# ============================================================
+
+FROM codercom/code-server:latest
+
+USER root
+
+# ============================================================
+# 切换到阿里云镜像（解决中国大陆网络问题，兼容 Ubuntu/Debian）
+# 内网构建时可注释此段，使用内网 apt 源
+# ============================================================
+RUN if [ -f /etc/apt/sources.list ] && grep -q "ubuntu" /etc/apt/sources.list 2>/dev/null; then \
+        sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list && \
+        sed -i 's|http://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list; \
+    elif [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' /etc/apt/sources.list.d/debian.sources && \
+        sed -i 's|http://security.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list.d/debian.sources; \
+    elif [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' /etc/apt/sources.list && \
+        sed -i 's|http://security.debian.org|http://mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list; \
+    fi
+
+# ============================================================
+# apt 网络超时与重试配置
+# ============================================================
+RUN printf 'Acquire::http::Timeout "120";\nAcquire::https::Timeout "120";\nAcquire::Retries "5";\n' \
+    > /etc/apt/apt.conf.d/99network-resilience
+
+# ============================================================
+# 系统依赖 + 嵌入式开发基础工具
+# ============================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    wget \
+    git \
+    git-lfs \
+    vim \
+    nano \
+    htop \
+    tree \
+    jq \
+    unzip \
+    zip \
+    build-essential \
+    gdb \
+    gdb-multiarch \
+    cmake \
+    ninja-build \
+    clang \
+    clang-format \
+    clang-tidy \
+    clang-tools \
+    clangd \
+    llvm \
+    cppcheck \
+    valgrind \
+    lcov \
+    doxygen \
+    graphviz \
+    gcc-arm-linux-gnueabihf \
+    g++-arm-linux-gnueabihf \
+    gcc-aarch64-linux-gnu \
+    g++-aarch64-linux-gnu \
+    python3 \
+    python3-pip \
+    python3-venv \
+    openocd \
+    stlink-tools \
+    libftdi1-dev \
+    libhidapi-dev \
+    libusb-1.0-0-dev \
+    qemu-user-static \
+    qemu-system-arm \
+    qemu-system-misc \
+    binfmt-support \
+    check \
+    libcmocka-dev \
+    libcunit1-dev \
+    libgtest-dev \
+    splint \
+    iwyu \
+    scons \
+    ruby \
+    ruby-dev \
+    pandoc \
+    plantuml \
+    default-jre-headless \
+    && rm -rf /var/lib/apt/lists/*
+
+# ============================================================
+# Google Test — 从源码编译安装
+# ============================================================
+RUN cd /usr/src/googletest \
+    && cmake . \
+    && make \
+    && make install
+
+# ============================================================
+# Python 工具
+# ============================================================
+RUN pip3 install --no-cache-dir --break-system-packages \
+    gcovr \
+    pyserial \
+    pyelftools \
+    meson \
+    autopep8 \
+    doorstop \
+    pyocd \
+    esptool \
+    pyusb \
+    pycparser \
+    cffi \
+    conan \
+    sphinx \
+    sphinx-rtd-theme \
+    breathe \
+    exhale
+
+# ============================================================
+# ARM bare-metal 工具链（arm-none-eabi）
+# 离线构建：将 arm-gnu-toolchain tar 包放到 build-artifacts/ 目录
+# 并替换以下 wget 行为：COPY build-artifacts/arm-gnu-toolchain-*.tar.xz /tmp/arm-toolchain.tar.xz
+# ============================================================
+ENV ARM_GCC_VERSION=13.2.rel1
+RUN mkdir -p /opt/toolchains \
+    && wget -q --timeout=300 \
+       "https://developer.arm.com/-/media/Files/downloads/gnu/${ARM_GCC_VERSION}/binrel/arm-gnu-toolchain-${ARM_GCC_VERSION}-x86_64-arm-none-eabi.tar.xz" \
+       -O /tmp/arm-toolchain.tar.xz \
+    && tar -xf /tmp/arm-toolchain.tar.xz -C /opt/toolchains \
+    && mv /opt/toolchains/arm-gnu-toolchain-*-x86_64-arm-none-eabi /opt/toolchains/arm-none-eabi \
+    && rm /tmp/arm-toolchain.tar.xz
+
+ENV PATH="/opt/toolchains/arm-none-eabi/bin:${PATH}"
+
+# ============================================================
+# Node.js + Claude Code CLI
+# 离线构建：将 nodesource 安装替换为内网 apt 源或预下载的 .deb 包
+# ============================================================
+ENV NODE_MAJOR=20
+RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @anthropic-ai/claude-code
+
+# opencode AI 编码助手 CLI（可选）
+RUN npm install -g opencode-ai \
+    || echo "[WARN] opencode install failed, skipping"
+
+# ============================================================
+# Ceedling 嵌入式 C 测试框架（包含 Unity, CMock, CException）
+# ============================================================
+RUN gem install ceedling \
+    || echo "[WARN] ceedling install failed, skipping"
+
+# ============================================================
+# VS Code 扩展（安装到 seed 目录，不被 volume 覆盖）
+# workspace-startup.sh 启动时自动合并到实际 extensions 目录
+# ============================================================
+ENV CODE_SERVER_EXTENSIONS_SEED=/opt/code-server-extensions-seed
+
+RUN mkdir -p ${CODE_SERVER_EXTENSIONS_SEED}
+
+# clangd C/C++ support
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension llvm-vs-code-extensions.vscode-clangd \
+    || echo "[WARN] vscode-clangd not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension marus25.cortex-debug \
+    || echo "[WARN] cortex-debug not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension dan-c-underwood.arm \
+    || echo "[WARN] arm extension not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension zixuanwang.linkerscript \
+    || echo "[WARN] linkerscript extension not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension jbenden.c-cpp-flylint \
+    || echo "[WARN] c-cpp-flylint not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension xaver.clang-format \
+    || echo "[WARN] clang-format extension not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension notskm.clang-tidy \
+    || echo "[WARN] clang-tidy extension not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension cschlosser.doxdocgen \
+    || echo "[WARN] doxdocgen not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension ms-vscode.cmake-tools \
+    || echo "[WARN] cmake-tools not available on Open VSX, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension twxs.cmake \
+    || echo "[WARN] twxs.cmake not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension eamodio.gitlens \
+    || echo "[WARN] gitlens not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension mhutchie.git-graph \
+    || echo "[WARN] git-graph not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension pkief.material-icon-theme \
+    || echo "[WARN] material-icon-theme not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension streetsidesoftware.code-spell-checker \
+    || echo "[WARN] code-spell-checker not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension usernamehw.errorlens \
+    || echo "[WARN] errorlens not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension christian-kohler.path-intellisense \
+    || echo "[WARN] path-intellisense not available, skipping"
+
+# Claude Code 官方扩展
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension anthropic.claude-code \
+    || echo "[INFO] Claude Code extension not in marketplace, use VSIX instead"
+
+# Cline 备选
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension saoudrizwan.claude-dev \
+    || echo "[INFO] Cline not available, skipping"
+
+# Roo Code AI 助手
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension RooVeterinaryInc.roo-cline \
+    || echo "[WARN] Roo Code not available, skipping"
+
+# 测试覆盖率
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension ryanluker.vscode-coverage-gutters \
+    || echo "[WARN] coverage-gutters not available, skipping"
+
+# PlantUML 图表
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension jebbs.plantuml \
+    || echo "[WARN] plantuml not available, skipping"
+
+# Markdown Mermaid 图表
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension bierner.markdown-mermaid \
+    || echo "[WARN] markdown-mermaid not available, skipping"
+
+# Markdown All in One
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension yzhang.markdown-all-in-one \
+    || echo "[WARN] markdown-all-in-one not available, skipping"
+
+# TODO Tree
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension Gruntfuggly.todo-tree \
+    || echo "[WARN] todo-tree not available, skipping"
+
+# ============================================================
+# 离线 VSIX 安装（将 .vsix 文件放到 configs/vsix/ 目录）
+# 适用于 Open VSX 没有的扩展（如 ms-vscode.cpptools、anthropic.claude-code 等）
+# ============================================================
+RUN mkdir -p /tmp/vsix
+COPY configs/vsix/ /tmp/vsix/
+RUN if ls /tmp/vsix/*.vsix 1>/dev/null 2>&1; then \
+        for vsix in /tmp/vsix/*.vsix; do \
+            echo "Installing: $vsix" && \
+            code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension "$vsix" || echo "Failed: $vsix"; \
+        done; \
+    else \
+        echo "[INFO] No VSIX files, skipping offline install"; \
+    fi
+
+# ============================================================
+# 可选：信任 Coder 服务器的自签名证书
+# 将 configs/ssl/server.crt 的内容加入系统信任存储
+# 这样 workspace 容器中的 curl（用于下载 coder agent）能正常验证服务器证书
+# 前提：先运行 manage.sh ssl，再运行 manage.sh build
+# ============================================================
+RUN mkdir -p /usr/local/share/ca-certificates
+COPY configs/ssl/ /tmp/ssl-certs/
+RUN if [ -f /tmp/ssl-certs/server.crt ]; then \
+        cp /tmp/ssl-certs/server.crt /usr/local/share/ca-certificates/coder-server.crt && \
+        update-ca-certificates 2>/dev/null && \
+        echo "[INFO] Coder server SSL cert trusted in workspace image"; \
+    else \
+        echo "[INFO] No SSL cert found (run 'manage.sh ssl' before 'manage.sh build')"; \
+    fi && \
+    rm -rf /tmp/ssl-certs
+
+# ============================================================
+# VS Code 工作区默认设置
+# ============================================================
+COPY --chown=coder:coder configs/settings.json /home/coder/.local/share/code-server/User/settings.json
+
+# ============================================================
+# 嵌入式工具别名（写入系统级 profile，容器以 root 运行时也会加载）
+# ============================================================
+RUN printf '# ==== Embedded Dev Environment ====\n\
+export PATH="/opt/toolchains/arm-none-eabi/bin:$PATH"\n\
+alias arm-gcc="arm-none-eabi-gcc"\n\
+alias arm-objdump="arm-none-eabi-objdump"\n\
+alias arm-size="arm-none-eabi-size"\n\
+alias cf="clang-format"\n\
+alias ct="clang-tidy"\n\
+alias cppc="cppcheck --enable=all --suppress=missingIncludeSystem"\n\
+alias cov="gcovr -r . --html --html-details -o coverage.html"\n\
+alias sp="splint -weak"\n\
+alias iwyu="include-what-you-use"\n\
+alias scan="scan-build --use-cc=gcc"\n\
+alias ds="doorstop"\n\
+alias ceed="ceedling"\n\
+alias qemu-arm="qemu-arm-static"\n\
+alias flash-openocd="openocd"\n\
+alias flash-pyocd="pyocd"\n\
+alias esp-flash="esptool.py"\n\
+alias sphinx-init="sphinx-quickstart"\n' \
+    > /etc/profile.d/embedded-dev.sh \
+    && cat /etc/profile.d/embedded-dev.sh >> /etc/bash.bashrc
+
+# ============================================================
+# workspace 启动脚本（由 Coder agent startup_script 调用）
+# 负责：配置 Claude Code + 合并扩展 seed + 启动 code-server
+# ============================================================
+COPY scripts/workspace-startup.sh /opt/workspace-startup.sh
+RUN sed -i 's/\r$//' /opt/workspace-startup.sh && chmod +x /opt/workspace-startup.sh
+
+ENV SHELL=/bin/bash
+WORKDIR /home/coder
+
+# 无 ENTRYPOINT：由 Coder 的 init_script 接管容器入口
+# init_script 下载 coder agent 并启动，agent 再执行 startup_script

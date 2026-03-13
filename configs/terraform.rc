@@ -1,0 +1,36 @@
+# ============================================================
+# Terraform CLI 配置 - Provider 安装策略
+#
+# 此文件挂载到 Coder 容器的 /home/coder/.terraformrc
+# 通过环境变量 TF_CLI_CONFIG_FILE=/home/coder/.terraformrc 生效
+# （该变量已在 coder/provisioner/terraform/provision.go 中加入白名单，
+#   会透传到 terraform 子进程）
+#
+# 策略：filesystem_mirror 优先，internet 兜底
+#   - 若 /opt/terraform-providers 中存在对应版本 zip → 使用本地缓存（离线可用）
+#   - 若本地缓存没有对应版本 → 自动回退到 registry.terraform.io 在线下载
+#
+# 完全离线部署时，运行 scripts/prepare-offline.ps1 / prepare-offline.sh
+# 预先下载 provider zip 到 configs/terraform-providers/，目录结构：
+#   registry.terraform.io/
+#   ├── coder/coder/<VERSION>/linux_amd64/
+#   │   └── terraform-provider-coder_<VERSION>_linux_amd64.zip
+#   └── kreuzwerker/docker/<VERSION>/linux_amd64/
+#       └── terraform-provider-docker_<VERSION>_linux_amd64.zip
+# ============================================================
+
+provider_installation {
+  # 优先从本地文件系统镜像加载 provider（离线模式）
+  # 有 zip 文件时使用本地缓存，无 zip 时自动回退到 direct 块
+  filesystem_mirror {
+    path    = "/opt/terraform-providers"
+    include = [
+      "registry.terraform.io/coder/coder",
+      "registry.terraform.io/kreuzwerker/docker"
+    ]
+  }
+
+  # 兜底：filesystem_mirror 中不存在所需版本时，从互联网下载
+  # 完全离线环境中需要预先填充 /opt/terraform-providers
+  direct {}
+}
