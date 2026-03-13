@@ -1,8 +1,4 @@
-# ============================================================
-# Coder Production Platform Management Script (Windows PowerShell)
-# Usage: .\scripts\manage.ps1 <command> [arg] [-Llm]
-# ============================================================
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 
 param(
     [Parameter(Position=0)]
@@ -15,483 +11,394 @@ param(
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# ---- Paths ----
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
 $DockerDir   = Join-Path $ProjectRoot "docker"
 $ConfigsDir  = Join-Path $ProjectRoot "configs"
 $EnvFile     = Join-Path $DockerDir ".env"
 $SetupDone   = Join-Path $DockerDir ".setup-done"
-
 $script:UseLlm = $Llm.IsPresent
 
-# ---- Color output ----
-function Write-Info { param($msg) Write-Host "[INFO]  $msg" -ForegroundColor Cyan }
-function Write-OK   { param($msg) Write-Host "[ OK ]  $msg" -ForegroundColor Green }
-function Write-Warn { param($msg) Write-Host "[WARN]  $msg" -ForegroundColor Yellow }
-function Write-Fail { param($msg) Write-Host "[FAIL]  $msg" -ForegroundColor Red }
+. (Join-Path $ScriptDir "lib\offline-common.ps1")
 
-# ---- Docker check ----
+function Write-Info { param([string]$Message) Write-Host "[INFO]  $Message" -ForegroundColor Cyan }
+function Write-OK   { param([string]$Message) Write-Host "[ OK ]  $Message" -ForegroundColor Green }
+function Write-Warn { param([string]$Message) Write-Host "[WARN]  $Message" -ForegroundColor Yellow }
+function Write-Fail { param([string]$Message) Write-Host "[FAIL]  $Message" -ForegroundColor Red }
+
 function Assert-Docker {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
         Write-Fail "docker not found. Please install Docker Desktop."
         exit 1
     }
-    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    docker info 2>&1 | Out-Null
-    $e = $LASTEXITCODE
-    $ErrorActionPreference = $eap
-    if ($e -ne 0) { Write-Fail "Docker daemon is not running. Please start Docker Desktop."; exit 1 }
 
-    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    docker info 2>&1 | Out-Null
+    $dockerExit = $LASTEXITCODE
     docker compose version 2>&1 | Out-Null
-    $e2 = $LASTEXITCODE
+    $composeExit = $LASTEXITCODE
     $ErrorActionPreference = $eap
-    if ($e2 -ne 0) { Write-Fail "docker compose not available. Please upgrade Docker Desktop."; exit 1 }
+
+    if ($dockerExit -ne 0) {
+        Write-Fail "Docker daemon is not running."
+        exit 1
+    }
+    if ($composeExit -ne 0) {
+        Write-Fail "docker compose is not available."
+        exit 1
+    }
 }
 
-# ---- Initialize directories ----
 function Initialize-Dirs {
-    foreach ($d in @(
-        (Join-Path $DockerDir ""),
+    foreach ($path in @(
+        $DockerDir,
         (Join-Path $ConfigsDir "ssl"),
         (Join-Path $ConfigsDir "terraform-providers"),
         (Join-Path $ConfigsDir "vsix"),
         (Join-Path $ProjectRoot "images"),
         (Join-Path $ProjectRoot "logs\nginx")
     )) {
-        New-Item -ItemType Directory -Path $d -Force | Out-Null
+        New-Item -ItemType Directory -Path $path -Force | Out-Null
     }
 }
 
-# ---- Read .env file into hashtable ----
-function Read-EnvFile {
-    $h = @{}
-    if (-not (Test-Path $EnvFile)) { return $h }
-    Get-Content $EnvFile | ForEach-Object {
-        $line = $_.Trim()
-        if ($line -and -not $line.StartsWith('#') -and $line -match '^([^=]+)=(.*)$') {
-            $h[$matches[1].Trim()] = $matches[2].Trim()
-        }
+function Get-Config {
+    if (Test-Path $EnvFile) {
+        Ensure-EnvDefaults -EnvFile $EnvFile -ConfigsDir $ConfigsDir
     }
-    return $h
+    return Get-EffectiveConfig -ConfigsDir $ConfigsDir -EnvFile $EnvFile
 }
 
-# ---- Generate random hex string ----
 function New-RandomHex {
     param([int]$Bytes = 16)
-    $arr = [byte[]]::new($Bytes)
-    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($arr)
-    return ($arr | ForEach-Object { '{0:x2}' -f $_ }) -join ''
+    $buffer = [byte[]]::new($Bytes)
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($buffer)
+    return ($buffer | ForEach-Object { '{0:x2}' -f $_ }) -join ''
 }
 
-# ============================================================
-# init: Create docker/.env config file
-# ============================================================
-function Invoke-Init {
-    Write-Info "Initializing Coder platform configuration..."
-    if (Test-Path $EnvFile) {
-        $ans = Read-Host "docker\.env already exists. Overwrite? (y/N)"
-        if ($ans -notmatch '^[Yy]$') { Write-OK "Keeping existing config."; return }
-    }
-
-    $pgPassword = New-RandomHex -Bytes 16
-
-    $serverHost = Read-Host "Server IP or hostname [localhost]"
-    if (-not $serverHost) { $serverHost = "localhost" }
-
-    $gatewayPort = Read-Host "Gateway port [8443]"
-    if (-not $gatewayPort) { $gatewayPort = "8443" }
-
-    $adminEmail = Read-Host "Coder admin email [admin@company.local]"
-    if (-not $adminEmail) { $adminEmail = "admin@company.local" }
-
-    $adminUsername = Read-Host "Coder admin username [admin]"
-    if (-not $adminUsername) { $adminUsername = "admin" }
-
-    $adminPasswordSec = Read-Host "Coder admin password (min 8 chars)" -AsSecureString
-    $adminPasswordPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
-        [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($adminPasswordSec))
-    if ($adminPasswordPlain.Length -lt 8) {
-        $adminPasswordPlain = "Coder@$(Get-Date -Format 'yyyy')"
-        Write-Warn "Password too short. Auto-generated: $adminPasswordPlain"
-    }
-
-    $anthropicKey = Read-Host "Anthropic API Key (leave blank to skip)"
-    $anthropicUrl = Read-Host "Anthropic Base URL for internal proxy (leave blank to skip)"
-
-    $lines = @(
-        "# ============================================================",
-        "# Coder Production Platform Configuration",
-        "# Generated by manage.ps1 init",
-        "# ============================================================",
-        "",
-        "# ---- Network ----",
-        "SERVER_HOST=$serverHost",
-        "GATEWAY_PORT=$gatewayPort",
-        "",
-        "# ---- Coder image versions ----",
-        "CODER_IMAGE=ghcr.io/coder/coder",
-        "CODER_VERSION=latest",
-        "WORKSPACE_IMAGE=workspace-embedded",
-        "WORKSPACE_IMAGE_TAG=latest",
-        "",
-        "# ---- Database (auto-generated password) ----",
-        "POSTGRES_PASSWORD=$pgPassword",
-        "",
-        "# ---- Coder admin account (created on first start) ----",
-        "CODER_ADMIN_EMAIL=$adminEmail",
-        "CODER_ADMIN_USERNAME=$adminUsername",
-        "CODER_ADMIN_PASSWORD=$adminPasswordPlain",
-        "",
-        "# ---- Claude Code API ----",
-        "# Option A: Official API  -> set ANTHROPIC_API_KEY, leave ANTHROPIC_BASE_URL blank",
-        "# Option B: Internal proxy-> set both (proxy must implement Anthropic /v1/messages)",
-        "# Option C: LiteLLM      -> .\manage.ps1 up -Llm, ANTHROPIC_BASE_URL=https://<IP>:8443/llm",
-        "# Option D: Manual login -> leave blank, run 'claude' inside workspace",
-        "ANTHROPIC_API_KEY=$anthropicKey",
-        "ANTHROPIC_BASE_URL=$anthropicUrl",
-        "",
-        "# ---- LiteLLM AI gateway (optional, enabled with -Llm flag) ----",
-        "LITELLM_MASTER_KEY=sk-devenv",
-        "INTERNAL_API_BASE=http://10.0.0.1:8000",
-        "INTERNAL_API_KEY=your-internal-api-key",
-        "",
-        "# ---- Internal ports ----",
-        "CODER_INTERNAL_PORT=7080"
-    )
-
-    $content = $lines -join "`r`n"
-    [System.IO.File]::WriteAllText($EnvFile, $content, [System.Text.Encoding]::UTF8)
-    Write-OK "Config file created: $EnvFile"
-    Write-Warn "Please review and modify $EnvFile as needed."
-
-    $ans2 = Read-Host "Also create LiteLLM config? (y/N)"
-    if ($ans2 -match '^[Yy]$') {
-        $llmExample = Join-Path $ConfigsDir "litellm_config.yaml.example"
-        $llmConfig  = Join-Path $ConfigsDir "litellm_config.yaml"
-        if ((Test-Path $llmExample) -and (-not (Test-Path $llmConfig))) {
-            Copy-Item $llmExample $llmConfig
-            Write-OK "LiteLLM config created: $llmConfig"
-            Write-Warn "Edit this file to fill in your internal API address and model name."
-        } elseif (Test-Path $llmConfig) {
-            Write-Warn "LiteLLM config already exists: $llmConfig"
-        }
-    }
+function Get-WorkspaceImageRef {
+    $cfg = Get-Config
+    $image = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
+    $tag = if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
+    return "${image}:${tag}"
 }
 
-# ============================================================
-# ssl: Generate self-signed SSL certificate
-# ============================================================
-function Invoke-GenSSL {
-    param([string]$ServerHost = "")
-    Write-Info "Generating self-signed SSL certificate (with SAN)..."
-    $sslDir = Join-Path $ConfigsDir "ssl"
-    New-Item -ItemType Directory -Path $sslDir -Force | Out-Null
-
-    $altNames = "DNS.1 = localhost`nDNS.2 = coder.local`nDNS.3 = host.docker.internal`nIP.1  = 127.0.0.1`n"
-    $cnName   = "localhost"
-    if ($ServerHost) {
-        $cnName = $ServerHost
-        if ($ServerHost -match '^\d+\.\d+\.\d+\.\d+$') {
-            $altNames += "IP.2  = $ServerHost`n"
-        } else {
-            $altNames += "DNS.4 = $ServerHost`n"
-        }
-        Write-Info "  SAN includes server address: $ServerHost"
-    }
-
-    # Find openssl (bundled with Git for Windows)
-    $opensslCmd = $null
-    foreach ($candidate in @(
-        "openssl",
-        "C:\Program Files\Git\usr\bin\openssl.exe",
-        "C:\Program Files (x86)\Git\usr\bin\openssl.exe"
-    )) {
-        if (Get-Command $candidate -ErrorAction SilentlyContinue) {
-            $opensslCmd = $candidate; break
-        }
-    }
-
-    if ($opensslCmd) {
-        $confLines = @(
-            "[req]",
-            "default_bits       = 2048",
-            "prompt             = no",
-            "default_md         = sha256",
-            "distinguished_name = dn",
-            "x509_extensions    = v3_req",
-            "",
-            "[dn]",
-            "C  = CN",
-            "ST = Beijing",
-            "L  = Beijing",
-            "O  = Coder Platform",
-            "CN = $cnName",
-            "",
-            "[v3_req]",
-            "subjectAltName      = @alt_names",
-            "keyUsage            = critical, digitalSignature, keyEncipherment",
-            "extendedKeyUsage    = serverAuth",
-            "basicConstraints    = CA:FALSE",
-            "",
-            "[alt_names]",
-            $altNames
-        )
-        $opensslConf = $confLines -join "`n"
-
-        $confPath = Join-Path $sslDir "openssl.cnf"
-        [System.IO.File]::WriteAllText($confPath, $opensslConf, [System.Text.Encoding]::ASCII)
-
-        $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        & $opensslCmd req -x509 -newkey rsa:2048 -sha256 -days 825 -nodes `
-            -keyout "$sslDir\server.key" `
-            -out    "$sslDir\server.crt" `
-            -config $confPath 2>&1 | Out-Null
-        $exitCode = $LASTEXITCODE
-        $ErrorActionPreference = $eap
-        Remove-Item $confPath -ErrorAction SilentlyContinue
-
-        if ($exitCode -ne 0) {
-            # Retry with output visible for debugging
-            Write-Warn "Retrying openssl with output..."
-            & $opensslCmd req -x509 -newkey rsa:2048 -sha256 -days 825 -nodes `
-                -keyout "$sslDir\server.key" `
-                -out    "$sslDir\server.crt" `
-                -config (Join-Path $sslDir "openssl.cnf")
-            [System.IO.File]::WriteAllText((Join-Path $sslDir "openssl.cnf"), $opensslConf, [System.Text.Encoding]::ASCII)
-            & $opensslCmd req -x509 -newkey rsa:2048 -sha256 -days 825 -nodes `
-                -keyout "$sslDir\server.key" `
-                -out    "$sslDir\server.crt" `
-                -config (Join-Path $sslDir "openssl.cnf")
-            $exitCode = $LASTEXITCODE
-            Remove-Item (Join-Path $sslDir "openssl.cnf") -ErrorAction SilentlyContinue
-            if ($exitCode -ne 0) { Write-Fail "openssl certificate generation failed (exit $exitCode)"; exit 1 }
-        }
-        Write-OK "SSL certificate generated: $sslDir\"
-        Write-Warn "Run 'build' to bake this cert into the workspace image."
-
-        # Import to Windows Trusted Root store
-        Write-Info "Importing certificate to Windows Trusted Root store (requires admin)..."
-        try {
-            $certObj = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-                (Resolve-Path "$sslDir\server.crt").Path
-            )
-            $store = New-Object System.Security.Cryptography.X509Certificates.X509Store(
-                [System.Security.Cryptography.X509Certificates.StoreName]::Root,
-                [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine
-            )
-            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-            $store.Add($certObj)
-            $store.Close()
-            Write-OK "Certificate imported to Trusted Root -- browser will not show warnings."
-        } catch {
-            Write-Warn "Failed to import to Trusted Root: $($_.Exception.Message)"
-            Write-Warn "Run as Administrator or manually import $sslDir\server.crt"
-            Write-Warn "  -> Certificate Manager -> Trusted Root Certification Authorities -> Certificates"
-        }
-    } else {
-        Write-Warn "openssl not found (install Git for Windows to get openssl)."
-        Write-Warn "Falling back to PowerShell New-SelfSignedCertificate..."
-        $dnsNames = @("localhost", "coder.local", "host.docker.internal")
-        if ($ServerHost -and ($ServerHost -notmatch '^\d')) { $dnsNames += $ServerHost }
-        $cert = New-SelfSignedCertificate `
-            -DnsName $dnsNames `
-            -CertStoreLocation "Cert:\LocalMachine\My" `
-            -NotAfter (Get-Date).AddYears(1) `
-            -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
-            -KeyUsage DigitalSignature, KeyEncipherment `
-            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.1")
-        $pfxPath = Join-Path $sslDir "server.pfx"
-        $pfxPwd  = ConvertTo-SecureString "coder" -AsPlainText -Force
-        Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $pfxPwd | Out-Null
-        Write-Warn "Generated PFX: $pfxPath"
-        Write-Warn "Install Git for Windows then re-run 'ssl' to get PEM format (required by Docker/nginx)."
-    }
+function Get-LlmGatewayUrl {
+    param([hashtable]$Config)
+    $serverHost = if ($Config['SERVER_HOST']) { $Config['SERVER_HOST'] } else { 'localhost' }
+    $gatewayPort = if ($Config['GATEWAY_PORT']) { $Config['GATEWAY_PORT'] } else { '8443' }
+    $llmHost = if ($serverHost -in @('localhost', '127.0.0.1')) { 'host.docker.internal' } else { $serverHost }
+    return "https://${llmHost}:${gatewayPort}/llm"
 }
 
-# ============================================================
-# pull: Pull platform base images (requires internet)
-# ============================================================
-function Invoke-Pull {
-    Assert-Docker
-    $env      = Read-EnvFile
-    $coderImg = if ($env["CODER_IMAGE"])       { $env["CODER_IMAGE"] }       else { "ghcr.io/coder/coder" }
-    $coderVer = if ($env["CODER_VERSION"])     { $env["CODER_VERSION"] }     else { "latest" }
-    $pgVer    = if ($env["POSTGRES_VERSION"]) { $env["POSTGRES_VERSION"] } else { "16" }
+function Assert-LlmConfig {
+    if (-not $script:UseLlm) { return }
 
-    Write-Info "Pulling platform base images..."
-    foreach ($img in @("${coderImg}:${coderVer}", "postgres:${pgVer}-alpine", "nginx:alpine")) {
-        Write-Info "  Pulling $img"
-        docker pull $img
-        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to pull: $img"; exit 1 }
-    }
-    if ($script:UseLlm) {
-        Write-Info "  Pulling ghcr.io/berriai/litellm:main-latest"
-        docker pull ghcr.io/berriai/litellm:main-latest
-    }
-    Write-OK "Base images pulled."
-    Write-Warn "Workspace image must be built separately: .\manage.ps1 build"
-}
-
-# ============================================================
-# build: Build workspace Docker image
-# ============================================================
-function Invoke-Build {
-    Assert-Docker
-    $env     = Read-EnvFile
-    $imgName = if ($env["WORKSPACE_IMAGE"])     { $env["WORKSPACE_IMAGE"] }     else { "workspace-embedded" }
-    $imgTag  = if ($env["WORKSPACE_IMAGE_TAG"]) { $env["WORKSPACE_IMAGE_TAG"] } else { "latest" }
-
-    $sslCrt = Join-Path $ConfigsDir "ssl\server.crt"
-    if (-not (Test-Path $sslCrt)) {
-        Write-Warn "SSL cert not found. Auto-generating for localhost..."
-        Invoke-GenSSL
-        Write-Warn "For production: run '.\manage.ps1 ssl <SERVER_IP>' before 'build'."
-    }
-
-    Write-Info "Building workspace image: ${imgName}:${imgTag}"
-    Write-Info "Note: Full embedded toolchain build may take 20-40 minutes..."
-    docker build `
-        -f "$DockerDir\Dockerfile.workspace" `
-        -t "${imgName}:${imgTag}" `
-        $ProjectRoot
-    if ($LASTEXITCODE -ne 0) { Write-Fail "Workspace image build failed."; exit 1 }
-    Write-OK "Workspace image built: ${imgName}:${imgTag}"
-}
-
-# ============================================================
-# save: Export images to images\ directory
-# ============================================================
-function Invoke-Save {
-    Assert-Docker
-    $env    = Read-EnvFile
-    $imgDir = Join-Path $ProjectRoot "images"
-    New-Item -ItemType Directory -Path $imgDir -Force | Out-Null
-
-    $coderImg = if ($env["CODER_IMAGE"])         { $env["CODER_IMAGE"] }         else { "ghcr.io/coder/coder" }
-    $coderVer = if ($env["CODER_VERSION"])        { $env["CODER_VERSION"] }        else { "latest" }
-    $pgVer    = if ($env["POSTGRES_VERSION"])     { $env["POSTGRES_VERSION"] }     else { "16" }
-    $wsImg    = if ($env["WORKSPACE_IMAGE"])      { $env["WORKSPACE_IMAGE"] }      else { "workspace-embedded" }
-    $wsTag    = if ($env["WORKSPACE_IMAGE_TAG"]) { $env["WORKSPACE_IMAGE_TAG"] } else { "latest" }
-
-    $images = [System.Collections.Generic.List[string]]@(
-        "${coderImg}:${coderVer}",
-        "postgres:${pgVer}-alpine",
-        "nginx:alpine",
-        "${wsImg}:${wsTag}"
-    )
-    if ($script:UseLlm) { $images.Add("ghcr.io/berriai/litellm:main-latest") }
-
-    foreach ($img in $images) {
-        $fname = ($img -replace "[:/]", "_") + ".tar"
-        $fpath = Join-Path $imgDir $fname
-        Write-Info "  Saving $img -> $fname (no progress bar, please wait)..."
-        docker save $img -o $fpath
-        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to save: $img"; exit 1 }
-        $sizeMB = [math]::Round((Get-Item $fpath).Length / 1MB)
-        Write-OK "  Saved ${sizeMB} MB"
-    }
-    Write-OK "All images saved to images\"
-}
-
-# ============================================================
-# load: Load images from images\ directory
-# ============================================================
-function Invoke-Load {
-    Assert-Docker
-    $imgDir = Join-Path $ProjectRoot "images"
-    if (-not (Test-Path $imgDir)) { Write-Fail "images\ directory not found."; exit 1 }
-    $tarFiles = Get-ChildItem "$imgDir\*.tar" -ErrorAction SilentlyContinue
-    if ($tarFiles.Count -eq 0) {
-        Write-Fail "No .tar files in images\. Run 'save' or 'prepare-offline' first."
+    $cfg = Get-Config
+    $configPath = Join-Path $ConfigsDir 'litellm_config.yaml'
+    if (-not (Test-Path $configPath)) {
+        Write-Fail "LiteLLM is enabled but configs\litellm_config.yaml is missing."
         exit 1
     }
-    foreach ($f in $tarFiles) {
-        $sizeMB = [math]::Round($f.Length / 1MB)
-        Write-Info "  Loading $($f.Name) (${sizeMB} MB)..."
-        docker load -i $f.FullName
-        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to load: $($f.Name)"; exit 1 }
+    if (-not $cfg['INTERNAL_API_BASE']) {
+        Write-Fail "INTERNAL_API_BASE is not configured."
+        exit 1
     }
-    Write-OK "Images loaded."
+    if (-not $cfg['INTERNAL_API_KEY']) {
+        Write-Fail "INTERNAL_API_KEY is not configured."
+        exit 1
+    }
+
+    $configText = Get-Content $configPath -Raw
+    if ($configText -match 'YOUR_INTERNAL_MODEL') {
+        Write-Fail "LiteLLM config still contains YOUR_INTERNAL_MODEL placeholders."
+        exit 1
+    }
 }
 
-# ============================================================
-# up: Start the platform
-# ============================================================
+function Invoke-Init {
+    Write-Info "Initializing docker/.env ..."
+    if (Test-Path $EnvFile) {
+        $answer = Read-Host "docker/.env already exists. Overwrite? (y/N)"
+        if ($answer -notmatch '^[Yy]$') {
+            Write-OK "Keeping existing docker/.env"
+            return
+        }
+    }
+
+    $postgresPassword = New-RandomHex -Bytes 16
+    $serverHost = Read-Host 'Server IP or hostname [localhost]'
+    if (-not $serverHost) { $serverHost = 'localhost' }
+
+    $gatewayPort = Read-Host 'Gateway port [8443]'
+    if (-not $gatewayPort) { $gatewayPort = '8443' }
+
+    $adminEmail = Read-Host 'Coder admin email [admin@company.local]'
+    if (-not $adminEmail) { $adminEmail = 'admin@company.local' }
+
+    $adminUsername = Read-Host 'Coder admin username [admin]'
+    if (-not $adminUsername) { $adminUsername = 'admin' }
+
+    $adminPasswordSec = Read-Host 'Coder admin password (min 8 chars)' -AsSecureString
+    $adminPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($adminPasswordSec)
+    )
+    if ($adminPassword.Length -lt 8) {
+        $adminPassword = "Coder@$(Get-Date -Format 'yyyy')"
+        Write-Warn "Password too short. Auto-generated: $adminPassword"
+    }
+
+    $anthropicKey = Read-Host 'Anthropic API key (blank to skip)'
+    $anthropicUrl = Read-Host 'Anthropic base URL (blank to skip)'
+
+    $lines = @(
+        '# Mutable environment for this deployment.',
+        '',
+        '# ---- Network ----',
+        "SERVER_HOST=$serverHost",
+        "GATEWAY_PORT=$gatewayPort",
+        '',
+        '# ---- Database ----',
+        "POSTGRES_PASSWORD=$postgresPassword",
+        '',
+        '# ---- Coder admin ----',
+        "CODER_ADMIN_EMAIL=$adminEmail",
+        "CODER_ADMIN_USERNAME=$adminUsername",
+        "CODER_ADMIN_PASSWORD=$adminPassword",
+        '',
+        '# ---- Claude / Anthropic settings ----',
+        "ANTHROPIC_API_KEY=$anthropicKey",
+        "ANTHROPIC_BASE_URL=$anthropicUrl",
+        '',
+        '# ---- LiteLLM gateway ----',
+        'LITELLM_MASTER_KEY=sk-devenv',
+        'INTERNAL_API_BASE=http://10.0.0.1:8000',
+        'INTERNAL_API_KEY=your-internal-api-key',
+        '',
+        '# ---- Internal ports ----',
+        'CODER_INTERNAL_PORT=7080'
+    )
+
+    [System.IO.File]::WriteAllText($EnvFile, ($lines -join "`r`n") + "`r`n", [System.Text.UTF8Encoding]::new($false))
+    Ensure-EnvDefaults -EnvFile $EnvFile -ConfigsDir $ConfigsDir
+    Write-OK "Created $EnvFile"
+
+    $createLlmConfig = Read-Host 'Also create configs/litellm_config.yaml? (y/N)'
+    if ($createLlmConfig -match '^[Yy]$') {
+        $examplePath = Join-Path $ConfigsDir 'litellm_config.yaml.example'
+        $configPath = Join-Path $ConfigsDir 'litellm_config.yaml'
+        if ((Test-Path $examplePath) -and (-not (Test-Path $configPath))) {
+            Copy-Item $examplePath $configPath
+            Write-OK "Created $configPath"
+        } elseif (Test-Path $configPath) {
+            Write-Warn "LiteLLM config already exists: $configPath"
+        }
+    }
+}
+
+function Invoke-GenSSL {
+    param([string]$ServerHost = '')
+
+    $sslDir = Join-Path $ConfigsDir 'ssl'
+    $resolvedHost = if ($ServerHost) { $ServerHost } else { 'localhost' }
+    Write-Info "Issuing TLS leaf certificate for $resolvedHost"
+    $result = Issue-LeafCertificate -SslDir $sslDir -ServerHost $resolvedHost
+    Write-OK "Certificates written to $sslDir"
+
+    if (Import-RootCAToWindows -CaCert $result.CaCert) {
+        Write-OK 'Imported root CA into Windows Trusted Root store.'
+    } else {
+        Write-Warn "Could not import root CA automatically. Import $($result.CaCert) manually if you want the browser to trust it."
+    }
+
+    if ($result.CaCreated) {
+        Write-Warn 'A new root CA was created. Rebuild the workspace image once so containers trust it.'
+    } else {
+        Write-Info 'Root CA already existed. Rotating only the leaf certificate does not require rebuilding the workspace image.'
+    }
+}
+
+function Invoke-Pull {
+    Assert-Docker
+    $cfg = Get-Config
+
+    $images = [System.Collections.Generic.List[string]]@(
+        $cfg['CODER_IMAGE_REF'],
+        $cfg['POSTGRES_IMAGE_REF'],
+        $cfg['NGINX_IMAGE_REF'],
+        $cfg['CODE_SERVER_BASE_IMAGE_REF']
+    )
+    if ($script:UseLlm) {
+        $images.Add($cfg['LITELLM_IMAGE_REF'])
+    }
+
+    foreach ($image in $images) {
+        Write-Info "Pulling $image"
+        docker pull $image
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail "Failed to pull $image"
+            exit 1
+        }
+    }
+
+    Write-OK 'Base images pulled.'
+    Write-Warn 'Run build to produce the workspace image used by the template.'
+}
+
+function Invoke-Build {
+    Assert-Docker
+    Initialize-Dirs
+    $cfg = Get-Config
+
+    $sslDir = Join-Path $ConfigsDir 'ssl'
+    $ca = Ensure-RootCA -SslDir $sslDir
+    if ($ca.Created) {
+        Write-Warn 'Created a new root CA for workspace trust.'
+    }
+
+    $image = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
+    $tag = if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
+    $codeServerBase = $cfg['CODE_SERVER_BASE_IMAGE_REF']
+
+    Write-Info "Building ${image}:${tag}"
+    docker build `
+        -f "$DockerDir\Dockerfile.workspace" `
+        --build-arg "CODE_SERVER_BASE_IMAGE_REF=$codeServerBase" `
+        -t "${image}:${tag}" `
+        $ProjectRoot
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail 'Workspace image build failed.'
+        exit 1
+    }
+
+    Write-OK "Built ${image}:${tag}"
+}
+
+function Invoke-Save {
+    Assert-Docker
+    $cfg = Get-Config
+    $imagesDir = Join-Path $ProjectRoot 'images'
+    New-Item -ItemType Directory -Path $imagesDir -Force | Out-Null
+
+    $workspaceImage = Get-WorkspaceImageRef
+    $images = [System.Collections.Generic.List[string]]@(
+        $cfg['CODER_IMAGE_REF'],
+        $cfg['POSTGRES_IMAGE_REF'],
+        $cfg['NGINX_IMAGE_REF'],
+        $workspaceImage
+    )
+    if ($script:UseLlm) {
+        $images.Add($cfg['LITELLM_IMAGE_REF'])
+    }
+
+    foreach ($image in $images) {
+        $fileName = ($image -replace '[:/@]', '_') + '.tar'
+        $filePath = Join-Path $imagesDir $fileName
+        Write-Info "Saving $image -> $fileName"
+        docker save $image -o $filePath
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail "Failed to save $image"
+            exit 1
+        }
+        $sizeMb = [math]::Round((Get-Item $filePath).Length / 1MB)
+        Write-OK "Saved ${sizeMb} MB"
+    }
+}
+
+function Invoke-Load {
+    Assert-Docker
+    $imagesDir = Join-Path $ProjectRoot 'images'
+    if (-not (Test-Path $imagesDir)) {
+        Write-Fail 'images directory not found.'
+        exit 1
+    }
+
+    $tarFiles = Get-ChildItem "$imagesDir\*.tar" -ErrorAction SilentlyContinue
+    if (-not $tarFiles) {
+        Write-Fail 'No image tarballs found in images.'
+        exit 1
+    }
+
+    foreach ($tarFile in $tarFiles) {
+        $sizeMb = [math]::Round($tarFile.Length / 1MB)
+        Write-Info "Loading $($tarFile.Name) (${sizeMb} MB)"
+        docker load -i $tarFile.FullName
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail "Failed to load $($tarFile.Name)"
+            exit 1
+        }
+    }
+
+    Write-OK 'Images loaded.'
+}
+
 function Invoke-Up {
     Assert-Docker
     Initialize-Dirs
 
     if (-not (Test-Path $EnvFile)) {
-        Write-Fail "docker\.env not found. Run: .\manage.ps1 init"
+        Write-Fail 'docker/.env not found. Run init first.'
         exit 1
     }
-    $env = Read-EnvFile
 
-    # Auto-generate SSL cert if missing
-    $sslCrt = Join-Path $ConfigsDir "ssl\server.crt"
-    if (-not (Test-Path $sslCrt)) {
-        Write-Warn "SSL cert not found. Auto-generating..."
-        $sh = if ($env["SERVER_HOST"]) { $env["SERVER_HOST"] } else { "localhost" }
-        Invoke-GenSSL -ServerHost $sh
+    $cfg = Get-Config
+    $sslDir = Join-Path $ConfigsDir 'ssl'
+    if (-not (Test-Path (Join-Path $sslDir 'server.crt'))) {
+        Write-Warn 'TLS leaf certificate not found. Generating one now.'
+        Invoke-GenSSL -ServerHost $cfg['SERVER_HOST']
     }
 
-    # Check workspace image
-    $wsImg = if ($env["WORKSPACE_IMAGE"])     { $env["WORKSPACE_IMAGE"] }     else { "workspace-embedded" }
-    $wsTag = if ($env["WORKSPACE_IMAGE_TAG"]) { $env["WORKSPACE_IMAGE_TAG"] } else { "latest" }
-    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    docker image inspect "${wsImg}:${wsTag}" 2>&1 | Out-Null
-    $imgExists = $LASTEXITCODE
+    if ($script:UseLlm) {
+        Assert-LlmConfig
+    }
+
+    $workspaceImage = Get-WorkspaceImageRef
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    docker image inspect $workspaceImage 2>&1 | Out-Null
+    $imageExists = $LASTEXITCODE
     $ErrorActionPreference = $eap
-    if ($imgExists -ne 0) {
-        Write-Warn "Workspace image not found. Auto-building..."
+    if ($imageExists -ne 0) {
+        Write-Warn "Workspace image $workspaceImage not found. Building it now."
         Invoke-Build
     }
 
-    # Warn if Terraform providers are missing
-    $tfProviders = Join-Path $ConfigsDir "terraform-providers\registry.terraform.io"
-    if (-not (Test-Path $tfProviders)) {
-        Write-Warn "Terraform provider cache not found (configs\terraform-providers\)."
-        Write-Warn "Run prepare-offline.ps1 on an internet-connected machine, or ensure Coder can reach registry.terraform.io."
+    $providerRoot = Join-Path $ConfigsDir 'terraform-providers\registry.terraform.io'
+    if (-not (Test-Path $providerRoot)) {
+        Write-Warn 'Offline Terraform provider cache not found. Connected mode may still work, but air-gapped deployment will not.'
     }
 
-    $logsDir = Join-Path $ProjectRoot "logs\nginx"
-    New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
-
-    $composeArgs = if ($script:UseLlm) { @("--profile", "llm", "up", "-d") } else { @("up", "-d") }
+    $composeArgs = if ($script:UseLlm) { @('--profile', 'llm', 'up', '-d') } else { @('up', '-d') }
     Push-Location $DockerDir
     docker compose @composeArgs
-    if ($LASTEXITCODE -ne 0) { Pop-Location; Write-Fail "docker compose up failed."; exit 1 }
+    $composeExit = $LASTEXITCODE
     Pop-Location
-    Write-OK "Platform started."
+    if ($composeExit -ne 0) {
+        Write-Fail 'docker compose up failed.'
+        exit 1
+    }
+
+    Write-OK 'Platform started.'
 
     if (-not (Test-Path $SetupDone)) {
-        Write-Host ""
-        Write-Warn "First-time startup detected. Initializing Coder (30-60 seconds)..."
+        Write-Warn 'First startup detected. Running setup-coder after a short delay.'
         Start-Sleep -Seconds 8
         Invoke-SetupCoder
     } else {
-        Write-Host ""
         Show-AccessInfo
     }
 }
 
-# ============================================================
-# down: Stop the platform
-# ============================================================
 function Invoke-Down {
     Assert-Docker
-    $composeArgs = if ($script:UseLlm) { @("--profile", "llm", "down") } else { @("down") }
+    $composeArgs = if ($script:UseLlm) { @('--profile', 'llm', 'down') } else { @('down') }
     Push-Location $DockerDir
     docker compose @composeArgs
     Pop-Location
-    Write-OK "Platform stopped."
+    Write-OK 'Platform stopped.'
 }
 
-# ============================================================
-# status: Show service status
-# ============================================================
 function Invoke-Status {
     Assert-Docker
     Push-Location $DockerDir
@@ -499,9 +406,6 @@ function Invoke-Status {
     Pop-Location
 }
 
-# ============================================================
-# logs: Show logs
-# ============================================================
 function Invoke-Logs {
     Assert-Docker
     Push-Location $DockerDir
@@ -513,14 +417,10 @@ function Invoke-Logs {
     Pop-Location
 }
 
-# ============================================================
-# shell: Enter container shell
-# ============================================================
 function Invoke-Shell {
     Assert-Docker
     if (-not $Arg1) {
-        Write-Fail "Specify a service name. Example: .\manage.ps1 shell coder"
-        Write-Host "Available services: gateway, coder, postgres, llm-gateway"
+        Write-Fail 'Specify a service name. Example: .\scripts\manage.ps1 shell coder'
         exit 1
     }
     Push-Location $DockerDir
@@ -528,261 +428,249 @@ function Invoke-Shell {
     Pop-Location
 }
 
-# ============================================================
-# setup-coder: First-time init (create admin + push template)
-# ============================================================
 function Invoke-SetupCoder {
-    if (-not (Test-Path $EnvFile)) { Write-Fail "Run 'init' first."; exit 1 }
-    $env = Read-EnvFile
+    if (-not (Test-Path $EnvFile)) {
+        Write-Fail 'Run init first.'
+        exit 1
+    }
 
-    $internalPort = if ($env["CODER_INTERNAL_PORT"]) { $env["CODER_INTERNAL_PORT"] } else { "7080" }
-    $baseUrl      = "http://localhost:$internalPort"
-    $adminEmail   = if ($env["CODER_ADMIN_EMAIL"])    { $env["CODER_ADMIN_EMAIL"] }    else { "admin@company.local" }
-    $adminUser    = if ($env["CODER_ADMIN_USERNAME"]) { $env["CODER_ADMIN_USERNAME"] } else { "admin" }
-    $adminPwd     = if ($env["CODER_ADMIN_PASSWORD"]) { $env["CODER_ADMIN_PASSWORD"] } else { "" }
-    $serverHost   = if ($env["SERVER_HOST"])          { $env["SERVER_HOST"] }          else { "localhost" }
-    $gwPort       = if ($env["GATEWAY_PORT"])         { $env["GATEWAY_PORT"] }         else { "8443" }
-    $wsImg        = if ($env["WORKSPACE_IMAGE"])      { $env["WORKSPACE_IMAGE"] }      else { "workspace-embedded" }
-    $wsTag        = if ($env["WORKSPACE_IMAGE_TAG"]) { $env["WORKSPACE_IMAGE_TAG"] } else { "latest" }
-    $anthropicKey = if ($env["ANTHROPIC_API_KEY"])    { $env["ANTHROPIC_API_KEY"] }    else { "" }
-    $anthropicUrl = if ($env["ANTHROPIC_BASE_URL"])   { $env["ANTHROPIC_BASE_URL"] }   else { "" }
+    $cfg = Get-Config
+    $internalPort = if ($cfg['CODER_INTERNAL_PORT']) { $cfg['CODER_INTERNAL_PORT'] } else { '7080' }
+    $baseUrl = "http://localhost:$internalPort"
+    $adminEmail = if ($cfg['CODER_ADMIN_EMAIL']) { $cfg['CODER_ADMIN_EMAIL'] } else { 'admin@company.local' }
+    $adminUsername = if ($cfg['CODER_ADMIN_USERNAME']) { $cfg['CODER_ADMIN_USERNAME'] } else { 'admin' }
+    $adminPassword = if ($cfg['CODER_ADMIN_PASSWORD']) { $cfg['CODER_ADMIN_PASSWORD'] } else { '' }
+    $workspaceImageName = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
+    $workspaceImageTag = if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
+    $anthropicKey = if ($cfg['ANTHROPIC_API_KEY']) { $cfg['ANTHROPIC_API_KEY'] } else { '' }
+    $anthropicUrl = if ($cfg['ANTHROPIC_BASE_URL']) { $cfg['ANTHROPIC_BASE_URL'] } else { '' }
 
-    # 1. Wait for Coder to be ready
-    Write-Info "Waiting for Coder service to be ready..."
+    if ($script:UseLlm) {
+        Assert-LlmConfig
+        if (-not $anthropicKey -and $cfg['LITELLM_MASTER_KEY']) {
+            $anthropicKey = $cfg['LITELLM_MASTER_KEY']
+        }
+        if (-not $anthropicUrl) {
+            $anthropicUrl = Get-LlmGatewayUrl -Config $cfg
+        }
+    }
+
+    Write-Info 'Waiting for Coder health endpoint...'
     $ready = $false
-    for ($i = 1; $i -le 60; $i++) {
-        $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    for ($i = 0; $i -lt 60; $i++) {
         try {
-            $r = Invoke-WebRequest -Uri "$baseUrl/healthz" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
-            if ($r.StatusCode -eq 200) { $ready = $true; break }
-        } catch { }
-        $ErrorActionPreference = $eap
-        Write-Host "." -NoNewline
+            $response = Invoke-WebRequest -Uri "$baseUrl/healthz" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+            if ($response.StatusCode -eq 200) {
+                $ready = $true
+                break
+            }
+        } catch {}
         Start-Sleep -Seconds 3
     }
-    Write-Host ""
-    if (-not $ready) { Write-Fail "Coder did not become ready within 180 seconds."; exit 1 }
-    Write-OK "Coder is ready."
+    if (-not $ready) {
+        Write-Fail 'Coder did not become ready within 180 seconds.'
+        exit 1
+    }
+    Write-OK 'Coder is ready.'
 
-    # 2. Create first admin if not yet created
-    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     try {
-        $chk = Invoke-WebRequest -Uri "$baseUrl/api/v2/users/first" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-        $firstUserStatus = $chk.StatusCode
+        $firstUserResponse = Invoke-WebRequest -Uri "$baseUrl/api/v2/users/first" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        $firstUserStatus = $firstUserResponse.StatusCode
     } catch {
         $firstUserStatus = $_.Exception.Response.StatusCode.Value__
     }
-    $ErrorActionPreference = $eap
 
     if ($firstUserStatus -eq 404) {
-        Write-Info "Creating admin account: $adminEmail"
-        $body = '{"email":"' + $adminEmail + '","username":"' + $adminUser + '","password":"' + $adminPwd + '","trial":false}'
-        $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        try {
-            Invoke-RestMethod -Uri "$baseUrl/api/v2/users/first" -Method POST `
-                -ContentType "application/json" -Body $body -ErrorAction Stop | Out-Null
-            Write-OK "Admin account created."
-        } catch {
-            Write-Fail "Failed to create admin account: $_"; exit 1
-        }
-        $ErrorActionPreference = $eap
+        Write-Info "Creating admin account $adminEmail"
+        $body = '{"email":"' + $adminEmail + '","username":"' + $adminUsername + '","password":"' + $adminPassword + '","trial":false}'
+        Invoke-RestMethod -Uri "$baseUrl/api/v2/users/first" -Method POST -ContentType 'application/json' -Body $body | Out-Null
+        Write-OK 'Admin account created.'
     } else {
-        Write-Info "Admin account already exists. Skipping creation."
+        Write-Info 'Admin account already exists.'
     }
 
-    # 3. Login to get session token
-    $loginBody = '{"email":"' + $adminEmail + '","password":"' + $adminPwd + '"}'
-    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try {
-        $loginResp = Invoke-RestMethod -Uri "$baseUrl/api/v2/users/login" -Method POST `
-            -ContentType "application/json" -Body $loginBody -ErrorAction Stop
-        $sessionToken = $loginResp.session_token
-    } catch {
-        Write-Fail "Login failed: $_"; exit 1
+    $loginBody = '{"email":"' + $adminEmail + '","password":"' + $adminPassword + '"}'
+    $loginResponse = Invoke-RestMethod -Uri "$baseUrl/api/v2/users/login" -Method POST -ContentType 'application/json' -Body $loginBody
+    $sessionToken = $loginResponse.session_token
+    if (-not $sessionToken) {
+        Write-Fail 'Failed to get Coder session token.'
+        exit 1
     }
-    $ErrorActionPreference = $eap
 
-    if (-not $sessionToken) { Write-Fail "Failed to get session token."; exit 1 }
-    Write-OK "Logged in. Session token obtained."
-
-    # 4. Check if template already exists
-    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     try {
-        $tmplChk = Invoke-WebRequest -Uri "$baseUrl/api/v2/organizations/default/templates/embedded-dev" `
-            -Headers @{ "Coder-Session-Token" = $sessionToken } -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-        $templateExists = ($tmplChk.StatusCode -eq 200)
+        $templateResponse = Invoke-WebRequest -Uri "$baseUrl/api/v2/organizations/default/templates/embedded-dev" -Headers @{ 'Coder-Session-Token' = $sessionToken } -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        $templateExists = ($templateResponse.StatusCode -eq 200)
     } catch {
         $templateExists = $false
     }
-    $ErrorActionPreference = $eap
 
     if ($templateExists) {
-        Write-Warn "Template 'embedded-dev' already exists. Skipping push."
-        Write-Warn "To update: .\manage.ps1 setup-coder  (after deleting docker\.setup-done)"
+        Write-Warn "Template 'embedded-dev' already exists."
     } else {
-        # 5. Copy template directory into container via docker cp, then push with coder CLI
-        Write-Info "Pushing workspace template..."
-        $tmplDir = Join-Path $ProjectRoot "workspace-template"
-
-        # Ensure clean destination
-        $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $templateDir = Join-Path $ProjectRoot 'workspace-template'
+        Write-Info 'Pushing workspace template...'
         docker exec coder-server sh -c "rm -rf /tmp/template-push && mkdir -p /tmp/template-push" | Out-Null
-        $ErrorActionPreference = $eap
+        docker cp "$templateDir/." "coder-server:/tmp/template-push/"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail 'Failed to copy template into coder-server.'
+            exit 1
+        }
 
-        # docker cp handles Windows paths natively (no tar needed)
-        docker cp "$tmplDir/." "coder-server:/tmp/template-push/"
-        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to copy template to container."; exit 1 }
+        $pushCommand = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$sessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key=$anthropicKey --var anthropic_base_url=$anthropicUrl ; rm -rf /tmp/template-push"
+        docker exec coder-server sh -c $pushCommand
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail 'Template push failed.'
+            exit 1
+        }
+        Write-OK 'Workspace template pushed.'
+    }
 
-        $pushCmd = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$sessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$wsImg --var workspace_image_tag=$wsTag --var anthropic_api_key=$anthropicKey --var anthropic_base_url=$anthropicUrl ; rm -rf /tmp/template-push"
+    Get-Date | Set-Content $SetupDone
+    Show-AccessInfo
+}
 
-        $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        docker exec coder-server sh -c $pushCmd
-        $pushExit = $LASTEXITCODE
-        $ErrorActionPreference = $eap
+function Show-AccessInfo {
+    $cfg = Get-Config
+    $serverHost = if ($cfg['SERVER_HOST']) { $cfg['SERVER_HOST'] } else { 'localhost' }
+    $gatewayPort = if ($cfg['GATEWAY_PORT']) { $cfg['GATEWAY_PORT'] } else { '8443' }
 
-        if ($pushExit -eq 0) {
-            Write-OK "Workspace template pushed successfully."
+    Write-Host "Access URLs:" -ForegroundColor Cyan
+    Write-Host "  Admin Dashboard: https://${serverHost}:${gatewayPort}/" -ForegroundColor White
+    Write-Host "  User IDE:        https://${serverHost}:${gatewayPort}/@<username>/<workspace>.main/apps/code-server" -ForegroundColor White
+    if ($script:UseLlm) {
+        Write-Host "  LiteLLM:         https://${serverHost}:${gatewayPort}/llm/" -ForegroundColor White
+    }
+}
+
+function Invoke-TestApi {
+    if (-not (Test-Path $EnvFile)) {
+        Write-Fail 'Run init first.'
+        exit 1
+    }
+
+    $cfg = Get-Config
+    $apiKey = if ($cfg['ANTHROPIC_API_KEY']) { $cfg['ANTHROPIC_API_KEY'] } else { '' }
+    $apiBaseUrl = if ($cfg['ANTHROPIC_BASE_URL']) { $cfg['ANTHROPIC_BASE_URL'] } else { '' }
+
+    if ($script:UseLlm -and -not $apiBaseUrl) {
+        $apiBaseUrl = Get-LlmGatewayUrl -Config $cfg
+        if (-not $apiKey -and $cfg['LITELLM_MASTER_KEY']) {
+            $apiKey = $cfg['LITELLM_MASTER_KEY']
+        }
+    }
+    if (-not $apiBaseUrl) {
+        $apiBaseUrl = 'https://api.anthropic.com'
+    }
+    if (-not $apiKey) {
+        Write-Fail 'ANTHROPIC_API_KEY is not configured.'
+        exit 1
+    }
+
+    $body = '{"model":"claude-haiku-4-5-20251001","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
+    Write-Info "Testing $apiBaseUrl"
+    try {
+        Invoke-RestMethod -Uri "$apiBaseUrl/v1/messages" -Method POST `
+            -Headers @{ 'x-api-key' = $apiKey; 'anthropic-version' = '2023-06-01' } `
+            -ContentType 'application/json' -Body $body -TimeoutSec 15 | Out-Null
+        Write-OK 'API request succeeded.'
+    } catch {
+        if ($_.Exception.Response) {
+            $status = $_.Exception.Response.StatusCode.Value__
+            Write-Warn "API returned HTTP $status"
         } else {
-            Write-Fail "Template push failed (exit $pushExit)."
-            Write-Warn "Manual fix: docker exec -it coder-server /bin/sh"
+            Write-Fail "Failed to connect to $apiBaseUrl"
+        }
+    }
+}
+
+function Invoke-TestLlmBackend {
+    if (-not (Test-Path $EnvFile)) {
+        Write-Fail 'Run init first.'
+        exit 1
+    }
+
+    $cfg = Get-Config
+    if (-not $cfg['INTERNAL_API_BASE']) {
+        Write-Fail 'INTERNAL_API_BASE is not configured.'
+        exit 1
+    }
+
+    $headers = @{}
+    if ($cfg['INTERNAL_API_KEY']) {
+        $headers['Authorization'] = "Bearer $($cfg['INTERNAL_API_KEY'])"
+    }
+
+    try {
+        Invoke-WebRequest -Uri $cfg['INTERNAL_API_BASE'] -UseBasicParsing -Headers $headers -TimeoutSec 10 | Out-Null
+        Write-OK 'Internal LLM backend is reachable.'
+    } catch {
+        if ($_.Exception.Response) {
+            $status = $_.Exception.Response.StatusCode.Value__
+            Write-OK "Internal LLM backend is reachable and returned HTTP $status."
+        } else {
+            Write-Fail "Failed to reach $($cfg['INTERNAL_API_BASE'])"
             exit 1
         }
     }
-
-    # Write completion marker
-    Get-Date | Set-Content $SetupDone
-
-    Write-Host ""
-    Write-Host "========================================" -ForegroundColor Green
-    Write-Host " Coder initialization complete!" -ForegroundColor Green
-    Write-Host "========================================" -ForegroundColor Green
-    Write-Host ""
-    Show-AccessInfo
-    Write-Host "Admin account: $adminEmail" -ForegroundColor Yellow
 }
 
-# ---- Show access info ----
-function Show-AccessInfo {
-    $env    = Read-EnvFile
-    $sh     = if ($env["SERVER_HOST"])  { $env["SERVER_HOST"] }  else { "localhost" }
-    $port   = if ($env["GATEWAY_PORT"]) { $env["GATEWAY_PORT"] } else { "8443" }
-    Write-Host "Access URLs:" -ForegroundColor Cyan
-    Write-Host "  Admin Dashboard: https://${sh}:${port}/" -ForegroundColor White
-    Write-Host "  User IDE:        https://${sh}:${port}/@<username>/<workspace>.main/apps/code-server" -ForegroundColor White
-    if ($script:UseLlm) {
-        Write-Host "  LiteLLM:         https://${sh}:${port}/llm/" -ForegroundColor White
-    }
-    Write-Host ""
-}
-
-# ============================================================
-# test-api: Test LLM API connectivity
-# ============================================================
-function Invoke-TestApi {
-    if (-not (Test-Path $EnvFile)) { Write-Fail "Run 'init' first."; exit 1 }
-    $env        = Read-EnvFile
-    $apiKey     = if ($env["ANTHROPIC_API_KEY"])  { $env["ANTHROPIC_API_KEY"] }  else { "" }
-    $apiBaseUrl = if ($env["ANTHROPIC_BASE_URL"]) { $env["ANTHROPIC_BASE_URL"] } else { "" }
-    if (-not $apiBaseUrl) { $apiBaseUrl = "https://api.anthropic.com" }
-
-    if (-not $apiKey) { Write-Fail "ANTHROPIC_API_KEY not configured."; exit 1 }
-    Write-Info "Testing API connection: $apiBaseUrl"
-
-    $body = '{"model":"claude-haiku-4-5-20251001","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
-
-    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try {
-        Invoke-RestMethod -Uri "$apiBaseUrl/v1/messages" -Method POST `
-            -Headers @{ "x-api-key" = $apiKey; "anthropic-version" = "2023-06-01" } `
-            -ContentType "application/json" -Body $body -TimeoutSec 15 -ErrorAction Stop | Out-Null
-        Write-OK "API connection and authentication successful."
-    } catch {
-        $sc = $_.Exception.Response.StatusCode.Value__
-        if ($sc -eq 401)  { Write-Fail "Invalid API Key (401)." }
-        elseif ($sc)      { Write-Warn "API returned status: $sc" }
-        else              { Write-Fail "Cannot connect to $apiBaseUrl" }
-    }
-    $ErrorActionPreference = $eap
-}
-
-# ============================================================
-# clean: Clean Docker build cache
-# ============================================================
 function Invoke-Clean {
-    Write-Info "Cleaning Docker build cache..."
+    Write-Info 'Cleaning Docker build cache...'
     docker system prune -f
-    Write-OK "Cleanup complete."
+    Write-OK 'Cleanup complete.'
 }
 
-# ============================================================
-# help
-# ============================================================
 function Show-Help {
-    $helpText = @(
-        "",
-        "Usage: .\scripts\manage.ps1 <command> [arg] [-Llm]",
-        "",
-        "Commands:",
-        "  init              Create docker\.env config file",
-        "  ssl [IP/hostname] Generate self-signed SSL certificate",
-        "  pull              Pull platform base images (requires internet)",
-        "  build             Build workspace Docker image (embedded toolchain)",
-        "  save              Export all images as tar (for offline transfer)",
-        "  load              Load images from images\*.tar (offline deploy)",
-        "  up                Start platform (auto SSL, first-time Coder init)",
-        "  down              Stop platform",
-        "  status            Show container status",
-        "  logs [service]    Show logs (gateway / coder / postgres / llm-gateway)",
-        "  shell <service>   Enter container shell",
-        "  setup-coder       Manually trigger Coder init (create admin + push template)",
-        "  test-api          Test LLM API connectivity",
-        "  clean             Clean Docker build cache",
-        "",
-        "Options:",
-        "  -Llm              Include LiteLLM AI gateway (requires configs\litellm_config.yaml)",
-        "",
-        "Examples:",
-        "  .\scripts\manage.ps1 init",
-        "  .\scripts\manage.ps1 ssl 192.168.1.100",
-        "  .\scripts\manage.ps1 build",
-        "  .\scripts\manage.ps1 up",
-        "  .\scripts\manage.ps1 up -Llm",
-        "  .\scripts\manage.ps1 logs coder",
-        "  .\scripts\manage.ps1 shell coder",
-        "  .\scripts\manage.ps1 down",
-        "",
-        "Access URLs (after startup):",
-        "  Admin Dashboard: https://<IP>:8443/",
-        "  User IDE:        https://<IP>:8443/@<username>/<workspace>.main/apps/code-server",
-        "  LiteLLM:         https://<IP>:8443/llm/  (with -Llm flag)",
-        ""
+    $text = @(
+        '',
+        'Usage: .\scripts\manage.ps1 <command> [arg] [-Llm]',
+        '',
+        'Commands:',
+        '  init                  Create docker/.env',
+        '  ssl [host]            Issue/update TLS leaf certificate',
+        '  pull                  Pull pinned runtime and build-base images',
+        '  build                 Build the workspace image',
+        '  save                  Save deployment images into images/',
+        '  load                  Load images from images/*.tar',
+        '  up                    Start the platform',
+        '  down                  Stop the platform',
+        '  status                Show service status',
+        '  logs [service]        Follow logs',
+        '  shell <service>       Enter a service shell',
+        '  setup-coder           Create admin and push template',
+        '  test-api              Test Anthropic/LiteLLM API access',
+        '  test-llm-backend      Test the internal LLM backend base URL',
+        '  clean                 Clean Docker build cache',
+        '',
+        'Notes:',
+        '  Deployment uses pinned image refs from configs/versions.lock.env.',
+        '  A new root CA requires one workspace rebuild. Later leaf rotations do not.',
+        '  LiteLLM remains a gateway layer to existing internal model infrastructure.'
     )
-    Write-Host ($helpText -join "`n")
+    Write-Host ($text -join "`n")
 }
 
-# ============================================================
-# Main entry point
-# ============================================================
-Write-Host "=== Coder Production Platform Management (Windows) ===" -ForegroundColor Blue
-Write-Host ""
+Write-Host '=== Coder Production Platform Management (Windows) ===' -ForegroundColor Blue
+Write-Host ''
 
 switch ($Command.ToLower()) {
-    "init"        { Initialize-Dirs; Invoke-Init; break }
-    "ssl"         { Initialize-Dirs; Invoke-GenSSL -ServerHost $Arg1; break }
-    "pull"        { Invoke-Pull; break }
-    "build"       { Invoke-Build; break }
-    "save"        { Invoke-Save; break }
-    "load"        { Invoke-Load; break }
-    "up"          { Invoke-Up; break }
-    "start"       { Invoke-Up; break }
-    "down"        { Invoke-Down; break }
-    "stop"        { Invoke-Down; break }
-    "status"      { Invoke-Status; break }
-    "ps"          { Invoke-Status; break }
-    "logs"        { Invoke-Logs; break }
-    "shell"       { Invoke-Shell; break }
-    "setup-coder" { Invoke-SetupCoder; break }
-    "test-api"    { Invoke-TestApi; break }
-    "clean"       { Invoke-Clean; break }
-    default       { Show-Help }
+    'init'             { Initialize-Dirs; Invoke-Init; break }
+    'ssl'              { Initialize-Dirs; Invoke-GenSSL -ServerHost $Arg1; break }
+    'pull'             { Invoke-Pull; break }
+    'build'            { Invoke-Build; break }
+    'save'             { Invoke-Save; break }
+    'load'             { Invoke-Load; break }
+    'up'               { Invoke-Up; break }
+    'start'            { Invoke-Up; break }
+    'down'             { Invoke-Down; break }
+    'stop'             { Invoke-Down; break }
+    'status'           { Invoke-Status; break }
+    'ps'               { Invoke-Status; break }
+    'logs'             { Invoke-Logs; break }
+    'shell'            { Invoke-Shell; break }
+    'setup-coder'      { Invoke-SetupCoder; break }
+    'test-api'         { Invoke-TestApi; break }
+    'test-llm-backend' { Invoke-TestLlmBackend; break }
+    'clean'            { Invoke-Clean; break }
+    default            { Show-Help }
 }

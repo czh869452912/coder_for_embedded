@@ -1,229 +1,157 @@
-# ============================================================
-# Prepare offline resources (run on an internet-connected machine)
-#
-# Downloads:
-#   1. Terraform provider zips -> configs\terraform-providers\
-#   2. Platform Docker images  -> images\*.tar
-#   3. Builds workspace image  -> images\workspace-embedded_latest.tar
-#
-# Usage:
-#   .\scripts\prepare-offline.ps1
-#   .\scripts\prepare-offline.ps1 -SkipImages   # only download TF providers
-#   .\scripts\prepare-offline.ps1 -SkipBuild    # skip workspace image build
-# ============================================================
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 
 param(
-    [switch]$SkipImages,   # skip docker pull/save
-    [switch]$SkipBuild,    # skip workspace image build+save
-    [switch]$IncludeLlm    # also save litellm image
+    [switch]$SkipImages,
+    [switch]$SkipBuild,
+    [switch]$IncludeLlm
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
-$ConfigsDir  = Join-Path $ProjectRoot "configs"
-$DockerDir   = Join-Path $ProjectRoot "docker"
-$ImagesDir   = Join-Path $ProjectRoot "images"
+$ConfigsDir  = Join-Path $ProjectRoot 'configs'
+$DockerDir   = Join-Path $ProjectRoot 'docker'
+$ImagesDir   = Join-Path $ProjectRoot 'images'
+$EnvFile     = Join-Path $DockerDir '.env'
 
-function Write-Info { param($msg) Write-Host "[INFO]  $msg" -ForegroundColor Cyan }
-function Write-OK   { param($msg) Write-Host "[ OK ]  $msg" -ForegroundColor Green }
-function Write-Warn { param($msg) Write-Host "[WARN]  $msg" -ForegroundColor Yellow }
-function Write-Fail { param($msg) Write-Host "[FAIL]  $msg" -ForegroundColor Red }
+. (Join-Path $ScriptDir 'lib\offline-common.ps1')
 
-function Read-EnvFile {
-    $h = @{}
-    $envFile = Join-Path $DockerDir ".env"
-    if (-not (Test-Path $envFile)) { return $h }
-    Get-Content $envFile | ForEach-Object {
-        $line = $_.Trim()
-        if ($line -and -not $line.StartsWith('#') -and $line -match '^([^=]+)=(.*)$') {
-            $h[$matches[1].Trim()] = $matches[2].Trim()
-        }
+function Write-Info { param([string]$Message) Write-Host "[INFO]  $Message" -ForegroundColor Cyan }
+function Write-OK   { param([string]$Message) Write-Host "[ OK ]  $Message" -ForegroundColor Green }
+function Write-Warn { param([string]$Message) Write-Host "[WARN]  $Message" -ForegroundColor Yellow }
+function Write-Fail { param([string]$Message) Write-Host "[FAIL]  $Message" -ForegroundColor Red }
+
+function Get-Config {
+    if (Test-Path $EnvFile) {
+        Ensure-EnvDefaults -EnvFile $EnvFile -ConfigsDir $ConfigsDir
     }
-    return $h
+    return Get-EffectiveConfig -ConfigsDir $ConfigsDir -EnvFile $EnvFile
 }
 
-# ============================================================
-# Step 1: Download Terraform providers
-# ============================================================
 function Get-TerraformProviders {
-    Write-Info "=== Step 1: Downloading Terraform providers ==="
+    Write-Info '=== Step 1: Downloading Terraform providers ==='
+    $cfg = Get-Config
 
-    # Read provider versions from main.tf
-    $mainTf = Join-Path $ProjectRoot "workspace-template\main.tf"
-    $tfContent = Get-Content $mainTf -Raw
-
-    # Extract version constraints (take the latest matching version)
-    $coderVerConstraint   = if ($tfContent -match '"~>\s*([\d\.]+)"[^}]*coder/coder|coder/coder[^}]*"~>\s*([\d\.]+)"') { $matches[1] + $matches[2] } else { "2" }
-    $dockerVerConstraint  = if ($tfContent -match '"~>\s*([\d\.]+)"[^}]*kreuzwerker/docker|kreuzwerker/docker[^}]*"~>\s*([\d\.]+)"') { $matches[1] + $matches[2] } else { "3" }
-
-    # Provider specs: [namespace, type, major_version, os, arch]
     $providers = @(
-        @{ ns = "coder";        type = "coder";  major = "2"; os = "linux"; arch = "amd64" },
-        @{ ns = "kreuzwerker";  type = "docker"; major = "3"; os = "linux"; arch = "amd64" }
+        @{ Namespace = 'coder'; Type = 'coder'; Version = $cfg['TF_PROVIDER_CODER_VERSION']; Os = 'linux'; Arch = 'amd64' },
+        @{ Namespace = 'kreuzwerker'; Type = 'docker'; Version = $cfg['TF_PROVIDER_DOCKER_VERSION']; Os = 'linux'; Arch = 'amd64' }
     )
 
-    foreach ($p in $providers) {
-        $regUrl = "https://registry.terraform.io/v1/providers/$($p.ns)/$($p.type)/versions"
-        Write-Info "  Fetching available versions for $($p.ns)/$($p.type)..."
+    foreach ($provider in $providers) {
+        $downloadInfoUrl = "https://registry.terraform.io/v1/providers/$($provider.Namespace)/$($provider.Type)/$($provider.Version)/download/$($provider.Os)/$($provider.Arch)"
+        $destinationDir = Join-Path $ConfigsDir "terraform-providers\registry.terraform.io\$($provider.Namespace)\$($provider.Type)\$($provider.Version)\$($provider.Os)_$($provider.Arch)"
+        New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
 
-        try {
-            $versionsResp = Invoke-RestMethod -Uri $regUrl -TimeoutSec 30 -ErrorAction Stop
-        } catch {
-            Write-Fail "  Failed to query registry for $($p.ns)/$($p.type): $_"
-            continue
-        }
-
-        # Find latest version matching major version constraint
-        $matching = $versionsResp.versions |
-            Where-Object { $_.version -match "^$($p.major)\." } |
-            Sort-Object { [version]$_.version } -Descending |
-            Select-Object -First 1
-
-        if (-not $matching) {
-            Write-Fail "  No matching version found for $($p.ns)/$($p.type) ~> $($p.major).x"
-            continue
-        }
-
-        $version = $matching.version
-        Write-Info "  Latest $($p.ns)/$($p.type): v$version"
-
-        # Get download URL
-        $dlUrl = "https://registry.terraform.io/v1/providers/$($p.ns)/$($p.type)/$version/download/$($p.os)/$($p.arch)"
-        try {
-            $dlInfo = Invoke-RestMethod -Uri $dlUrl -TimeoutSec 30 -ErrorAction Stop
-        } catch {
-            Write-Fail "  Failed to get download info: $_"
-            continue
-        }
-
-        # Create directory structure
-        $destDir = Join-Path $ConfigsDir "terraform-providers\registry.terraform.io\$($p.ns)\$($p.type)\$version\$($p.os)_$($p.arch)"
-        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
-
-        $zipName = "terraform-provider-$($p.type)_${version}_$($p.os)_$($p.arch).zip"
-        $zipPath = Join-Path $destDir $zipName
-
+        $zipName = "terraform-provider-$($provider.Type)_$($provider.Version)_$($provider.Os)_$($provider.Arch).zip"
+        $zipPath = Join-Path $destinationDir $zipName
         if (Test-Path $zipPath) {
-            Write-OK "  Already downloaded: $zipName"
+            Write-OK "Already downloaded: $zipName"
             continue
         }
 
-        Write-Info "  Downloading $zipName..."
-        try {
-            Invoke-WebRequest -Uri $dlInfo.download_url -OutFile $zipPath -TimeoutSec 300 -ErrorAction Stop
-            $sizeMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 1)
-            Write-OK "  Downloaded $zipName (${sizeMB} MB)"
-        } catch {
-            Write-Fail "  Download failed: $_"
-            Remove-Item $zipPath -ErrorAction SilentlyContinue
-        }
+        Write-Info "Downloading $zipName"
+        $downloadInfo = Invoke-RestMethod -Uri $downloadInfoUrl -TimeoutSec 30
+        Invoke-WebRequest -Uri $downloadInfo.download_url -OutFile $zipPath -TimeoutSec 300
+        $sizeMb = [math]::Round((Get-Item $zipPath).Length / 1MB, 1)
+        Write-OK "Saved $zipName (${sizeMb} MB)"
     }
-    Write-OK "Terraform providers download complete."
-    Write-Info "  Directory: $ConfigsDir\terraform-providers\"
 }
 
-# ============================================================
-# Step 2: Pull and save platform Docker images
-# ============================================================
 function Save-PlatformImages {
-    Write-Info "=== Step 2: Pulling and saving platform Docker images ==="
+    Write-Info '=== Step 2: Pulling and saving runtime images ==='
+    $cfg = Get-Config
     New-Item -ItemType Directory -Path $ImagesDir -Force | Out-Null
-
-    $env      = Read-EnvFile
-    $coderImg = if ($env["CODER_IMAGE"])       { $env["CODER_IMAGE"] }       else { "ghcr.io/coder/coder" }
-    $coderVer = if ($env["CODER_VERSION"])     { $env["CODER_VERSION"] }     else { "latest" }
-    $pgVer    = if ($env["POSTGRES_VERSION"]) { $env["POSTGRES_VERSION"] } else { "16" }
 
     $images = [System.Collections.Generic.List[string]]@(
-        "${coderImg}:${coderVer}",
-        "postgres:${pgVer}-alpine",
-        "nginx:alpine"
+        $cfg['CODER_IMAGE_REF'],
+        $cfg['POSTGRES_IMAGE_REF'],
+        $cfg['NGINX_IMAGE_REF']
     )
-    if ($IncludeLlm) { $images.Add("ghcr.io/berriai/litellm:main-latest") }
+    if ($IncludeLlm) {
+        $images.Add($cfg['LITELLM_IMAGE_REF'])
+    }
 
-    foreach ($img in $images) {
-        Write-Info "  Pulling $img..."
-        docker pull $img
-        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to pull $img"; exit 1 }
+    foreach ($image in $images) {
+        Write-Info "Pulling $image"
+        docker pull $image
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to pull $image"; exit 1 }
 
-        $fname = ($img -replace "[:/]", "_") + ".tar"
-        $fpath = Join-Path $ImagesDir $fname
-        Write-Info "  Saving $img -> $fname..."
-        docker save $img -o $fpath
-        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to save $img"; exit 1 }
-        $sizeMB = [math]::Round((Get-Item $fpath).Length / 1MB)
-        Write-OK "  Saved $fname (${sizeMB} MB)"
+        $fileName = ($image -replace '[:/@]', '_') + '.tar'
+        $filePath = Join-Path $ImagesDir $fileName
+        Write-Info "Saving $image -> $fileName"
+        docker save $image -o $filePath
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to save $image"; exit 1 }
+        $sizeMb = [math]::Round((Get-Item $filePath).Length / 1MB)
+        Write-OK "Saved $fileName (${sizeMb} MB)"
     }
 }
 
-# ============================================================
-# Step 3: Build and save workspace image
-# ============================================================
 function Build-WorkspaceImage {
-    Write-Info "=== Step 3: Building workspace image ==="
+    Write-Info '=== Step 3: Building and saving workspace image ==='
+    $cfg = Get-Config
+    $sslDir = Join-Path $ConfigsDir 'ssl'
+    $serverHost = if ($cfg['SERVER_HOST']) { $cfg['SERVER_HOST'] } else { 'localhost' }
+    $workspaceImage = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
+    $workspaceTag = if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
 
-    $env     = Read-EnvFile
-    $imgName = if ($env["WORKSPACE_IMAGE"])     { $env["WORKSPACE_IMAGE"] }     else { "workspace-embedded" }
-    $imgTag  = if ($env["WORKSPACE_IMAGE_TAG"]) { $env["WORKSPACE_IMAGE_TAG"] } else { "latest" }
-
-    # Ensure SSL cert exists (baked into workspace image)
-    $sslCrt = Join-Path $ConfigsDir "ssl\server.crt"
-    if (-not (Test-Path $sslCrt)) {
-        Write-Warn "SSL cert not found. Generating for localhost..."
-        & (Join-Path $ScriptDir "manage.ps1") ssl localhost
+    if (-not (Test-Path (Join-Path $sslDir 'ca.crt'))) {
+        Write-Warn 'No root CA found. Generating CA and leaf certificate now.'
+        Issue-LeafCertificate -SslDir $sslDir -ServerHost $serverHost | Out-Null
+    } elseif (-not (Test-Path (Join-Path $sslDir 'server.crt'))) {
+        Write-Warn 'Root CA exists but leaf certificate is missing. Issuing one now.'
+        Issue-LeafCertificate -SslDir $sslDir -ServerHost $serverHost | Out-Null
     }
 
-    Write-Info "  Building ${imgName}:${imgTag} (may take 20-40 minutes)..."
-    docker build -f "$DockerDir\Dockerfile.workspace" -t "${imgName}:${imgTag}" $ProjectRoot
-    if ($LASTEXITCODE -ne 0) { Write-Fail "Build failed."; exit 1 }
-    Write-OK "  Build complete: ${imgName}:${imgTag}"
+    Write-Info "Pulling build base image $($cfg['CODE_SERVER_BASE_IMAGE_REF'])"
+    docker pull $cfg['CODE_SERVER_BASE_IMAGE_REF']
+    if ($LASTEXITCODE -ne 0) { Write-Fail 'Failed to pull code-server base image'; exit 1 }
+
+    Write-Info "Building ${workspaceImage}:${workspaceTag}"
+    docker build -f "$DockerDir\Dockerfile.workspace" --build-arg "CODE_SERVER_BASE_IMAGE_REF=$($cfg['CODE_SERVER_BASE_IMAGE_REF'])" -t "${workspaceImage}:${workspaceTag}" $ProjectRoot
+    if ($LASTEXITCODE -ne 0) { Write-Fail 'Workspace image build failed'; exit 1 }
 
     New-Item -ItemType Directory -Path $ImagesDir -Force | Out-Null
-    $fname = ($imgName -replace "[:/]", "_") + "_$imgTag.tar"
-    $fpath = Join-Path $ImagesDir $fname
-    Write-Info "  Saving workspace image -> $fname..."
-    docker save "${imgName}:${imgTag}" -o $fpath
-    if ($LASTEXITCODE -ne 0) { Write-Fail "Save failed."; exit 1 }
-    $sizeMB = [math]::Round((Get-Item $fpath).Length / 1MB)
-    Write-OK "  Saved $fname (${sizeMB} MB)"
+    $fileName = "${workspaceImage}_$workspaceTag.tar"
+    $filePath = Join-Path $ImagesDir $fileName
+    Write-Info "Saving ${workspaceImage}:${workspaceTag} -> $fileName"
+    docker save "${workspaceImage}:${workspaceTag}" -o $filePath
+    if ($LASTEXITCODE -ne 0) { Write-Fail 'Failed to save workspace image'; exit 1 }
+    $sizeMb = [math]::Round((Get-Item $filePath).Length / 1MB)
+    Write-OK "Saved $fileName (${sizeMb} MB)"
 }
 
-# ============================================================
-# Main
-# ============================================================
-Write-Host "=== Coder Offline Resource Preparation ===" -ForegroundColor Blue
-Write-Host ""
+Write-Host '=== Coder Offline Resource Preparation ===' -ForegroundColor Blue
+Write-Host ''
 
-# Always download TF providers
 Get-TerraformProviders
-Write-Host ""
+Write-Host ''
 
 if (-not $SkipImages) {
     Save-PlatformImages
-    Write-Host ""
+    Write-Host ''
 }
 
 if (-not $SkipBuild) {
     Build-WorkspaceImage
-    Write-Host ""
+    Write-Host ''
 }
 
-Write-Host "========================================" -ForegroundColor Green
-Write-Host " Offline preparation complete!" -ForegroundColor Green
-Write-Host "========================================" -ForegroundColor Green
-Write-Host ""
-Write-Host "Transfer the following to the offline server:" -ForegroundColor Cyan
-Write-Host "  images\          -> Docker image tarballs" -ForegroundColor White
-Write-Host "  configs\ssl\     -> TLS certificates" -ForegroundColor White
-Write-Host "  configs\terraform-providers\ -> TF provider zips" -ForegroundColor White
-Write-Host ""
-Write-Host "On the offline server:" -ForegroundColor Cyan
-Write-Host "  .\scripts\manage.ps1 load     # load Docker images" -ForegroundColor White
-Write-Host "  .\scripts\manage.ps1 init     # create .env" -ForegroundColor White
-Write-Host "  .\scripts\manage.ps1 ssl <IP> # regenerate cert for server IP" -ForegroundColor White
-Write-Host "  .\scripts\manage.ps1 build    # rebuild workspace image with correct cert" -ForegroundColor White
-Write-Host "  .\scripts\manage.ps1 up       # start platform" -ForegroundColor White
+Write-Host '========================================' -ForegroundColor Green
+Write-Host ' Offline preparation complete' -ForegroundColor Green
+Write-Host '========================================' -ForegroundColor Green
+Write-Host ''
+Write-Host 'Transfer these items to the offline server:' -ForegroundColor Cyan
+Write-Host '  entire project directory' -ForegroundColor White
+Write-Host '  images\' -ForegroundColor White
+Write-Host '  configs\ssl\   (keep ca.crt and ca.key so the target only reissues a leaf cert)' -ForegroundColor White
+Write-Host '  configs\terraform-providers\' -ForegroundColor White
+Write-Host ''
+Write-Host 'Offline deployment path:' -ForegroundColor Cyan
+Write-Host '  .\scripts\manage.ps1 load' -ForegroundColor White
+Write-Host '  .\scripts\manage.ps1 init' -ForegroundColor White
+Write-Host '  .\scripts\manage.ps1 ssl <TARGET_IP_OR_HOST>' -ForegroundColor White
+Write-Host '  .\scripts\manage.ps1 up' -ForegroundColor White
+Write-Host ''
+Write-Host 'If the CA changes on the offline side, rebuild the workspace image once. Leaf-only rotation does not require rebuild.' -ForegroundColor Yellow
