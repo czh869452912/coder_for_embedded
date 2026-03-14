@@ -190,19 +190,24 @@ RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extens
 RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension anthropic.claude-code \
     || echo "[INFO] Claude Code extension not in marketplace, use VSIX instead"
 
-# Cline 婢跺洭鈧?RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension saoudrizwan.claude-dev \
+# Cline
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension saoudrizwan.claude-dev \
     || echo "[INFO] Cline not available, skipping"
 
-# Roo Code AI 閸斺晜澧?RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension RooVeterinaryInc.roo-cline \
+# Roo Code AI
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension RooVeterinaryInc.roo-cline \
     || echo "[WARN] Roo Code not available, skipping"
 
-# 濞村鐦憰鍡欐磰閻?RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension ryanluker.vscode-coverage-gutters \
+# Coverage Gutters
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension ryanluker.vscode-coverage-gutters \
     || echo "[WARN] coverage-gutters not available, skipping"
 
-# PlantUML 閸ユ崘銆?RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension jebbs.plantuml \
+# PlantUML
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension jebbs.plantuml \
     || echo "[WARN] plantuml not available, skipping"
 
-# Markdown Mermaid 閸ユ崘銆?RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension bierner.markdown-mermaid \
+# Markdown Mermaid
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension bierner.markdown-mermaid \
     || echo "[WARN] markdown-mermaid not available, skipping"
 
 # Markdown All in One

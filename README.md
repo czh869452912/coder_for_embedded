@@ -130,6 +130,8 @@ The preparation step:
 - Generates a root CA in `configs/ssl/` if one does not already exist
 - Writes `offline-manifest.json`
 
+If you intentionally run `prepare-offline.ps1 -SkipBuild` or `prepare-offline.sh --skip-build`, `verify-offline` will fail until the workspace image tarball has also been produced.
+
 ### Step 2: Transfer to the Offline Server
 
 Transfer the entire project directory, including at least:
@@ -218,7 +220,7 @@ The refresh scripts:
 
 - Pull the tagged upstream images you have chosen to track
 - Resolve their current digests
-- Query the newest provider versions within the current locked major versions
+- Query the newest stable provider versions within the current locked major versions
 - Rewrite `configs/versions.lock.env` only when you explicitly apply
 
 ## AI Gateway Setup
@@ -299,6 +301,23 @@ bash scripts/verify-offline.sh [--require-llm]
 - `scripts/verify-offline.ps1`: Windows offline bundle verification
 - `scripts/verify-offline.sh`: Linux offline bundle verification
 - `offline-manifest.json`: expected offline bundle contents
+
+## Windows Smoke Test
+
+The following Windows paths have been exercised successfully in this repository:
+
+- `.\scripts\refresh-versions.ps1` dry run
+- `.\scripts\prepare-offline.ps1 -SkipBuild`
+- `.\scripts\manage.ps1 ssl localhost`
+- `.\scripts\manage.ps1 build`
+- `.\scripts\manage.ps1 save`
+- `.\scripts\verify-offline.ps1`
+- `.\scripts\manage.ps1 up`
+- `.\scripts\manage.ps1 status`
+- `http://localhost:7080/healthz`
+- `.\scripts\manage.ps1 down`
+
+The gateway container also reached `healthy` state during startup verification.
 
 ## Troubleshooting
 

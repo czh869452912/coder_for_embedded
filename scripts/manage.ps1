@@ -10,6 +10,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$PSNativeCommandUseErrorActionPreference = $false
 
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
@@ -419,10 +420,18 @@ function Invoke-Up {
 
 function Invoke-Down {
     Assert-Docker
-    $composeArgs = if ($script:UseLlm) { @('--profile', 'llm', 'down') } else { @('down') }
     Push-Location $DockerDir
-    docker compose @composeArgs
+    if ($script:UseLlm) {
+        docker compose --profile llm down
+    } else {
+        docker compose down
+    }
+    $composeExit = $LASTEXITCODE
     Pop-Location
+    if ($composeExit -ne 0) {
+        Write-Fail 'docker compose down failed.'
+        exit 1
+    }
     Write-OK 'Platform stopped.'
 }
 

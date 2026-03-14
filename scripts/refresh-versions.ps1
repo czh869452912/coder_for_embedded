@@ -4,6 +4,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$PSNativeCommandUseErrorActionPreference = $false
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
@@ -74,11 +75,11 @@ function Get-LatestProviderVersion {
     $major = ($CurrentVersion -split '\.')[0]
     $response = Invoke-RestMethod -Uri "https://registry.terraform.io/v1/providers/$Namespace/$Type/versions" -TimeoutSec 30
     $matchingVersions = $response.versions.version |
-        Where-Object { $_ -match "^$([regex]::Escape($major))\." } |
+        Where-Object { $_ -match "^$([regex]::Escape($major))\.\d+(?:\.\d+)*$" } |
         Sort-Object { [version]$_ } -Descending
 
     if (-not $matchingVersions) {
-        throw "No provider version found for $Namespace/$Type major $major"
+        throw "No stable provider version found for $Namespace/$Type major $major"
     }
 
     return $matchingVersions[0]

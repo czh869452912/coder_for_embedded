@@ -61,16 +61,20 @@ latest_provider_version() {
     local current_version="$3"
     local major="${current_version%%.*}"
     curl -fsSL "https://registry.terraform.io/v1/providers/${namespace}/${provider_type}/versions" | python3 - "$major" <<'PY'
-import json,sys
+import json,re,sys
 major = sys.argv[1]
 versions = json.load(sys.stdin)['versions']
 matching = sorted(
-    [v['version'] for v in versions if v['version'].startswith(major + '.')],
+    [
+        v['version']
+        for v in versions
+        if re.fullmatch(rf"{re.escape(major)}\.\d+(?:\.\d+)*", v['version'])
+    ],
     key=lambda s: tuple(int(part) for part in s.split('.')),
     reverse=True,
 )
 if not matching:
-    raise SystemExit('no matching provider version found')
+    raise SystemExit('no stable provider version found')
 print(matching[0])
 PY
 }
