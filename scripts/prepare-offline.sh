@@ -7,6 +7,7 @@ CONFIGS_DIR="$PROJECT_ROOT/configs"
 DOCKER_DIR="$PROJECT_ROOT/docker"
 IMAGES_DIR="$PROJECT_ROOT/images"
 ENV_FILE="$DOCKER_DIR/.env"
+MANIFEST_PATH="$PROJECT_ROOT/offline-manifest.json"
 
 source "$SCRIPT_DIR/lib/offline-common.sh"
 
@@ -37,6 +38,16 @@ load_config() {
         ensure_env_defaults "$ENV_FILE" "$CONFIGS_DIR"
     fi
     load_effective_config "$CONFIGS_DIR" "$ENV_FILE"
+}
+
+image_archive_name() {
+    local image_ref="$1"
+    printf '%s.tar\n' "$(printf '%s' "$image_ref" | tr '/:@' '_')"
+}
+
+workspace_archive_name() {
+    load_config
+    printf '%s_%s.tar\n' "${WORKSPACE_IMAGE:-workspace-embedded}" "${WORKSPACE_IMAGE_TAG:-latest}"
 }
 
 download_terraform_providers() {
@@ -88,7 +99,7 @@ save_runtime_images() {
     for image in "${images[@]}"; do
         info "Pulling $image"
         docker pull "$image"
-        filename="$(printf '%s' "$image" | tr '/:@' '_').tar"
+        filename="$(image_archive_name "$image")"
         filepath="$IMAGES_DIR/$filename"
         info "Saving $image -> $filename"
         docker save -o "$filepath" "$image"
@@ -117,10 +128,52 @@ build_workspace_image() {
         -t "${WORKSPACE_IMAGE:-workspace-embedded}:${WORKSPACE_IMAGE_TAG:-latest}" \
         "$PROJECT_ROOT"
 
-    local output_file="$IMAGES_DIR/${WORKSPACE_IMAGE:-workspace-embedded}_${WORKSPACE_IMAGE_TAG:-latest}.tar"
+    local output_file="$IMAGES_DIR/$(workspace_archive_name)"
     info "Saving ${WORKSPACE_IMAGE:-workspace-embedded}:${WORKSPACE_IMAGE_TAG:-latest} -> $(basename "$output_file")"
     docker save -o "$output_file" "${WORKSPACE_IMAGE:-workspace-embedded}:${WORKSPACE_IMAGE_TAG:-latest}"
     ok "Saved $(basename "$output_file")"
+}
+
+write_manifest() {
+    load_config
+    local ca_sha256=""
+    if [ -f "$CONFIGS_DIR/ssl/ca.crt" ]; then
+        ca_sha256="$(python3 - "$CONFIGS_DIR/ssl/ca.crt" <<'PY'
+import hashlib,sys
+with open(sys.argv[1], 'rb') as fh:
+    print(hashlib.sha256(fh.read()).hexdigest())
+PY
+)"
+    fi
+
+    local llm_manifest=''
+    if [ "$INCLUDE_LLM" = true ]; then
+        llm_manifest=",\n    {\"ref\": \"${LITELLM_IMAGE_REF}\", \"archive\": \"images/$(image_archive_name "$LITELLM_IMAGE_REF")\"}"
+    fi
+
+    cat > "$MANIFEST_PATH" <<EOF
+{
+  "generated_at_utc": "$(python3 - <<'PY'
+from datetime import datetime, timezone
+print(datetime.now(timezone.utc).isoformat())
+PY
+)",
+  "include_llm": ${INCLUDE_LLM,,},
+  "terraform_cli_config_mount_default": "../configs/terraform-offline.rc",
+  "ca_sha256": "${ca_sha256}",
+  "images": [
+    {"ref": "${CODER_IMAGE_REF}", "archive": "images/$(image_archive_name "$CODER_IMAGE_REF")"},
+    {"ref": "${POSTGRES_IMAGE_REF}", "archive": "images/$(image_archive_name "$POSTGRES_IMAGE_REF")"},
+    {"ref": "${NGINX_IMAGE_REF}", "archive": "images/$(image_archive_name "$NGINX_IMAGE_REF")"},
+    {"ref": "${WORKSPACE_IMAGE:-workspace-embedded}:${WORKSPACE_IMAGE_TAG:-latest}", "archive": "images/$(workspace_archive_name)"}${llm_manifest}
+  ],
+  "providers": [
+    {"source": "registry.terraform.io/coder/coder", "version": "${TF_PROVIDER_CODER_VERSION}", "archive": "configs/terraform-providers/registry.terraform.io/coder/coder/${TF_PROVIDER_CODER_VERSION}/linux_amd64/terraform-provider-coder_${TF_PROVIDER_CODER_VERSION}_linux_amd64.zip"},
+    {"source": "registry.terraform.io/kreuzwerker/docker", "version": "${TF_PROVIDER_DOCKER_VERSION}", "archive": "configs/terraform-providers/registry.terraform.io/kreuzwerker/docker/${TF_PROVIDER_DOCKER_VERSION}/linux_amd64/terraform-provider-docker_${TF_PROVIDER_DOCKER_VERSION}_linux_amd64.zip"}
+  ]
+}
+EOF
+    ok "Wrote $MANIFEST_PATH"
 }
 
 echo -e "${BLUE}=== Coder Offline Resource Preparation ===${NC}"
@@ -139,17 +192,14 @@ if [ "$SKIP_BUILD" = false ]; then
     echo
 fi
 
-echo -e "${GREEN}Offline preparation complete${NC}"
-echo -e "Transfer these items to the offline server:"
-echo -e "  ${BLUE}entire project directory${NC}"
-echo -e "  ${BLUE}images/${NC}"
-echo -e "  ${BLUE}configs/ssl/${NC}  keep ca.crt and ca.key so the target only reissues a leaf cert"
-echo -e "  ${BLUE}configs/terraform-providers/${NC}"
+write_manifest
 echo
-echo -e "Offline deployment path:"
+
+echo -e "${GREEN}Offline preparation complete${NC}"
+echo -e "Recommended next steps:"
+echo -e "  ${BLUE}bash scripts/verify-offline.sh${NC}"
+echo -e "  ${BLUE}Transfer the whole project directory to the offline server${NC}"
 echo -e "  ${BLUE}bash scripts/manage.sh load${NC}"
 echo -e "  ${BLUE}bash scripts/manage.sh init${NC}"
 echo -e "  ${BLUE}bash scripts/manage.sh ssl <TARGET_IP_OR_HOST>${NC}"
 echo -e "  ${BLUE}bash scripts/manage.sh up${NC}"
-echo
-echo -e "${YELLOW}If the CA changes on the offline side, rebuild the workspace image once. Leaf-only rotation does not require rebuild.${NC}"

@@ -60,6 +60,7 @@ Notes:
   Deployment uses pinned image refs from configs/versions.lock.env.
   A new root CA requires one workspace rebuild. Later leaf rotations do not.
   LiteLLM remains a gateway layer to existing internal model infrastructure.
+  Set TF_CLI_CONFIG_MOUNT=../configs/terraform.rc to allow connected Terraform fallback.
 EOF
 }
 
@@ -104,6 +105,11 @@ llm_gateway_url() {
         host="host.docker.internal"
     fi
     echo "https://${host}:${port}/llm"
+}
+
+terraform_cli_config_mount() {
+    load_config
+    echo "${TF_CLI_CONFIG_MOUNT:-../configs/terraform-offline.rc}"
 }
 
 assert_llm_config() {
@@ -173,6 +179,9 @@ ANTHROPIC_BASE_URL=${anthropic_url}
 LITELLM_MASTER_KEY=sk-devenv
 INTERNAL_API_BASE=http://10.0.0.1:8000
 INTERNAL_API_KEY=your-internal-api-key
+
+# ---- Terraform provider resolution ----
+TF_CLI_CONFIG_MOUNT=../configs/terraform-offline.rc
 
 # ---- Internal ports ----
 CODER_INTERNAL_PORT=7080
@@ -317,8 +326,27 @@ start_services() {
         build_images
     fi
 
+    local terraform_config_mount terraform_config_host_path offline_terraform_mode
+    terraform_config_mount="$(terraform_cli_config_mount)"
+    if [[ "$terraform_config_mount" = /* ]]; then
+        terraform_config_host_path="$terraform_config_mount"
+    else
+        terraform_config_host_path="$(cd "$DOCKER_DIR" && python3 -c "import os,sys; print(os.path.abspath(sys.argv[1]))" "$terraform_config_mount")"
+    fi
+    [ -f "$terraform_config_host_path" ] || fail "Terraform CLI config not found: $terraform_config_host_path"
+
+    offline_terraform_mode=false
+    if [ "$(basename "$terraform_config_host_path")" = "terraform-offline.rc" ]; then
+        offline_terraform_mode=true
+    fi
+
     if [ ! -d "$CONFIGS_DIR/terraform-providers/registry.terraform.io" ]; then
-        warn "Offline Terraform provider cache not found. Air-gapped deployment will not be complete."
+        if [ "$offline_terraform_mode" = true ]; then
+            fail "Offline Terraform mode is active but the provider cache is missing."
+        fi
+        warn "Connected Terraform mode is active and the provider cache is missing. Terraform will fall back to the public registry."
+    elif [ "$offline_terraform_mode" = false ]; then
+        info "Connected Terraform mode is active. Local providers will be used first, then registry fallback is allowed."
     fi
 
     cd "$DOCKER_DIR"

@@ -41,7 +41,7 @@ services:
       CODER_CACHE_DIRECTORY: "/tmp/coder-cache"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ../configs/terraform.rc:/home/coder/.terraformrc:ro
+      - ${TF_CLI_CONFIG_MOUNT:-../configs/terraform-offline.rc}:/home/coder/.terraformrc:ro
       - ../configs/terraform-providers:/opt/terraform-providers:ro
     depends_on:
       postgres:
@@ -110,3 +110,4 @@ networks:
 volumes:
   postgres-data:
   litellm-cache:
+

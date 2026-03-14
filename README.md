@@ -41,9 +41,9 @@ Workspace app path
 
 ## Prerequisites
 
-- Windows: Docker Desktop, PowerShell 5.1+, Git for Windows (`openssl`)
+- Windows: Docker Desktop, PowerShell 7 recommended, Git for Windows (`openssl`)
 - Linux: Docker Engine + Compose v2, `bash`, `openssl`, `curl`, `python3`
-- Internet is required only for online preparation, image refresh, and external dependencies you choose to keep online.
+- Internet is required only for online preparation and explicit version refresh operations.
 
 ## Quick Start
 
@@ -74,14 +74,35 @@ bash scripts/manage.sh up --llm
 
 ## TLS Model
 
-The platform now uses a root CA plus target-specific leaf certificates.
+The platform uses a root CA plus target-specific leaf certificates.
 
 - The workspace image trusts `configs/ssl/ca.crt`.
 - `ssl <host>` issues or rotates `server.crt` and `server.key` for the deployment target.
 - If only the leaf certificate changes, you do not need to rebuild the workspace image.
 - If the root CA changes, rebuild the workspace image once.
 
-This is what removes the old requirement to rebuild the workspace image on every offline target.
+This removes the old requirement to rebuild the workspace image on every offline target.
+
+## Terraform Modes
+
+There are two Terraform CLI configs:
+
+- `configs/terraform-offline.rc`: strict offline mode, no registry fallback
+- `configs/terraform.rc`: connected mode, filesystem mirror first and registry fallback allowed
+
+Default behavior is strict offline mode.
+
+`docker/.env` contains:
+
+```env
+TF_CLI_CONFIG_MOUNT=../configs/terraform-offline.rc
+```
+
+If you want connected fallback for maintenance or experimentation, change it to:
+
+```env
+TF_CLI_CONFIG_MOUNT=../configs/terraform.rc
+```
 
 ## Offline Deployment
 
@@ -91,20 +112,23 @@ Windows:
 
 ```powershell
 .\scripts\prepare-offline.ps1
+.\scripts\verify-offline.ps1
 ```
 
 Linux:
 
 ```bash
 bash scripts/prepare-offline.sh
+bash scripts/verify-offline.sh
 ```
 
-This preparation step:
+The preparation step:
 
 - Downloads Terraform providers into `configs/terraform-providers/`
 - Pulls pinned runtime images and saves them into `images/`
 - Builds the workspace image and saves it into `images/`
 - Generates a root CA in `configs/ssl/` if one does not already exist
+- Writes `offline-manifest.json`
 
 ### Step 2: Transfer to the Offline Server
 
@@ -113,6 +137,7 @@ Transfer the entire project directory, including at least:
 - `images/`
 - `configs/ssl/`
 - `configs/terraform-providers/`
+- `offline-manifest.json`
 - `configs/vsix/` if you use offline VSIX packages
 
 Important:
@@ -123,6 +148,7 @@ Keep `configs/ssl/ca.crt` and `configs/ssl/ca.key` from the prepared bundle. The
 Windows:
 
 ```powershell
+.\scripts\verify-offline.ps1
 .\scripts\manage.ps1 load
 .\scripts\manage.ps1 init
 .\scripts\manage.ps1 ssl 10.0.1.50
@@ -132,6 +158,7 @@ Windows:
 Linux:
 
 ```bash
+bash scripts/verify-offline.sh
 bash scripts/manage.sh load
 bash scripts/manage.sh init
 bash scripts/manage.sh ssl 10.0.1.50
@@ -142,10 +169,11 @@ Notes:
 
 - `up` will auto-run first-time Coder initialization if `docker/.setup-done` does not exist.
 - If the offline target accidentally generates a new CA instead of reusing the transferred CA, rebuild the workspace image once.
+- In strict offline mode, `up` will fail fast if the provider cache is incomplete.
 
 ## Version Locking
 
-Deployment uses pinned refs from `configs/versions.lock.env`.
+Deployment reads pinned refs from `configs/versions.lock.env`.
 
 Current pinned items include:
 
@@ -157,6 +185,41 @@ Current pinned items include:
 - Terraform provider versions
 
 Runtime scripts read `docker/.env` for deployment-specific values and `configs/versions.lock.env` for locked image/provider versions.
+
+## Refreshing to the Latest Stable Versions
+
+Version refresh is an explicit maintenance step. It does not happen during deployment.
+
+Windows dry run:
+
+```powershell
+.\scripts\refresh-versions.ps1
+```
+
+Windows apply:
+
+```powershell
+.\scripts\refresh-versions.ps1 -Apply
+```
+
+Linux dry run:
+
+```bash
+bash scripts/refresh-versions.sh
+```
+
+Linux apply:
+
+```bash
+bash scripts/refresh-versions.sh --apply
+```
+
+The refresh scripts:
+
+- Pull the tagged upstream images you have chosen to track
+- Resolve their current digests
+- Query the newest provider versions within the current locked major versions
+- Rewrite `configs/versions.lock.env` only when you explicitly apply
 
 ## AI Gateway Setup
 
@@ -206,12 +269,16 @@ Helpful checks:
 .\scripts\manage.ps1 setup-coder
 .\scripts\manage.ps1 test-api
 .\scripts\manage.ps1 test-llm-backend
+.\scripts\refresh-versions.ps1 [-Apply]
+.\scripts\verify-offline.ps1
 ```
 
 ### Linux
 
 ```bash
 bash scripts/manage.sh <command> [--llm]
+bash scripts/refresh-versions.sh [--apply]
+bash scripts/verify-offline.sh [--require-llm]
 ```
 
 ## Key Files
@@ -219,13 +286,19 @@ bash scripts/manage.sh <command> [--llm]
 - `docker/docker-compose.yml`: platform services
 - `docker/Dockerfile.workspace`: workspace image build
 - `configs/versions.lock.env`: pinned deployment versions
-- `configs/terraform.rc`: Terraform filesystem mirror configuration
+- `configs/terraform-offline.rc`: strict offline Terraform config
+- `configs/terraform.rc`: connected Terraform config with fallback
 - `configs/litellm_config.yaml.example`: LiteLLM gateway template
 - `workspace-template/main.tf`: Coder template that provisions workspace containers
 - `scripts/manage.ps1`: Windows entrypoint
 - `scripts/manage.sh`: Linux entrypoint
 - `scripts/prepare-offline.ps1`: Windows offline preparation
 - `scripts/prepare-offline.sh`: Linux offline preparation
+- `scripts/refresh-versions.ps1`: Windows version refresh tool
+- `scripts/refresh-versions.sh`: Linux version refresh tool
+- `scripts/verify-offline.ps1`: Windows offline bundle verification
+- `scripts/verify-offline.sh`: Linux offline bundle verification
+- `offline-manifest.json`: expected offline bundle contents
 
 ## Troubleshooting
 
@@ -253,8 +326,15 @@ If the CA changed:
 
 ### Terraform provider not found
 
-The offline bundle is incomplete.
-Run `prepare-offline.ps1` or `prepare-offline.sh` again on a connected machine and transfer `configs/terraform-providers/`.
+The offline bundle is incomplete, or strict offline mode is active without a full provider cache.
+
+Run `prepare-offline.ps1` or `prepare-offline.sh` again on a connected machine, then run `verify-offline` before deployment.
+
+If you intentionally want registry fallback in a connected environment, set:
+
+```env
+TF_CLI_CONFIG_MOUNT=../configs/terraform.rc
+```
 
 ### LiteLLM does not start
 

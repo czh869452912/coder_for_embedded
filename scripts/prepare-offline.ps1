@@ -1,5 +1,3 @@
-﻿#Requires -Version 5.1
-
 param(
     [switch]$SkipImages,
     [switch]$SkipBuild,
@@ -9,17 +7,18 @@ param(
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-$ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
-$ConfigsDir  = Join-Path $ProjectRoot 'configs'
-$DockerDir   = Join-Path $ProjectRoot 'docker'
-$ImagesDir   = Join-Path $ProjectRoot 'images'
-$EnvFile     = Join-Path $DockerDir '.env'
+$ConfigsDir = Join-Path $ProjectRoot 'configs'
+$DockerDir = Join-Path $ProjectRoot 'docker'
+$ImagesDir = Join-Path $ProjectRoot 'images'
+$EnvFile = Join-Path $DockerDir '.env'
+$ManifestPath = Join-Path $ProjectRoot 'offline-manifest.json'
 
 . (Join-Path $ScriptDir 'lib\offline-common.ps1')
 
 function Write-Info { param([string]$Message) Write-Host "[INFO]  $Message" -ForegroundColor Cyan }
-function Write-OK   { param([string]$Message) Write-Host "[ OK ]  $Message" -ForegroundColor Green }
+function Write-OK { param([string]$Message) Write-Host "[ OK ]  $Message" -ForegroundColor Green }
 function Write-Warn { param([string]$Message) Write-Host "[WARN]  $Message" -ForegroundColor Yellow }
 function Write-Fail { param([string]$Message) Write-Host "[FAIL]  $Message" -ForegroundColor Red }
 
@@ -28,6 +27,18 @@ function Get-Config {
         Ensure-EnvDefaults -EnvFile $EnvFile -ConfigsDir $ConfigsDir
     }
     return Get-EffectiveConfig -ConfigsDir $ConfigsDir -EnvFile $EnvFile
+}
+
+function Get-ImageArchiveName {
+    param([string]$ImageRef)
+    return (($ImageRef -replace '[:/@]', '_') + '.tar')
+}
+
+function Get-WorkspaceArchiveName {
+    param([hashtable]$Config)
+    $workspaceImage = if ($Config['WORKSPACE_IMAGE']) { $Config['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
+    $workspaceTag = if ($Config['WORKSPACE_IMAGE_TAG']) { $Config['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
+    return "${workspaceImage}_$workspaceTag.tar"
 }
 
 function Get-TerraformProviders {
@@ -54,8 +65,7 @@ function Get-TerraformProviders {
         Write-Info "Downloading $zipName"
         $downloadInfo = Invoke-RestMethod -Uri $downloadInfoUrl -TimeoutSec 30
         Invoke-WebRequest -Uri $downloadInfo.download_url -OutFile $zipPath -TimeoutSec 300
-        $sizeMb = [math]::Round((Get-Item $zipPath).Length / 1MB, 1)
-        Write-OK "Saved $zipName (${sizeMb} MB)"
+        Write-OK "Saved $zipName"
     }
 }
 
@@ -78,13 +88,12 @@ function Save-PlatformImages {
         docker pull $image
         if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to pull $image"; exit 1 }
 
-        $fileName = ($image -replace '[:/@]', '_') + '.tar'
+        $fileName = Get-ImageArchiveName -ImageRef $image
         $filePath = Join-Path $ImagesDir $fileName
         Write-Info "Saving $image -> $fileName"
         docker save $image -o $filePath
         if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to save $image"; exit 1 }
-        $sizeMb = [math]::Round((Get-Item $filePath).Length / 1MB)
-        Write-OK "Saved $fileName (${sizeMb} MB)"
+        Write-OK "Saved $fileName"
     }
 }
 
@@ -113,13 +122,52 @@ function Build-WorkspaceImage {
     if ($LASTEXITCODE -ne 0) { Write-Fail 'Workspace image build failed'; exit 1 }
 
     New-Item -ItemType Directory -Path $ImagesDir -Force | Out-Null
-    $fileName = "${workspaceImage}_$workspaceTag.tar"
+    $fileName = Get-WorkspaceArchiveName -Config $cfg
     $filePath = Join-Path $ImagesDir $fileName
     Write-Info "Saving ${workspaceImage}:${workspaceTag} -> $fileName"
     docker save "${workspaceImage}:${workspaceTag}" -o $filePath
     if ($LASTEXITCODE -ne 0) { Write-Fail 'Failed to save workspace image'; exit 1 }
-    $sizeMb = [math]::Round((Get-Item $filePath).Length / 1MB)
-    Write-OK "Saved $fileName (${sizeMb} MB)"
+    Write-OK "Saved $fileName"
+}
+
+function Write-OfflineManifest {
+    $cfg = Get-Config
+    $caCert = Join-Path $ConfigsDir 'ssl\ca.crt'
+    $images = @(
+        [ordered]@{ ref = $cfg['CODER_IMAGE_REF']; archive = "images/$((Get-ImageArchiveName -ImageRef $cfg['CODER_IMAGE_REF']))" },
+        [ordered]@{ ref = $cfg['POSTGRES_IMAGE_REF']; archive = "images/$((Get-ImageArchiveName -ImageRef $cfg['POSTGRES_IMAGE_REF']))" },
+        [ordered]@{ ref = $cfg['NGINX_IMAGE_REF']; archive = "images/$((Get-ImageArchiveName -ImageRef $cfg['NGINX_IMAGE_REF']))" },
+        [ordered]@{ ref = "$(if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }):$(if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' })"; archive = "images/$((Get-WorkspaceArchiveName -Config $cfg))" }
+    )
+    if ($IncludeLlm) {
+        $images += [ordered]@{ ref = $cfg['LITELLM_IMAGE_REF']; archive = "images/$((Get-ImageArchiveName -ImageRef $cfg['LITELLM_IMAGE_REF']))" }
+    }
+
+    $providers = @(
+        [ordered]@{
+            source = 'registry.terraform.io/coder/coder'
+            version = $cfg['TF_PROVIDER_CODER_VERSION']
+            archive = "configs/terraform-providers/registry.terraform.io/coder/coder/$($cfg['TF_PROVIDER_CODER_VERSION'])/linux_amd64/terraform-provider-coder_$($cfg['TF_PROVIDER_CODER_VERSION'])_linux_amd64.zip"
+        },
+        [ordered]@{
+            source = 'registry.terraform.io/kreuzwerker/docker'
+            version = $cfg['TF_PROVIDER_DOCKER_VERSION']
+            archive = "configs/terraform-providers/registry.terraform.io/kreuzwerker/docker/$($cfg['TF_PROVIDER_DOCKER_VERSION'])/linux_amd64/terraform-provider-docker_$($cfg['TF_PROVIDER_DOCKER_VERSION'])_linux_amd64.zip"
+        }
+    )
+
+    $manifest = [ordered]@{
+        generated_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        include_llm = [bool]$IncludeLlm
+        terraform_cli_config_mount_default = '../configs/terraform-offline.rc'
+        ca_sha256 = if (Test-Path $caCert) { (Get-FileHash $caCert -Algorithm SHA256).Hash.ToLowerInvariant() } else { '' }
+        images = $images
+        providers = $providers
+    }
+
+    $json = $manifest | ConvertTo-Json -Depth 6
+    [System.IO.File]::WriteAllText($ManifestPath, $json + "`r`n", [System.Text.UTF8Encoding]::new($false))
+    Write-OK "Wrote $ManifestPath"
 }
 
 Write-Host '=== Coder Offline Resource Preparation ===' -ForegroundColor Blue
@@ -138,20 +186,16 @@ if (-not $SkipBuild) {
     Write-Host ''
 }
 
+Write-OfflineManifest
+Write-Host ''
 Write-Host '========================================' -ForegroundColor Green
 Write-Host ' Offline preparation complete' -ForegroundColor Green
 Write-Host '========================================' -ForegroundColor Green
 Write-Host ''
-Write-Host 'Transfer these items to the offline server:' -ForegroundColor Cyan
-Write-Host '  entire project directory' -ForegroundColor White
-Write-Host '  images\' -ForegroundColor White
-Write-Host '  configs\ssl\   (keep ca.crt and ca.key so the target only reissues a leaf cert)' -ForegroundColor White
-Write-Host '  configs\terraform-providers\' -ForegroundColor White
-Write-Host ''
-Write-Host 'Offline deployment path:' -ForegroundColor Cyan
+Write-Host 'Recommended next steps:' -ForegroundColor Cyan
+Write-Host '  .\scripts\verify-offline.ps1' -ForegroundColor White
+Write-Host '  Transfer the whole project directory to the offline server' -ForegroundColor White
 Write-Host '  .\scripts\manage.ps1 load' -ForegroundColor White
 Write-Host '  .\scripts\manage.ps1 init' -ForegroundColor White
 Write-Host '  .\scripts\manage.ps1 ssl <TARGET_IP_OR_HOST>' -ForegroundColor White
 Write-Host '  .\scripts\manage.ps1 up' -ForegroundColor White
-Write-Host ''
-Write-Host 'If the CA changes on the offline side, rebuild the workspace image once. Leaf-only rotation does not require rebuild.' -ForegroundColor Yellow

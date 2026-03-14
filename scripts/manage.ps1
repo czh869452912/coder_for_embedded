@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 
 param(
     [Parameter(Position=0)]
@@ -92,6 +92,12 @@ function Get-LlmGatewayUrl {
     return "https://${llmHost}:${gatewayPort}/llm"
 }
 
+function Get-TerraformCliConfigMount {
+    param([hashtable]$Config)
+    if ($Config['TF_CLI_CONFIG_MOUNT']) { return $Config['TF_CLI_CONFIG_MOUNT'] }
+    return '../configs/terraform-offline.rc'
+}
+
 function Assert-LlmConfig {
     if (-not $script:UseLlm) { return }
 
@@ -175,6 +181,9 @@ function Invoke-Init {
         'LITELLM_MASTER_KEY=sk-devenv',
         'INTERNAL_API_BASE=http://10.0.0.1:8000',
         'INTERNAL_API_KEY=your-internal-api-key',
+        '',
+        '# ---- Terraform provider resolution ----',
+        'TF_CLI_CONFIG_MOUNT=../configs/terraform-offline.rc',
         '',
         '# ---- Internal ports ----',
         'CODER_INTERNAL_PORT=7080'
@@ -364,9 +373,27 @@ function Invoke-Up {
         Invoke-Build
     }
 
+    $terraformConfigMount = Get-TerraformCliConfigMount -Config $cfg
+    $terraformConfigHostPath = if ([System.IO.Path]::IsPathRooted($terraformConfigMount)) {
+        $terraformConfigMount
+    } else {
+        [System.IO.Path]::GetFullPath((Join-Path $DockerDir $terraformConfigMount))
+    }
+    if (-not (Test-Path $terraformConfigHostPath)) {
+        Write-Fail "Terraform CLI config not found: $terraformConfigHostPath"
+        exit 1
+    }
+
     $providerRoot = Join-Path $ConfigsDir 'terraform-providers\registry.terraform.io'
+    $offlineTerraformMode = ([System.IO.Path]::GetFileName($terraformConfigHostPath) -ieq 'terraform-offline.rc')
     if (-not (Test-Path $providerRoot)) {
-        Write-Warn 'Offline Terraform provider cache not found. Connected mode may still work, but air-gapped deployment will not.'
+        if ($offlineTerraformMode) {
+            Write-Fail 'Offline Terraform mode is active but the provider cache is missing.'
+            exit 1
+        }
+        Write-Warn 'Connected Terraform mode is active and the provider cache is missing. Terraform will fall back to the public registry.'
+    } elseif (-not $offlineTerraformMode) {
+        Write-Info 'Connected Terraform mode is active. Local providers will be used first, then registry fallback is allowed.'
     }
 
     $composeArgs = if ($script:UseLlm) { @('--profile', 'llm', 'up', '-d') } else { @('up', '-d') }
@@ -645,7 +672,8 @@ function Show-Help {
         'Notes:',
         '  Deployment uses pinned image refs from configs/versions.lock.env.',
         '  A new root CA requires one workspace rebuild. Later leaf rotations do not.',
-        '  LiteLLM remains a gateway layer to existing internal model infrastructure.'
+        '  LiteLLM remains a gateway layer to existing internal model infrastructure.',
+        '  Set TF_CLI_CONFIG_MOUNT=../configs/terraform.rc to allow connected Terraform fallback.'
     )
     Write-Host ($text -join "`n")
 }
