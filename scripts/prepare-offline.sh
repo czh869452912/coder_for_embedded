@@ -50,6 +50,59 @@ workspace_archive_name() {
     printf '%s_%s.tar\n' "${WORKSPACE_IMAGE:-workspace-embedded}" "${WORKSPACE_IMAGE_TAG:-latest}"
 }
 
+download_vsix_extensions() {
+    info '=== Step 0: Downloading VS Code extensions (.vsix) ==='
+    local vsix_dir="$CONFIGS_DIR/vsix"
+    mkdir -p "$vsix_dir"
+
+    # Extensions unavailable on Open VSX that must be pre-downloaded as .vsix files.
+    # The Dockerfile installs any .vsix found in configs/vsix/ as a fallback.
+
+    # cmake-tools: not on Open VSX (Microsoft proprietary), simple direct URL
+    local cmake_dest="$vsix_dir/ms-vscode.cmake-tools.vsix"
+    if [ -f "$cmake_dest" ]; then
+        ok "Already downloaded: ms-vscode.cmake-tools.vsix"
+    else
+        info "Downloading ms-vscode.cmake-tools"
+        local cmake_url="https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-vscode/vsextensions/cmake-tools/latest/vspackage"
+        if curl -fL --connect-timeout 30 --retry 3 -o "$cmake_dest" "$cmake_url" 2>/dev/null; then
+            ok "Saved ms-vscode.cmake-tools.vsix"
+        else
+            warn "Failed to download cmake-tools — continuing without it (not fatal)"
+            rm -f "$cmake_dest"
+        fi
+    fi
+
+    # cpptools linux-x64: platform-specific extension, requires Gallery API to resolve CDN URL
+    local cpptools_dest="$vsix_dir/ms-vscode.cpptools-linux-x64.vsix"
+    if [ -f "$cpptools_dest" ]; then
+        ok "Already downloaded: ms-vscode.cpptools-linux-x64.vsix"
+    else
+        info "Downloading ms-vscode.cpptools (linux-x64)"
+        local cpptools_url
+        cpptools_url="$(curl -fsSL --connect-timeout 15 \
+            -X POST 'https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery' \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json;api-version=3.0-preview.1' \
+            -d '{"filters":[{"criteria":[{"filterType":7,"value":"ms-vscode.cpptools"}]}],"flags":2151}' \
+            2>/dev/null | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+versions=data['results'][0]['extensions'][0]['versions']
+ver=[v for v in versions if v.get('targetPlatform')=='linux-x64'][0]
+files=ver['files']
+url=[f['source'] for f in files if f['assetType']=='Microsoft.VisualStudio.Services.VSIXPackage'][0]
+print(url)
+" 2>/dev/null)"
+        if [ -n "$cpptools_url" ] && curl -fL --connect-timeout 30 --retry 3 -o "$cpptools_dest" "$cpptools_url" 2>/dev/null; then
+            ok "Saved ms-vscode.cpptools-linux-x64.vsix"
+        else
+            warn "Failed to download cpptools — continuing without it (not fatal)"
+            rm -f "$cpptools_dest"
+        fi
+    fi
+}
+
 download_terraform_providers() {
     info '=== Step 1: Downloading Terraform providers ==='
     load_config
@@ -177,6 +230,9 @@ EOF
 }
 
 echo -e "${BLUE}=== Coder Offline Resource Preparation ===${NC}"
+echo
+
+download_vsix_extensions
 echo
 
 download_terraform_providers

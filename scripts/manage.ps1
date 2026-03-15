@@ -552,7 +552,7 @@ function Invoke-SetupCoder {
             exit 1
         }
 
-        $pushCommand = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$sessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key=$anthropicKey --var anthropic_base_url=$anthropicUrl ; rm -rf /tmp/template-push"
+        $pushCommand = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$sessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' ; rm -rf /tmp/template-push"
         docker exec coder-server sh -c $pushCommand
         if ($LASTEXITCODE -ne 0) {
             Write-Fail 'Template push failed.'

@@ -42,6 +42,53 @@ function Get-WorkspaceArchiveName {
     return "${workspaceImage}_$workspaceTag.tar"
 }
 
+function Get-VsixExtensions {
+    Write-Info '=== Step 0: Downloading VS Code extensions (.vsix) ==='
+    $vsixDir = Join-Path $ConfigsDir 'vsix'
+    New-Item -ItemType Directory -Path $vsixDir -Force | Out-Null
+
+    # Extensions unavailable on Open VSX that must be pre-downloaded as .vsix files.
+    # The Dockerfile installs any .vsix found in configs/vsix/ as a fallback.
+
+    # cmake-tools: not on Open VSX (Microsoft proprietary), simple direct URL
+    $cmakeDest = Join-Path $vsixDir 'ms-vscode.cmake-tools.vsix'
+    if (Test-Path $cmakeDest) {
+        Write-OK 'Already downloaded: ms-vscode.cmake-tools.vsix'
+    } else {
+        Write-Info 'Downloading ms-vscode.cmake-tools'
+        $cmakeUrl = 'https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-vscode/vsextensions/cmake-tools/latest/vspackage'
+        try {
+            Invoke-WebRequest -Uri $cmakeUrl -OutFile $cmakeDest -TimeoutSec 120 -UseBasicParsing -ErrorAction Stop
+            Write-OK 'Saved ms-vscode.cmake-tools.vsix'
+        } catch {
+            Write-Warn "Failed to download cmake-tools — continuing without it (not fatal)"
+            Remove-Item $cmakeDest -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # cpptools linux-x64: platform-specific extension, requires Gallery API to resolve CDN URL
+    $cpptoolsDest = Join-Path $vsixDir 'ms-vscode.cpptools-linux-x64.vsix'
+    if (Test-Path $cpptoolsDest) {
+        Write-OK 'Already downloaded: ms-vscode.cpptools-linux-x64.vsix'
+    } else {
+        Write-Info 'Downloading ms-vscode.cpptools (linux-x64)'
+        try {
+            $queryBody = '{"filters":[{"criteria":[{"filterType":7,"value":"ms-vscode.cpptools"}]}],"flags":2151}'
+            $apiResp = Invoke-RestMethod -Uri 'https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery' `
+                -Method POST -ContentType 'application/json' -Body $queryBody `
+                -Headers @{ 'Accept' = 'application/json;api-version=3.0-preview.1' } -TimeoutSec 20 -ErrorAction Stop
+            $versions = $apiResp.results[0].extensions[0].versions
+            $linuxVer = $versions | Where-Object { $_.targetPlatform -eq 'linux-x64' } | Select-Object -First 1
+            $vsixAsset = $linuxVer.files | Where-Object { $_.assetType -eq 'Microsoft.VisualStudio.Services.VSIXPackage' }
+            Invoke-WebRequest -Uri $vsixAsset.source -OutFile $cpptoolsDest -TimeoutSec 300 -UseBasicParsing -ErrorAction Stop
+            Write-OK 'Saved ms-vscode.cpptools-linux-x64.vsix'
+        } catch {
+            Write-Warn "Failed to download cpptools — continuing without it (not fatal)"
+            Remove-Item $cpptoolsDest -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Get-TerraformProviders {
     Write-Info '=== Step 1: Downloading Terraform providers ==='
     $cfg = Get-Config
@@ -172,6 +219,9 @@ function Write-OfflineManifest {
 }
 
 Write-Host '=== Coder Offline Resource Preparation ===' -ForegroundColor Blue
+Write-Host ''
+
+Get-VsixExtensions
 Write-Host ''
 
 Get-TerraformProviders
