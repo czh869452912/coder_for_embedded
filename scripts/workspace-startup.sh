@@ -25,6 +25,15 @@ if [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
   }
 }
 CONFIG_EOF
+
+    # 标记已完成新手引导，这是独立在根目录的 .claude.json，强制覆盖旧状态
+    rm -f "${HOME}/.claude.json"
+    cat > "${HOME}/.claude.json" <<ONBOARDING_EOF
+{
+  "hasCompletedOnboarding": true
+}
+ONBOARDING_EOF
+
     echo "[startup] Claude Code configured: ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-<default Anthropic>}"
 else
     echo "[startup] WARNING: No API config found."

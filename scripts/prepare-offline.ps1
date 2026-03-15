@@ -105,15 +105,20 @@ function Get-TerraformProviders {
 
         $zipName = "terraform-provider-$($provider.Type)_$($provider.Version)_$($provider.Os)_$($provider.Arch).zip"
         $zipPath = Join-Path $destinationDir $zipName
-        if (Test-Path $zipPath) {
-            Write-OK "Already downloaded: $zipName"
+        $extractedMarker = Join-Path $destinationDir '.extracted'
+        
+        if (Test-Path $extractedMarker) {
+            Write-OK "Already downloaded and extracted: $zipName"
             continue
         }
 
         Write-Info "Downloading $zipName"
         $downloadInfo = Invoke-RestMethod -Uri $downloadInfoUrl -TimeoutSec 30
         Invoke-WebRequest -Uri $downloadInfo.download_url -OutFile $zipPath -TimeoutSec 300
-        Write-OK "Saved $zipName"
+        Expand-Archive -Path $zipPath -DestinationPath $destinationDir -Force
+        Remove-Item $zipPath -Force
+        Set-Content -Path $extractedMarker -Value '1'
+        Write-OK "Saved and extracted $zipName"
     }
 }
 
@@ -195,12 +200,12 @@ function Write-OfflineManifest {
         [ordered]@{
             source = 'registry.terraform.io/coder/coder'
             version = $cfg['TF_PROVIDER_CODER_VERSION']
-            archive = "configs/terraform-providers/registry.terraform.io/coder/coder/$($cfg['TF_PROVIDER_CODER_VERSION'])/linux_amd64/terraform-provider-coder_$($cfg['TF_PROVIDER_CODER_VERSION'])_linux_amd64.zip"
+            archive = "configs/terraform-providers/registry.terraform.io/coder/coder/$($cfg['TF_PROVIDER_CODER_VERSION'])/linux_amd64/.extracted"
         },
         [ordered]@{
             source = 'registry.terraform.io/kreuzwerker/docker'
             version = $cfg['TF_PROVIDER_DOCKER_VERSION']
-            archive = "configs/terraform-providers/registry.terraform.io/kreuzwerker/docker/$($cfg['TF_PROVIDER_DOCKER_VERSION'])/linux_amd64/terraform-provider-docker_$($cfg['TF_PROVIDER_DOCKER_VERSION'])_linux_amd64.zip"
+            archive = "configs/terraform-providers/registry.terraform.io/kreuzwerker/docker/$($cfg['TF_PROVIDER_DOCKER_VERSION'])/linux_amd64/.extracted"
         }
     )
 

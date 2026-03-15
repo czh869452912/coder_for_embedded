@@ -99,12 +99,8 @@ workspace_image_ref() {
 
 llm_gateway_url() {
     load_config
-    local host="${SERVER_HOST:-localhost}"
-    local port="${GATEWAY_PORT:-8443}"
-    if [[ "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
-        host="host.docker.internal"
-    fi
-    echo "https://${host}:${port}/llm"
+    # 容器现已加入 coderplatform，直接通过 Docker DNS 访问网关服务更稳定
+    echo "http://llm-gateway:4000"
 }
 
 terraform_cli_config_mount() {
@@ -139,8 +135,16 @@ init_config() {
         postgres_password="changeme_$(date +%s)"
     fi
 
-    read -r -p "Server IP or hostname [localhost]: " server_host
-    server_host="${server_host:-localhost}"
+    local default_ip="192.168.1.100"
+    if command -v ip >/dev/null 2>&1; then
+        local found_ip
+        found_ip="$(ip -4 addr show | awk '/inet / {print $2}' | cut -d/ -f1 | grep -vE '^127\.|^172\.1[7-9]\.|^172\.2[0-9]\.|^172\.3[0-1]\.' | head -n 1 || true)"
+        [ -n "$found_ip" ] && default_ip="$found_ip"
+    fi
+
+    warn "IMPORTANT: Do not use localhost if running workspaces in Docker. Provide your LAN IP instead."
+    read -r -p "Server IP or hostname [$default_ip]: " server_host
+    server_host="${server_host:-$default_ip}"
     read -r -p "Gateway port [8443]: " gateway_port
     gateway_port="${gateway_port:-8443}"
     read -r -p "Coder admin email [admin@company.local]: " admin_email

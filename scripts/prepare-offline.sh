@@ -116,10 +116,11 @@ download_terraform_providers() {
         local destination_dir="$CONFIGS_DIR/terraform-providers/registry.terraform.io/${namespace}/${provider_type}/${version}/${os}_${arch}"
         local zip_name="terraform-provider-${provider_type}_${version}_${os}_${arch}.zip"
         local zip_path="$destination_dir/$zip_name"
+        local extracted_marker="$destination_dir/.extracted"
 
         mkdir -p "$destination_dir"
-        if [ -f "$zip_path" ]; then
-            ok "Already downloaded: $zip_name"
+        if [ -f "$extracted_marker" ]; then
+            ok "Already downloaded and extracted: $zip_name"
             return 0
         fi
 
@@ -127,7 +128,10 @@ download_terraform_providers() {
         local download_url
         download_url="$(curl -fsSL "https://registry.terraform.io/v1/providers/${namespace}/${provider_type}/${version}/download/${os}/${arch}" | python3 -c "import json,sys; print(json.load(sys.stdin)['download_url'])")"
         curl -fL "$download_url" -o "$zip_path"
-        ok "Saved $zip_name"
+        unzip -q -o "$zip_path" -d "$destination_dir"
+        rm -f "$zip_path"
+        touch "$extracted_marker"
+        ok "Saved and extracted $zip_name"
     }
 
     download_provider coder coder "$TF_PROVIDER_CODER_VERSION"
@@ -221,8 +225,8 @@ PY
     {"ref": "${WORKSPACE_IMAGE:-workspace-embedded}:${WORKSPACE_IMAGE_TAG:-latest}", "archive": "images/$(workspace_archive_name)"}${llm_manifest}
   ],
   "providers": [
-    {"source": "registry.terraform.io/coder/coder", "version": "${TF_PROVIDER_CODER_VERSION}", "archive": "configs/terraform-providers/registry.terraform.io/coder/coder/${TF_PROVIDER_CODER_VERSION}/linux_amd64/terraform-provider-coder_${TF_PROVIDER_CODER_VERSION}_linux_amd64.zip"},
-    {"source": "registry.terraform.io/kreuzwerker/docker", "version": "${TF_PROVIDER_DOCKER_VERSION}", "archive": "configs/terraform-providers/registry.terraform.io/kreuzwerker/docker/${TF_PROVIDER_DOCKER_VERSION}/linux_amd64/terraform-provider-docker_${TF_PROVIDER_DOCKER_VERSION}_linux_amd64.zip"}
+    {"source": "registry.terraform.io/coder/coder", "version": "${TF_PROVIDER_CODER_VERSION}", "archive": "configs/terraform-providers/registry.terraform.io/coder/coder/${TF_PROVIDER_CODER_VERSION}/linux_amd64/.extracted"},
+    {"source": "registry.terraform.io/kreuzwerker/docker", "version": "${TF_PROVIDER_DOCKER_VERSION}", "archive": "configs/terraform-providers/registry.terraform.io/kreuzwerker/docker/${TF_PROVIDER_DOCKER_VERSION}/linux_amd64/.extracted"}
   ]
 }
 EOF

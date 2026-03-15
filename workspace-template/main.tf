@@ -226,24 +226,22 @@ resource "docker_container" "workspace" {
   # init_script 负责：下载 coder agent 二进制 → 启动 agent
   # agent 启动后连接 Coder 服务器，执行 startup_script（启动 code-server）
   #
-  # replace() 处理：若 ACCESS_URL 含 localhost/127.0.0.1，
-  # 替换为 host.docker.internal，确保 Docker 容器能访问宿主机上的 nginx
+  # replace() 处理：将原有的外部访问 URL 替换为内网 Coder 服务 URL，
+  # 确保在 coderplatform 内部网络中下载 coder agent CLI 的行为不再绕行外部网关。
   entrypoint = ["sh", "-c", replace(
     coder_agent.main.init_script,
-    "/localhost|127\\.0\\.0\\.1/",
-    "host.docker.internal"
+    data.coder_workspace.me.access_url,
+    "http://coder:7080"
   )]
 
   env = [
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
+    "CODER_URL=http://coder:7080"
   ]
 
-  # 注册 host.docker.internal → 宿主机 IP 的映射
-  # 确保 workspace 容器能访问宿主机上运行的 nginx（https://<宿主机IP>:8443）
-  host {
-    host = "host.docker.internal"
-    ip   = "host-gateway"
-  }
+  # 将 workspace 容器附加到预先创建好的 coderplatform 网络中
+  # 这允许容器内通过 llm-gateway:4000 等 Docker DNS 别名直接访问
+  network_mode = "coderplatform"
 
   # 资源限制
   memory     = data.coder_parameter.memory_gb.value * 1024

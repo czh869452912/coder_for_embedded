@@ -87,10 +87,8 @@ function Get-WorkspaceImageRef {
 
 function Get-LlmGatewayUrl {
     param([hashtable]$Config)
-    $serverHost = if ($Config['SERVER_HOST']) { $Config['SERVER_HOST'] } else { 'localhost' }
-    $gatewayPort = if ($Config['GATEWAY_PORT']) { $Config['GATEWAY_PORT'] } else { '8443' }
-    $llmHost = if ($serverHost -in @('localhost', '127.0.0.1')) { 'host.docker.internal' } else { $serverHost }
-    return "https://${llmHost}:${gatewayPort}/llm"
+    # 容器现已加入 coderplatform，直接通过 Docker DNS 访问网关服务更稳定
+    return "http://llm-gateway:4000"
 }
 
 function Get-TerraformCliConfigMount {
@@ -135,8 +133,15 @@ function Invoke-Init {
     }
 
     $postgresPassword = New-RandomHex -Bytes 16
-    $serverHost = Read-Host 'Server IP or hostname [localhost]'
-    if (-not $serverHost) { $serverHost = 'localhost' }
+    $defaultIp = '192.168.1.100'
+    try {
+        $adapters = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceAlias -notmatch 'Loopback|vEthernet|WSL' -and $_.IPAddress -match '^192\.168\.|^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.' }
+        if ($adapters) { $defaultIp = ($adapters | Select-Object -First 1).IPAddress }
+    } catch {}
+
+    Write-Host '! IMPORTANT: Do not use localhost if running workspaces in Docker. Provide your LAN IP instead.' -ForegroundColor Yellow
+    $serverHost = Read-Host "Server IP or hostname [$defaultIp]"
+    if (-not $serverHost) { $serverHost = $defaultIp }
 
     $gatewayPort = Read-Host 'Gateway port [8443]'
     if (-not $gatewayPort) { $gatewayPort = '8443' }
@@ -541,25 +546,25 @@ function Invoke-SetupCoder {
     }
 
     if ($templateExists) {
-        Write-Warn "Template 'embedded-dev' already exists."
-    } else {
-        $templateDir = Join-Path $ProjectRoot 'workspace-template'
-        Write-Info 'Pushing workspace template...'
-        docker exec coder-server sh -c "rm -rf /tmp/template-push && mkdir -p /tmp/template-push" | Out-Null
-        docker cp "$templateDir/." "coder-server:/tmp/template-push/"
-        if ($LASTEXITCODE -ne 0) {
-            Write-Fail 'Failed to copy template into coder-server.'
-            exit 1
-        }
-
-        $pushCommand = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$sessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' ; rm -rf /tmp/template-push"
-        docker exec coder-server sh -c $pushCommand
-        if ($LASTEXITCODE -ne 0) {
-            Write-Fail 'Template push failed.'
-            exit 1
-        }
-        Write-OK 'Workspace template pushed.'
+        Write-Info "Template 'embedded-dev' already exists. Pushing a new version to apply current variables."
     }
+
+    $templateDir = Join-Path $ProjectRoot 'workspace-template'
+    Write-Info 'Pushing workspace template...'
+    docker exec coder-server sh -c "rm -rf /tmp/template-push && mkdir -p /tmp/template-push" | Out-Null
+    docker cp "$templateDir/." "coder-server:/tmp/template-push/"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail 'Failed to copy template into coder-server.'
+        exit 1
+    }
+
+    $pushCommand = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$sessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' ; rm -rf /tmp/template-push"
+    docker exec coder-server sh -c $pushCommand
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail 'Template push failed.'
+        exit 1
+    }
+    Write-OK 'Workspace template pushed.'
 
     Get-Date | Set-Content $SetupDone
     Show-AccessInfo

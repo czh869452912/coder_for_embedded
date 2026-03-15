@@ -36,12 +36,8 @@ load_effective_config "$CONFIGS_DIR" "$ENV_FILE"
 CODER_INTERNAL_URL="http://localhost:${CODER_INTERNAL_PORT:-7080}"
 
 llm_gateway_url() {
-    local host="${SERVER_HOST:-localhost}"
-    local port="${GATEWAY_PORT:-8443}"
-    if [[ "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
-        host="host.docker.internal"
-    fi
-    echo "https://${host}:${port}/llm"
+    # 容器现已加入 coderplatform，直接通过 Docker DNS 访问网关服务更稳定
+    echo "http://llm-gateway:4000"
 }
 
 wait_for_coder() {
@@ -132,10 +128,9 @@ main() {
     local template_status
     template_status="$(check_template_exists "$session_token")"
     if [ "$template_status" = "200" ]; then
-        warn "Template embedded-dev already exists. Skipping push."
-    else
-        push_template "$session_token"
+        info "Template embedded-dev already exists. Pushing a new version to apply current variables."
     fi
+    push_template "$session_token"
 
     date > "$SETUP_DONE_FILE"
     echo
