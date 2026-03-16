@@ -79,6 +79,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     splint \
     iwyu \
     scons \
+    cpputest \
     ruby \
     ruby-dev \
     pandoc \
@@ -111,7 +112,8 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     sphinx \
     sphinx-rtd-theme \
     breathe \
-    exhale
+    exhale \
+    lcov-cobertura
 
 # ============================================================
 # ARM bare-metal 瀹搞儱鍙块柧鎾呯礄arm-none-eabi閿?# 缁傝崵鍤庨弸鍕紦閿涙艾鐨?arm-gnu-toolchain tar 閸栧懏鏂侀崚?build-artifacts/ 閻╊喖缍?# 楠炶埖娴涢幑顫簰娑?wget 鐞涘奔璐熼敍娆砄PY build-artifacts/arm-gnu-toolchain-*.tar.xz /tmp/arm-toolchain.tar.xz
@@ -128,6 +130,27 @@ RUN mkdir -p /opt/toolchains \
 ENV PATH="/opt/toolchains/arm-none-eabi/bin:${PATH}"
 
 # ============================================================
+# fff (Fake Function Framework) - header-only C mock library
+# ============================================================
+RUN curl -fsSL \
+    "https://raw.githubusercontent.com/meekrosoft/fff/master/fff.h" \
+    -o /usr/local/include/fff.h \
+    && echo "[INFO] fff installed to /usr/local/include/fff.h"
+
+# ============================================================
+# Unity standalone (ThrowTheSwitch) - C unit test framework
+# 鍋?Ceedling 涔嬪, 鏀?/usr/local/include 缁欓」鐩洿鎺ュ紩鐢?# ============================================================
+ENV UNITY_VERSION=v2.6.0
+RUN mkdir -p /opt/unity /usr/local/src \
+    && curl -fsSL \
+       "https://github.com/ThrowTheSwitch/Unity/archive/refs/tags/${UNITY_VERSION}.tar.gz" \
+       | tar -xz --strip-components=1 -C /opt/unity \
+    && cp /opt/unity/src/unity.c           /usr/local/src/unity.c \
+    && cp /opt/unity/src/unity.h           /usr/local/include/unity.h \
+    && cp /opt/unity/src/unity_internals.h /usr/local/include/unity_internals.h \
+    && echo "[INFO] Unity ${UNITY_VERSION} installed"
+
+# ============================================================
 # Node.js + Claude Code CLI
 # 缁傝崵鍤庨弸鍕紦閿涙艾鐨?nodesource 鐎瑰顥婇弴鎸庡床娑撳搫鍞寸純?apt 濠ф劖鍨ㄦ０鍕瑓鏉炵晫娈?.deb 閸?# ============================================================
 ENV NODE_MAJOR=20
@@ -135,7 +158,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @anthropic-ai/claude-code
+RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # opencode AI 缂傛牜鐖滈崝鈺傚 CLI閿涘牆褰查柅澶涚礆
 RUN npm install -g opencode-ai \
@@ -218,6 +241,14 @@ RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extens
 RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension Gruntfuggly.todo-tree \
     || echo "[WARN] todo-tree not available, skipping"
 
+# Test Explorer UI - framework-agnostic test discovery and runner
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension hbenl.vscode-test-explorer \
+    || echo "[WARN] vscode-test-explorer not available, skipping"
+
+# C++ TestMate - Test Adapter for Google Test / Catch2 / doctest / CppUTest
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension matepek.vscode-catch2-test-adapter \
+    || echo "[WARN] vscode-catch2-test-adapter not available, skipping"
+
 # ============================================================
 # 缁傝崵鍤?VSIX 鐎瑰顥婇敍鍫濈殺 .vsix 閺傚洣娆㈤弨鎯у煂 configs/vsix/ 閻╊喖缍嶉敍?# 闁倻鏁ゆ禍?Open VSX 濞屸剝婀侀惃鍕⒖鐏炴洩绱欐俊?ms-vscode.cpptools閵嗕工nthropic.claude-code 缁涘绱?# ============================================================
 RUN mkdir -p /tmp/vsix
@@ -270,7 +301,12 @@ alias qemu-arm="qemu-arm-static"\n\
 alias flash-openocd="openocd"\n\
 alias flash-pyocd="pyocd"\n\
 alias esp-flash="esptool.py"\n\
-alias sphinx-init="sphinx-quickstart"\n' \
+alias sphinx-init="sphinx-quickstart"\n\
+alias cov-lcov="lcov --capture --directory . --output-file coverage.info"\n\
+alias cov-html="gcovr -r . --html --html-details -o coverage.html"\n\
+alias cov-xml="lcov_cobertura coverage.info"\n\
+alias unity-src="ls /usr/local/include/unity*.h /usr/local/src/unity.c"\n\
+alias fff-src="ls /usr/local/include/fff.h"\n' \
     > /etc/profile.d/embedded-dev.sh \
     && cat /etc/profile.d/embedded-dev.sh >> /etc/bash.bashrc
 

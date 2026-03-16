@@ -307,16 +307,53 @@ function Invoke-Save {
         $images.Add($cfg['LITELLM_IMAGE_REF'])
     }
 
+    # Build a digest-ref -> name:tag fallback map in case the digest ref is no longer cached
+    # (e.g. after pulling a newer version of the tag via refresh-versions without -Apply).
+    $refTagFallback = @{}
+    foreach ($entry in @(
+        @{ Ref = 'CODER_IMAGE_REF';           Tag = 'CODER_IMAGE_TAG' },
+        @{ Ref = 'POSTGRES_IMAGE_REF';         Tag = 'POSTGRES_IMAGE_TAG' },
+        @{ Ref = 'NGINX_IMAGE_REF';            Tag = 'NGINX_IMAGE_TAG' },
+        @{ Ref = 'LITELLM_IMAGE_REF';          Tag = 'LITELLM_IMAGE_TAG' },
+        @{ Ref = 'CODE_SERVER_BASE_IMAGE_REF'; Tag = 'CODE_SERVER_BASE_IMAGE_TAG' }
+    )) {
+        $r = $cfg[$entry.Ref]; $t = $cfg[$entry.Tag]
+        if ($r -and $t -and ($r -match '@sha256:')) {
+            $refTagFallback[$r] = "$(($r -split '@')[0]):${t}"
+        }
+    }
+
     foreach ($image in $images) {
         $fileName = ($image -replace '[:/@]', '_') + '.tar'
         $filePath = Join-Path $imagesDir $fileName
-        Write-Info "Saving $image -> $fileName"
-        docker save $image -o $filePath
+
+        # If the digest ref is no longer in the local cache, fall back to name:tag
+        $imageToSave = $image
+        if ($image -match '@sha256:') {
+            $eapSv = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+            docker image inspect $image 2>&1 | Out-Null
+            $checkExit = $LASTEXITCODE
+            $ErrorActionPreference = $eapSv
+            if ($checkExit -ne 0 -and $refTagFallback.ContainsKey($image)) {
+                $imageToSave = $refTagFallback[$image]
+                Write-Warn "Digest ref not in local cache; saving $imageToSave instead."
+                Write-Warn "Run 'refresh-versions -Apply' then 'save' again to keep pinned digests in sync."
+            }
+        }
+
+        Write-Info "Saving $imageToSave -> $fileName"
+        docker save $imageToSave -o $filePath
         if ($LASTEXITCODE -ne 0) {
-            Write-Fail "Failed to save $image"
+            Write-Fail "Failed to save $imageToSave"
             exit 1
         }
-        $sizeMb = [math]::Round((Get-Item $filePath).Length / 1MB)
+        $savedBytes = (Get-Item $filePath).Length
+        $sizeMb = [math]::Round($savedBytes / 1MB)
+        if ($savedBytes -lt 1MB) {
+            Write-Fail "Saved file is unexpectedly small (${savedBytes} bytes). docker save may have failed silently."
+            Write-Fail "If Docker Desktop uses the containerd image store, try: Settings > General > uncheck 'Use containerd for pulling and storing images', restart Docker, then re-pull and re-save."
+            exit 1
+        }
         Write-OK "Saved ${sizeMb} MB"
     }
 }
@@ -335,13 +372,47 @@ function Invoke-Load {
         exit 1
     }
 
+    # Build filename -> name:tag map so digest-referenced images can be retagged after load.
+    # When an image is saved by digest ref (e.g. ghcr.io/coder/coder@sha256:...), the tar has
+    # no RepoTag and docker load reports "Loaded image ID: sha256:..." with no usable name.
+    # Retagging to name:tag lets docker compose find the image without hitting the registry.
+    $cfg = Get-Config
+    $fileTagMap = @{}
+    foreach ($entry in @(
+        @{ Ref = 'CODER_IMAGE_REF';           Tag = 'CODER_IMAGE_TAG' },
+        @{ Ref = 'POSTGRES_IMAGE_REF';         Tag = 'POSTGRES_IMAGE_TAG' },
+        @{ Ref = 'NGINX_IMAGE_REF';            Tag = 'NGINX_IMAGE_TAG' },
+        @{ Ref = 'LITELLM_IMAGE_REF';          Tag = 'LITELLM_IMAGE_TAG' },
+        @{ Ref = 'CODE_SERVER_BASE_IMAGE_REF'; Tag = 'CODE_SERVER_BASE_IMAGE_TAG' }
+    )) {
+        $ref = $cfg[$entry.Ref]
+        $tag = $cfg[$entry.Tag]
+        if ($ref -and $tag -and ($ref -match '@sha256:')) {
+            $fn = ($ref -replace '[:/@]', '_') + '.tar'
+            $imageName = ($ref -split '@')[0]
+            $fileTagMap[$fn] = "${imageName}:${tag}"
+        }
+    }
+
     foreach ($tarFile in $tarFiles) {
         $sizeMb = [math]::Round($tarFile.Length / 1MB)
         Write-Info "Loading $($tarFile.Name) (${sizeMb} MB)"
-        docker load -i $tarFile.FullName
+        $loadOutput = docker load -i $tarFile.FullName 2>&1
+        $loadOutput | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -ne 0) {
             Write-Fail "Failed to load $($tarFile.Name)"
             exit 1
+        }
+
+        # If loaded without a repo tag, retag with name:tag so compose can resolve it offline
+        $outputStr = $loadOutput | Out-String
+        if ($outputStr -match 'Loaded image ID:\s*(sha256:\S+)') {
+            $imageId = $Matches[1]
+            $targetTag = $fileTagMap[$tarFile.Name]
+            if ($targetTag) {
+                Write-Info "Tagging $imageId -> $targetTag"
+                docker tag $imageId $targetTag
+            }
         }
     }
 
@@ -400,6 +471,44 @@ function Invoke-Up {
         Write-Warn 'Connected Terraform mode is active and the provider cache is missing. Terraform will fall back to the public registry.'
     } elseif (-not $offlineTerraformMode) {
         Write-Info 'Connected Terraform mode is active. Local providers will be used first, then registry fallback is allowed.'
+    }
+
+    # In offline/loaded mode Docker cannot resolve digest refs against the registry.
+    # Override image ref env vars to use name:tag format before invoking compose,
+    # so compose resolves against the locally loaded (and retagged) images.
+    $requiredImages = [System.Collections.Generic.List[string]]@()
+    foreach ($mapping in @(
+        @{ Ref = 'CODER_IMAGE_REF';    Tag = 'CODER_IMAGE_TAG'    },
+        @{ Ref = 'POSTGRES_IMAGE_REF'; Tag = 'POSTGRES_IMAGE_TAG' },
+        @{ Ref = 'NGINX_IMAGE_REF';    Tag = 'NGINX_IMAGE_TAG'    },
+        @{ Ref = 'LITELLM_IMAGE_REF';  Tag = 'LITELLM_IMAGE_TAG'  }
+    )) {
+        $ref = $cfg[$mapping.Ref]
+        $tag = $cfg[$mapping.Tag]
+        if (-not $ref) { continue }
+        if ($ref -match '@sha256:' -and $tag) {
+            $nameTag = "$(($ref -split '@')[0]):${tag}"
+            [System.Environment]::SetEnvironmentVariable($mapping.Ref, $nameTag, 'Process')
+            $requiredImages.Add($nameTag)
+        } else {
+            $requiredImages.Add($ref)
+        }
+    }
+
+    # Pre-flight: verify every required image exists locally so compose never falls back to a pull
+    $missingImages = [System.Collections.Generic.List[string]]@()
+    $eapPf = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    foreach ($img in $requiredImages) {
+        if (-not $script:UseLlm -and $img -match 'litellm') { continue }
+        docker image inspect $img 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { $missingImages.Add($img) }
+    }
+    $ErrorActionPreference = $eapPf
+    if ($missingImages.Count -gt 0) {
+        Write-Fail "The following images are not available locally. Run 'load' (with the correct flags) first:"
+        $missingImages | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+        exit 1
     }
 
     $composeArgs = if ($script:UseLlm) { @('--profile', 'llm', 'up', '-d') } else { @('up', '-d') }

@@ -281,28 +281,81 @@ save_images() {
         images+=("$LITELLM_IMAGE_REF")
     fi
 
-    local image filename filepath
+    # If the digest ref is no longer in the local cache (e.g. after pulling a newer tag via
+    # refresh-versions without -Apply), fall back to name:tag so the save can still succeed.
+    local image filename filepath image_to_save ref_key ref tag_key tag fallback
     for image in "${images[@]}"; do
         filename="$(printf '%s' "$image" | tr '/:@' '_').tar"
         filepath="$PROJECT_ROOT/images/$filename"
-        info "Saving $image -> $filename"
-        docker save -o "$filepath" "$image"
-        ok "Saved $filename"
+
+        image_to_save="$image"
+        if [[ "$image" == *@sha256:* ]]; then
+            if ! docker image inspect "$image" >/dev/null 2>&1; then
+                fallback=""
+                for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF; do
+                    ref="${!ref_key:-}"
+                    [ "$ref" = "$image" ] || continue
+                    tag_key="${ref_key/_REF/_TAG}"
+                    tag="${!tag_key:-}"
+                    [ -n "$tag" ] && fallback="${image%%@sha256:*}:${tag}"
+                    break
+                done
+                if [ -n "$fallback" ]; then
+                    warn "Digest ref not in local cache; saving $fallback instead."
+                    warn "Run 'refresh-versions -Apply' then 'save' again to keep pinned digests in sync."
+                    image_to_save="$fallback"
+                fi
+            fi
+        fi
+
+        info "Saving $image_to_save -> $filename"
+        docker save -o "$filepath" "$image_to_save"
+        local saved_bytes
+        saved_bytes="$(stat -c%s "$filepath" 2>/dev/null || stat -f%z "$filepath" 2>/dev/null || echo 0)"
+        if [ "$saved_bytes" -lt 1048576 ]; then
+            fail "Saved file is unexpectedly small (${saved_bytes} bytes). docker save may have failed silently.
+If Docker Desktop uses the containerd image store, try pulling with --platform linux/amd64 first, then re-save."
+        fi
+        ok "Saved $(( saved_bytes / 1048576 )) MB  ($filename)"
     done
 }
 
 load_images() {
     check_deps
+    load_config
     [ -d "$PROJECT_ROOT/images" ] || fail "images directory not found"
     shopt -s nullglob
     local tar_files=("$PROJECT_ROOT/images"/*.tar)
     shopt -u nullglob
     [ ${#tar_files[@]} -gt 0 ] || fail "No image tarballs found in images"
 
-    local tar_file
+    # When an image is saved by digest ref (e.g. ghcr.io/coder/coder@sha256:...), the tar has
+    # no RepoTag and docker load reports "Loaded image ID: sha256:..." with no usable name.
+    # Retagging to name:tag lets docker compose find the image without hitting the registry.
+    local tar_file base load_output image_id
     for tar_file in "${tar_files[@]}"; do
-        info "Loading $(basename "$tar_file")"
-        docker load -i "$tar_file"
+        base="$(basename "$tar_file")"
+        info "Loading $base"
+        load_output="$(docker load -i "$tar_file" 2>&1)"
+        echo "$load_output"
+
+        # If loaded without a repo tag, retag with name:tag so compose can resolve it offline
+        image_id="$(echo "$load_output" | awk '/Loaded image ID:/{print $NF}')"
+        if [ -n "$image_id" ]; then
+            local ref_key ref fn tag_key tag
+            for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF; do
+                ref="${!ref_key:-}"
+                [[ "$ref" == *@sha256:* ]] || continue
+                fn="$(printf '%s' "$ref" | tr '/:@' '_').tar"
+                [ "$fn" = "$base" ] || continue
+                tag_key="${ref_key/_REF/_TAG}"
+                tag="${!tag_key:-}"
+                [ -n "$tag" ] || continue
+                info "Tagging $image_id -> ${ref%%@sha256:*}:${tag}"
+                docker tag "$image_id" "${ref%%@sha256:*}:${tag}"
+                break
+            done
+        fi
     done
 
     ok "Images loaded"
@@ -351,6 +404,37 @@ start_services() {
         warn "Connected Terraform mode is active and the provider cache is missing. Terraform will fall back to the public registry."
     elif [ "$offline_terraform_mode" = false ]; then
         info "Connected Terraform mode is active. Local providers will be used first, then registry fallback is allowed."
+    fi
+
+    # In offline/loaded mode Docker cannot resolve digest refs against the registry.
+    # Override image ref env vars to use name:tag format before invoking compose,
+    # so compose resolves against the locally loaded (and retagged) images.
+    local ref_key ref tag_key tag
+    local -a required_images=()
+    for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF; do
+        ref="${!ref_key:-}"
+        [ -n "$ref" ] || continue
+        if [[ "$ref" == *@sha256:* ]]; then
+            tag_key="${ref_key/_REF/_TAG}"
+            tag="${!tag_key:-}"
+            [ -n "$tag" ] || continue
+            export "$ref_key"="${ref%%@sha256:*}:${tag}"
+            required_images+=("${ref%%@sha256:*}:${tag}")
+        else
+            required_images+=("$ref")
+        fi
+    done
+
+    # Pre-flight: verify every required image exists locally so compose never falls back to a pull
+    local missing_images=()
+    for img in "${required_images[@]}"; do
+        [ "$USE_LLM" = false ] && [[ "$img" == *litellm* ]] && continue
+        if ! docker image inspect "$img" >/dev/null 2>&1; then
+            missing_images+=("$img")
+        fi
+    done
+    if [ ${#missing_images[@]} -gt 0 ]; then
+        fail "The following images are not available locally. Run 'load' (with the correct flags) first:$(printf '\n  - %s' "${missing_images[@]}")"
     fi
 
     cd "$DOCKER_DIR"
