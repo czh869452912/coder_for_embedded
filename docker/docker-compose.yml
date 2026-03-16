@@ -34,7 +34,7 @@ services:
       CODER_ACCESS_URL: "https://${SERVER_HOST:-localhost}:${GATEWAY_PORT:-8443}"
       CODER_PG_CONNECTION_URL: "postgresql://coder:${POSTGRES_PASSWORD:-changeme_db}@postgres/coder?sslmode=disable"
       CODER_PROXY_TRUSTED_HEADERS: "X-Forwarded-For,X-Real-IP,X-Forwarded-Proto"
-      CODER_PROXY_TRUSTED_ORIGINS: "172.20.0.0/24"
+      CODER_PROXY_TRUSTED_ORIGINS: "172.28.0.0/16"
       CODER_TELEMETRY_ENABLE: "false"
       CODER_UPDATE_CHECK: "false"
       TF_CLI_CONFIG_FILE: "/home/coder/.terraformrc"
@@ -105,7 +105,7 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.20.0.0/24
+        - subnet: 172.28.0.0/16
 
 volumes:
   postgres-data:
