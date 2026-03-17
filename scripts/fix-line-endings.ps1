@@ -32,8 +32,9 @@ $totalSkipped = 0
 foreach ($ext in $extensions) {
     $files = Get-ChildItem -Path $root -Filter $ext -Recurse -File -ErrorAction SilentlyContinue
     foreach ($file in $files) {
-        # 读取原始字节，检测是否含有 CRLF
+        # 读取原始字节，检测是否含有 CRLF 或 UTF-8 BOM (EF BB BF)
         $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+
         $hasCRLF = $false
         for ($i = 0; $i -lt $bytes.Length - 1; $i++) {
             if ($bytes[$i] -eq 0x0D -and $bytes[$i+1] -eq 0x0A) {
@@ -42,26 +43,39 @@ foreach ($ext in $extensions) {
             }
         }
 
-        if (-not $hasCRLF) {
+        $hasBOM = ($bytes.Length -ge 3 -and
+                   $bytes[0] -eq 0xEF -and
+                   $bytes[1] -eq 0xBB -and
+                   $bytes[2] -eq 0xBF)
+
+        if (-not $hasCRLF -and -not $hasBOM) {
             $totalSkipped++
             continue
         }
 
+        $issues = @()
+        if ($hasCRLF) { $issues += 'CRLF' }
+        if ($hasBOM)  { $issues += 'BOM'  }
+        $issueStr = $issues -join '+'
+
         $relPath = $file.FullName.Substring($root.Length + 1)
         if ($DryRun) {
-            Write-Host "[检测到 CRLF] $relPath" -ForegroundColor Cyan
+            Write-Host "[检测到 $issueStr] $relPath" -ForegroundColor Cyan
         } else {
-            # 将所有 CRLF (0x0D 0x0A) 替换为 LF (0x0A)
             $newBytes = [System.Collections.Generic.List[byte]]::new($bytes.Length)
-            for ($i = 0; $i -lt $bytes.Length; $i++) {
+            $start = 0
+            # 跳过 UTF-8 BOM
+            if ($hasBOM) { $start = 3 }
+
+            for ($i = $start; $i -lt $bytes.Length; $i++) {
+                # 跳过 CR（0x0D），仅保留 LF（0x0A）
                 if ($bytes[$i] -eq 0x0D -and ($i + 1 -lt $bytes.Length) -and $bytes[$i+1] -eq 0x0A) {
-                    # 跳过 CR，只保留 LF（由下一次循环写入）
                     continue
                 }
                 $newBytes.Add($bytes[$i])
             }
             [System.IO.File]::WriteAllBytes($file.FullName, $newBytes.ToArray())
-            Write-Host "[已修复] $relPath" -ForegroundColor Green
+            Write-Host "[已修复 $issueStr] $relPath" -ForegroundColor Green
         }
         $totalFixed++
     }
@@ -69,7 +83,7 @@ foreach ($ext in $extensions) {
 
 Write-Host ""
 if ($DryRun) {
-    Write-Host "检测完成：$totalFixed 个文件含 CRLF，$totalSkipped 个文件已是 LF。" -ForegroundColor Yellow
+    Write-Host "检测完成：$totalFixed 个文件含 CRLF/BOM，$totalSkipped 个文件无需处理。" -ForegroundColor Yellow
 } else {
-    Write-Host "完成：已修复 $totalFixed 个文件，跳过 $totalSkipped 个文件（已是 LF）。" -ForegroundColor Green
+    Write-Host "完成：已修复 $totalFixed 个文件，跳过 $totalSkipped 个文件（无需处理）。" -ForegroundColor Green
 }

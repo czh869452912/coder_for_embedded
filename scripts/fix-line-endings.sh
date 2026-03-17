@@ -37,26 +37,37 @@ done
 FIND_ARGS=("${FIND_ARGS[@]:1}")
 
 while IFS= read -r -d '' file; do
-    # 判断是否含有 CR (\r)
-    if ! grep -qP '\r' "$file" 2>/dev/null; then
+    has_crlf=false
+    has_bom=false
+
+    grep -qP '\r' "$file" 2>/dev/null && has_crlf=true
+    grep -qP '^\xEF\xBB\xBF' "$file" 2>/dev/null && has_bom=true
+
+    if ! $has_crlf && ! $has_bom; then
         ((SKIPPED++)) || true
         continue
     fi
 
     rel="${file#"$ROOT/"}"
+    issues=""
+    $has_crlf && issues+="CRLF"
+    $has_bom  && { [[ -n "$issues" ]] && issues+="+"; issues+="BOM"; }
+
     if $DRY_RUN; then
-        echo "[检测到 CRLF] $rel"
+        echo "[检测到 ${issues}] $rel"
     else
-        # 优先用 sed -i 原地替换（不依赖 dos2unix）
-        sed -i 's/\r$//' "$file"
-        echo "[已修复] $rel"
+        # 移除 BOM（文件首行开头的 UTF-8 BOM：EF BB BF）
+        $has_bom  && sed -i '1s/^\xEF\xBB\xBF//' "$file"
+        # 移除 CRLF（不依赖 dos2unix）
+        $has_crlf && sed -i 's/\r$//' "$file"
+        echo "[已修复 ${issues}] $rel"
     fi
     ((FIXED++)) || true
 done < <(find "$ROOT" \( "${FIND_ARGS[@]}" \) -type f -print0)
 
 echo ""
 if $DRY_RUN; then
-    echo "检测完成：${FIXED} 个文件含 CRLF，${SKIPPED} 个文件已是 LF。"
+    echo "检测完成：${FIXED} 个文件含 CRLF/BOM，${SKIPPED} 个文件无需处理。"
 else
-    echo "完成：已修复 ${FIXED} 个文件，跳过 ${SKIPPED} 个文件（已是 LF）。"
+    echo "完成：已修复 ${FIXED} 个文件，跳过 ${SKIPPED} 个文件（无需处理）。"
 fi
