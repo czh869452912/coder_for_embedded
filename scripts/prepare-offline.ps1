@@ -1,229 +1,257 @@
-# ============================================================
-# Prepare offline resources (run on an internet-connected machine)
-#
-# Downloads:
-#   1. Terraform provider zips -> configs\terraform-providers\
-#   2. Platform Docker images  -> images\*.tar
-#   3. Builds workspace image  -> images\workspace-embedded_latest.tar
-#
-# Usage:
-#   .\scripts\prepare-offline.ps1
-#   .\scripts\prepare-offline.ps1 -SkipImages   # only download TF providers
-#   .\scripts\prepare-offline.ps1 -SkipBuild    # skip workspace image build
-# ============================================================
-#Requires -Version 5.1
-
 param(
-    [switch]$SkipImages,   # skip docker pull/save
-    [switch]$SkipBuild,    # skip workspace image build+save
-    [switch]$IncludeLlm    # also save litellm image
+    [switch]$SkipImages,
+    [switch]$SkipBuild,
+    [switch]$IncludeLlm
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$PSNativeCommandUseErrorActionPreference = $false
 
-$ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
-$ConfigsDir  = Join-Path $ProjectRoot "configs"
-$DockerDir   = Join-Path $ProjectRoot "docker"
-$ImagesDir   = Join-Path $ProjectRoot "images"
+$ConfigsDir = Join-Path $ProjectRoot 'configs'
+$DockerDir = Join-Path $ProjectRoot 'docker'
+$ImagesDir = Join-Path $ProjectRoot 'images'
+$EnvFile = Join-Path $DockerDir '.env'
+$ManifestPath = Join-Path $ProjectRoot 'offline-manifest.json'
 
-function Write-Info { param($msg) Write-Host "[INFO]  $msg" -ForegroundColor Cyan }
-function Write-OK   { param($msg) Write-Host "[ OK ]  $msg" -ForegroundColor Green }
-function Write-Warn { param($msg) Write-Host "[WARN]  $msg" -ForegroundColor Yellow }
-function Write-Fail { param($msg) Write-Host "[FAIL]  $msg" -ForegroundColor Red }
+. (Join-Path $ScriptDir 'lib\offline-common.ps1')
 
-function Read-EnvFile {
-    $h = @{}
-    $envFile = Join-Path $DockerDir ".env"
-    if (-not (Test-Path $envFile)) { return $h }
-    Get-Content $envFile | ForEach-Object {
-        $line = $_.Trim()
-        if ($line -and -not $line.StartsWith('#') -and $line -match '^([^=]+)=(.*)$') {
-            $h[$matches[1].Trim()] = $matches[2].Trim()
-        }
+function Write-Info { param([string]$Message) Write-Host "[INFO]  $Message" -ForegroundColor Cyan }
+function Write-OK { param([string]$Message) Write-Host "[ OK ]  $Message" -ForegroundColor Green }
+function Write-Warn { param([string]$Message) Write-Host "[WARN]  $Message" -ForegroundColor Yellow }
+function Write-Fail { param([string]$Message) Write-Host "[FAIL]  $Message" -ForegroundColor Red }
+
+function Get-Config {
+    if (Test-Path $EnvFile) {
+        Ensure-EnvDefaults -EnvFile $EnvFile -ConfigsDir $ConfigsDir
     }
-    return $h
+    return Get-EffectiveConfig -ConfigsDir $ConfigsDir -EnvFile $EnvFile
 }
 
-# ============================================================
-# Step 1: Download Terraform providers
-# ============================================================
+function Get-ImageArchiveName {
+    param([string]$ImageRef)
+    return (($ImageRef -replace '[:/@]', '_') + '.tar')
+}
+
+function Get-WorkspaceArchiveName {
+    param([hashtable]$Config)
+    $workspaceImage = if ($Config['WORKSPACE_IMAGE']) { $Config['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
+    $workspaceTag = if ($Config['WORKSPACE_IMAGE_TAG']) { $Config['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
+    return "${workspaceImage}_$workspaceTag.tar"
+}
+
+function Get-VsixExtensions {
+    Write-Info '=== Step 0: Downloading VS Code extensions (.vsix) ==='
+    $vsixDir = Join-Path $ConfigsDir 'vsix'
+    New-Item -ItemType Directory -Path $vsixDir -Force | Out-Null
+
+    # Extensions unavailable on Open VSX that must be pre-downloaded as .vsix files.
+    # The Dockerfile installs any .vsix found in configs/vsix/ as a fallback.
+
+    # cmake-tools: not on Open VSX (Microsoft proprietary), simple direct URL
+    $cmakeDest = Join-Path $vsixDir 'ms-vscode.cmake-tools.vsix'
+    if (Test-Path $cmakeDest) {
+        Write-OK 'Already downloaded: ms-vscode.cmake-tools.vsix'
+    } else {
+        Write-Info 'Downloading ms-vscode.cmake-tools'
+        $cmakeUrl = 'https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-vscode/vsextensions/cmake-tools/latest/vspackage'
+        try {
+            Invoke-WebRequest -Uri $cmakeUrl -OutFile $cmakeDest -TimeoutSec 120 -UseBasicParsing -ErrorAction Stop
+            Write-OK 'Saved ms-vscode.cmake-tools.vsix'
+        } catch {
+            Write-Warn "Failed to download cmake-tools — continuing without it (not fatal)"
+            Remove-Item $cmakeDest -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # cpptools linux-x64: platform-specific extension, requires Gallery API to resolve CDN URL
+    $cpptoolsDest = Join-Path $vsixDir 'ms-vscode.cpptools-linux-x64.vsix'
+    if (Test-Path $cpptoolsDest) {
+        Write-OK 'Already downloaded: ms-vscode.cpptools-linux-x64.vsix'
+    } else {
+        Write-Info 'Downloading ms-vscode.cpptools (linux-x64)'
+        try {
+            $queryBody = '{"filters":[{"criteria":[{"filterType":7,"value":"ms-vscode.cpptools"}]}],"flags":2151}'
+            $apiResp = Invoke-RestMethod -Uri 'https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery' `
+                -Method POST -ContentType 'application/json' -Body $queryBody `
+                -Headers @{ 'Accept' = 'application/json;api-version=3.0-preview.1' } -TimeoutSec 20 -ErrorAction Stop
+            $versions = $apiResp.results[0].extensions[0].versions
+            $linuxVer = $versions | Where-Object { $_.targetPlatform -eq 'linux-x64' } | Select-Object -First 1
+            $vsixAsset = $linuxVer.files | Where-Object { $_.assetType -eq 'Microsoft.VisualStudio.Services.VSIXPackage' }
+            Invoke-WebRequest -Uri $vsixAsset.source -OutFile $cpptoolsDest -TimeoutSec 300 -UseBasicParsing -ErrorAction Stop
+            Write-OK 'Saved ms-vscode.cpptools-linux-x64.vsix'
+        } catch {
+            Write-Warn "Failed to download cpptools — continuing without it (not fatal)"
+            Remove-Item $cpptoolsDest -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Get-TerraformProviders {
-    Write-Info "=== Step 1: Downloading Terraform providers ==="
+    Write-Info '=== Step 1: Downloading Terraform providers ==='
+    $cfg = Get-Config
 
-    # Read provider versions from main.tf
-    $mainTf = Join-Path $ProjectRoot "workspace-template\main.tf"
-    $tfContent = Get-Content $mainTf -Raw
-
-    # Extract version constraints (take the latest matching version)
-    $coderVerConstraint   = if ($tfContent -match '"~>\s*([\d\.]+)"[^}]*coder/coder|coder/coder[^}]*"~>\s*([\d\.]+)"') { $matches[1] + $matches[2] } else { "2" }
-    $dockerVerConstraint  = if ($tfContent -match '"~>\s*([\d\.]+)"[^}]*kreuzwerker/docker|kreuzwerker/docker[^}]*"~>\s*([\d\.]+)"') { $matches[1] + $matches[2] } else { "3" }
-
-    # Provider specs: [namespace, type, major_version, os, arch]
     $providers = @(
-        @{ ns = "coder";        type = "coder";  major = "2"; os = "linux"; arch = "amd64" },
-        @{ ns = "kreuzwerker";  type = "docker"; major = "3"; os = "linux"; arch = "amd64" }
+        @{ Namespace = 'coder'; Type = 'coder'; Version = $cfg['TF_PROVIDER_CODER_VERSION']; Os = 'linux'; Arch = 'amd64' },
+        @{ Namespace = 'kreuzwerker'; Type = 'docker'; Version = $cfg['TF_PROVIDER_DOCKER_VERSION']; Os = 'linux'; Arch = 'amd64' }
     )
 
-    foreach ($p in $providers) {
-        $regUrl = "https://registry.terraform.io/v1/providers/$($p.ns)/$($p.type)/versions"
-        Write-Info "  Fetching available versions for $($p.ns)/$($p.type)..."
+    foreach ($provider in $providers) {
+        $downloadInfoUrl = "https://registry.terraform.io/v1/providers/$($provider.Namespace)/$($provider.Type)/$($provider.Version)/download/$($provider.Os)/$($provider.Arch)"
+        $destinationDir = Join-Path $ConfigsDir "terraform-providers\registry.terraform.io\$($provider.Namespace)\$($provider.Type)\$($provider.Version)\$($provider.Os)_$($provider.Arch)"
+        New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
 
-        try {
-            $versionsResp = Invoke-RestMethod -Uri $regUrl -TimeoutSec 30 -ErrorAction Stop
-        } catch {
-            Write-Fail "  Failed to query registry for $($p.ns)/$($p.type): $_"
+        $zipName = "terraform-provider-$($provider.Type)_$($provider.Version)_$($provider.Os)_$($provider.Arch).zip"
+        $zipPath = Join-Path $destinationDir $zipName
+        $extractedMarker = Join-Path $destinationDir '.extracted'
+        
+        if (Test-Path $extractedMarker) {
+            Write-OK "Already downloaded and extracted: $zipName"
             continue
         }
 
-        # Find latest version matching major version constraint
-        $matching = $versionsResp.versions |
-            Where-Object { $_.version -match "^$($p.major)\." } |
-            Sort-Object { [version]$_.version } -Descending |
-            Select-Object -First 1
-
-        if (-not $matching) {
-            Write-Fail "  No matching version found for $($p.ns)/$($p.type) ~> $($p.major).x"
-            continue
-        }
-
-        $version = $matching.version
-        Write-Info "  Latest $($p.ns)/$($p.type): v$version"
-
-        # Get download URL
-        $dlUrl = "https://registry.terraform.io/v1/providers/$($p.ns)/$($p.type)/$version/download/$($p.os)/$($p.arch)"
-        try {
-            $dlInfo = Invoke-RestMethod -Uri $dlUrl -TimeoutSec 30 -ErrorAction Stop
-        } catch {
-            Write-Fail "  Failed to get download info: $_"
-            continue
-        }
-
-        # Create directory structure
-        $destDir = Join-Path $ConfigsDir "terraform-providers\registry.terraform.io\$($p.ns)\$($p.type)\$version\$($p.os)_$($p.arch)"
-        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
-
-        $zipName = "terraform-provider-$($p.type)_${version}_$($p.os)_$($p.arch).zip"
-        $zipPath = Join-Path $destDir $zipName
-
-        if (Test-Path $zipPath) {
-            Write-OK "  Already downloaded: $zipName"
-            continue
-        }
-
-        Write-Info "  Downloading $zipName..."
-        try {
-            Invoke-WebRequest -Uri $dlInfo.download_url -OutFile $zipPath -TimeoutSec 300 -ErrorAction Stop
-            $sizeMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 1)
-            Write-OK "  Downloaded $zipName (${sizeMB} MB)"
-        } catch {
-            Write-Fail "  Download failed: $_"
-            Remove-Item $zipPath -ErrorAction SilentlyContinue
-        }
+        Write-Info "Downloading $zipName"
+        $downloadInfo = Invoke-RestMethod -Uri $downloadInfoUrl -TimeoutSec 30
+        Invoke-WebRequest -Uri $downloadInfo.download_url -OutFile $zipPath -TimeoutSec 300
+        Expand-Archive -Path $zipPath -DestinationPath $destinationDir -Force
+        Remove-Item $zipPath -Force
+        Set-Content -Path $extractedMarker -Value '1'
+        Write-OK "Saved and extracted $zipName"
     }
-    Write-OK "Terraform providers download complete."
-    Write-Info "  Directory: $ConfigsDir\terraform-providers\"
 }
 
-# ============================================================
-# Step 2: Pull and save platform Docker images
-# ============================================================
 function Save-PlatformImages {
-    Write-Info "=== Step 2: Pulling and saving platform Docker images ==="
+    Write-Info '=== Step 2: Pulling and saving runtime images ==='
+    $cfg = Get-Config
     New-Item -ItemType Directory -Path $ImagesDir -Force | Out-Null
-
-    $env      = Read-EnvFile
-    $coderImg = if ($env["CODER_IMAGE"])       { $env["CODER_IMAGE"] }       else { "ghcr.io/coder/coder" }
-    $coderVer = if ($env["CODER_VERSION"])     { $env["CODER_VERSION"] }     else { "latest" }
-    $pgVer    = if ($env["POSTGRES_VERSION"]) { $env["POSTGRES_VERSION"] } else { "16" }
 
     $images = [System.Collections.Generic.List[string]]@(
-        "${coderImg}:${coderVer}",
-        "postgres:${pgVer}-alpine",
-        "nginx:alpine"
+        $cfg['CODER_IMAGE_REF'],
+        $cfg['POSTGRES_IMAGE_REF'],
+        $cfg['NGINX_IMAGE_REF']
     )
-    if ($IncludeLlm) { $images.Add("ghcr.io/berriai/litellm:main-latest") }
+    if ($IncludeLlm) {
+        $images.Add($cfg['LITELLM_IMAGE_REF'])
+    }
 
-    foreach ($img in $images) {
-        Write-Info "  Pulling $img..."
-        docker pull $img
-        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to pull $img"; exit 1 }
+    foreach ($image in $images) {
+        Write-Info "Pulling $image"
+        docker pull $image
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to pull $image"; exit 1 }
 
-        $fname = ($img -replace "[:/]", "_") + ".tar"
-        $fpath = Join-Path $ImagesDir $fname
-        Write-Info "  Saving $img -> $fname..."
-        docker save $img -o $fpath
-        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to save $img"; exit 1 }
-        $sizeMB = [math]::Round((Get-Item $fpath).Length / 1MB)
-        Write-OK "  Saved $fname (${sizeMB} MB)"
+        $fileName = Get-ImageArchiveName -ImageRef $image
+        $filePath = Join-Path $ImagesDir $fileName
+        Write-Info "Saving $image -> $fileName"
+        docker save $image -o $filePath
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to save $image"; exit 1 }
+        Write-OK "Saved $fileName"
     }
 }
 
-# ============================================================
-# Step 3: Build and save workspace image
-# ============================================================
 function Build-WorkspaceImage {
-    Write-Info "=== Step 3: Building workspace image ==="
+    Write-Info '=== Step 3: Building and saving workspace image ==='
+    $cfg = Get-Config
+    $sslDir = Join-Path $ConfigsDir 'ssl'
+    $serverHost = if ($cfg['SERVER_HOST']) { $cfg['SERVER_HOST'] } else { 'localhost' }
+    $workspaceImage = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
+    $workspaceTag = if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
 
-    $env     = Read-EnvFile
-    $imgName = if ($env["WORKSPACE_IMAGE"])     { $env["WORKSPACE_IMAGE"] }     else { "workspace-embedded" }
-    $imgTag  = if ($env["WORKSPACE_IMAGE_TAG"]) { $env["WORKSPACE_IMAGE_TAG"] } else { "latest" }
-
-    # Ensure SSL cert exists (baked into workspace image)
-    $sslCrt = Join-Path $ConfigsDir "ssl\server.crt"
-    if (-not (Test-Path $sslCrt)) {
-        Write-Warn "SSL cert not found. Generating for localhost..."
-        & (Join-Path $ScriptDir "manage.ps1") ssl localhost
+    if (-not (Test-Path (Join-Path $sslDir 'ca.crt'))) {
+        Write-Warn 'No root CA found. Generating CA and leaf certificate now.'
+        Issue-LeafCertificate -SslDir $sslDir -ServerHost $serverHost | Out-Null
+    } elseif (-not (Test-Path (Join-Path $sslDir 'server.crt'))) {
+        Write-Warn 'Root CA exists but leaf certificate is missing. Issuing one now.'
+        Issue-LeafCertificate -SslDir $sslDir -ServerHost $serverHost | Out-Null
     }
 
-    Write-Info "  Building ${imgName}:${imgTag} (may take 20-40 minutes)..."
-    docker build -f "$DockerDir\Dockerfile.workspace" -t "${imgName}:${imgTag}" $ProjectRoot
-    if ($LASTEXITCODE -ne 0) { Write-Fail "Build failed."; exit 1 }
-    Write-OK "  Build complete: ${imgName}:${imgTag}"
+    Write-Info "Pulling build base image $($cfg['CODE_SERVER_BASE_IMAGE_REF'])"
+    docker pull $cfg['CODE_SERVER_BASE_IMAGE_REF']
+    if ($LASTEXITCODE -ne 0) { Write-Fail 'Failed to pull code-server base image'; exit 1 }
+
+    Write-Info "Building ${workspaceImage}:${workspaceTag}"
+    docker build -f "$DockerDir\Dockerfile.workspace" --build-arg "CODE_SERVER_BASE_IMAGE_REF=$($cfg['CODE_SERVER_BASE_IMAGE_REF'])" -t "${workspaceImage}:${workspaceTag}" $ProjectRoot
+    if ($LASTEXITCODE -ne 0) { Write-Fail 'Workspace image build failed'; exit 1 }
 
     New-Item -ItemType Directory -Path $ImagesDir -Force | Out-Null
-    $fname = ($imgName -replace "[:/]", "_") + "_$imgTag.tar"
-    $fpath = Join-Path $ImagesDir $fname
-    Write-Info "  Saving workspace image -> $fname..."
-    docker save "${imgName}:${imgTag}" -o $fpath
-    if ($LASTEXITCODE -ne 0) { Write-Fail "Save failed."; exit 1 }
-    $sizeMB = [math]::Round((Get-Item $fpath).Length / 1MB)
-    Write-OK "  Saved $fname (${sizeMB} MB)"
+    $fileName = Get-WorkspaceArchiveName -Config $cfg
+    $filePath = Join-Path $ImagesDir $fileName
+    Write-Info "Saving ${workspaceImage}:${workspaceTag} -> $fileName"
+    docker save "${workspaceImage}:${workspaceTag}" -o $filePath
+    if ($LASTEXITCODE -ne 0) { Write-Fail 'Failed to save workspace image'; exit 1 }
+    Write-OK "Saved $fileName"
 }
 
-# ============================================================
-# Main
-# ============================================================
-Write-Host "=== Coder Offline Resource Preparation ===" -ForegroundColor Blue
-Write-Host ""
+function Write-OfflineManifest {
+    $cfg = Get-Config
+    $caCert = Join-Path $ConfigsDir 'ssl\ca.crt'
+    $images = @(
+        [ordered]@{ ref = $cfg['CODER_IMAGE_REF']; archive = "images/$((Get-ImageArchiveName -ImageRef $cfg['CODER_IMAGE_REF']))" },
+        [ordered]@{ ref = $cfg['POSTGRES_IMAGE_REF']; archive = "images/$((Get-ImageArchiveName -ImageRef $cfg['POSTGRES_IMAGE_REF']))" },
+        [ordered]@{ ref = $cfg['NGINX_IMAGE_REF']; archive = "images/$((Get-ImageArchiveName -ImageRef $cfg['NGINX_IMAGE_REF']))" },
+        [ordered]@{ ref = "$(if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }):$(if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' })"; archive = "images/$((Get-WorkspaceArchiveName -Config $cfg))" }
+    )
+    if ($IncludeLlm) {
+        $images += [ordered]@{ ref = $cfg['LITELLM_IMAGE_REF']; archive = "images/$((Get-ImageArchiveName -ImageRef $cfg['LITELLM_IMAGE_REF']))" }
+    }
 
-# Always download TF providers
+    $providers = @(
+        [ordered]@{
+            source = 'registry.terraform.io/coder/coder'
+            version = $cfg['TF_PROVIDER_CODER_VERSION']
+            archive = "configs/terraform-providers/registry.terraform.io/coder/coder/$($cfg['TF_PROVIDER_CODER_VERSION'])/linux_amd64/.extracted"
+        },
+        [ordered]@{
+            source = 'registry.terraform.io/kreuzwerker/docker'
+            version = $cfg['TF_PROVIDER_DOCKER_VERSION']
+            archive = "configs/terraform-providers/registry.terraform.io/kreuzwerker/docker/$($cfg['TF_PROVIDER_DOCKER_VERSION'])/linux_amd64/.extracted"
+        }
+    )
+
+    $manifest = [ordered]@{
+        generated_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        include_llm = [bool]$IncludeLlm
+        terraform_cli_config_mount_default = '../configs/terraform-offline.rc'
+        ca_sha256 = if (Test-Path $caCert) { (Get-FileHash $caCert -Algorithm SHA256).Hash.ToLowerInvariant() } else { '' }
+        images = $images
+        providers = $providers
+    }
+
+    $json = $manifest | ConvertTo-Json -Depth 6
+    [System.IO.File]::WriteAllText($ManifestPath, $json + "`r`n", [System.Text.UTF8Encoding]::new($false))
+    Write-OK "Wrote $ManifestPath"
+}
+
+Write-Host '=== Coder Offline Resource Preparation ===' -ForegroundColor Blue
+Write-Host ''
+
+Get-VsixExtensions
+Write-Host ''
+
 Get-TerraformProviders
-Write-Host ""
+Write-Host ''
 
 if (-not $SkipImages) {
     Save-PlatformImages
-    Write-Host ""
+    Write-Host ''
 }
 
 if (-not $SkipBuild) {
     Build-WorkspaceImage
-    Write-Host ""
+    Write-Host ''
 }
 
-Write-Host "========================================" -ForegroundColor Green
-Write-Host " Offline preparation complete!" -ForegroundColor Green
-Write-Host "========================================" -ForegroundColor Green
-Write-Host ""
-Write-Host "Transfer the following to the offline server:" -ForegroundColor Cyan
-Write-Host "  images\          -> Docker image tarballs" -ForegroundColor White
-Write-Host "  configs\ssl\     -> TLS certificates" -ForegroundColor White
-Write-Host "  configs\terraform-providers\ -> TF provider zips" -ForegroundColor White
-Write-Host ""
-Write-Host "On the offline server:" -ForegroundColor Cyan
-Write-Host "  .\scripts\manage.ps1 load     # load Docker images" -ForegroundColor White
-Write-Host "  .\scripts\manage.ps1 init     # create .env" -ForegroundColor White
-Write-Host "  .\scripts\manage.ps1 ssl <IP> # regenerate cert for server IP" -ForegroundColor White
-Write-Host "  .\scripts\manage.ps1 build    # rebuild workspace image with correct cert" -ForegroundColor White
-Write-Host "  .\scripts\manage.ps1 up       # start platform" -ForegroundColor White
+Write-OfflineManifest
+Write-Host ''
+Write-Host '========================================' -ForegroundColor Green
+Write-Host ' Offline preparation complete' -ForegroundColor Green
+Write-Host '========================================' -ForegroundColor Green
+Write-Host ''
+Write-Host 'Recommended next steps:' -ForegroundColor Cyan
+Write-Host '  .\scripts\verify-offline.ps1' -ForegroundColor White
+Write-Host '  Transfer the whole project directory to the offline server' -ForegroundColor White
+Write-Host '  .\scripts\manage.ps1 load' -ForegroundColor White
+Write-Host '  .\scripts\manage.ps1 init' -ForegroundColor White
+Write-Host '  .\scripts\manage.ps1 ssl <TARGET_IP_OR_HOST>' -ForegroundColor White
+Write-Host '  .\scripts\manage.ps1 up' -ForegroundColor White

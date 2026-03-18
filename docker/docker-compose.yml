@@ -1,15 +1,6 @@
-# ============================================================
-# Coder 多用户开发平台 - Docker Compose 配置
-# 架构：Nginx 网关（:8443）→ Coder 平台（:7080）→ workspace 容器
-# 单 IP 单端口：所有服务通过 8443 提供
-# ============================================================
-
 services:
-  # ==========================================================
-  # 1. 网关层：Nginx 反向代理（唯一对外端口 8443）
-  # ==========================================================
   gateway:
-    image: nginx:alpine
+    image: ${NGINX_IMAGE_REF:-nginx:alpine}
     container_name: coder-gateway
     hostname: gateway
     ports:
@@ -32,44 +23,25 @@ services:
       timeout: 10s
       retries: 3
 
-  # ==========================================================
-  # 2. Coder 平台（多用户管理 + workspace app 代理）
-  # ==========================================================
   coder:
-    image: ${CODER_IMAGE:-ghcr.io/coder/coder}:${CODER_VERSION:-latest}
+    image: ${CODER_IMAGE_REF:-ghcr.io/coder/coder:latest}
     container_name: coder-server
     hostname: coder
-    # 仅向 localhost 暴露内部端口，供 setup-coder.sh 调用 API 以及本地调试
-    # 不对外网暴露（外网流量通过 gateway nginx 进入）
     ports:
       - "127.0.0.1:${CODER_INTERNAL_PORT:-7080}:7080"
     environment:
-      # HTTP 监听地址（内部端口，nginx 负责 TLS）
       CODER_HTTP_ADDRESS: "0.0.0.0:7080"
-      # 外部访问 URL（nginx 的 HTTPS 地址，用于 init_script 和用户访问）
       CODER_ACCESS_URL: "https://${SERVER_HOST:-localhost}:${GATEWAY_PORT:-8443}"
-      # PostgreSQL 连接
       CODER_PG_CONNECTION_URL: "postgresql://coder:${POSTGRES_PASSWORD:-changeme_db}@postgres/coder?sslmode=disable"
-      # 信任来自 nginx 的代理头（nginx 在 coderplatform 子网内）
       CODER_PROXY_TRUSTED_HEADERS: "X-Forwarded-For,X-Real-IP,X-Forwarded-Proto"
-      CODER_PROXY_TRUSTED_ORIGINS: "172.20.0.0/24"
-      # 不使用通配符域名（单端口路径路由，无需 DNS 配置）
-      # CODER_WILDCARD_ACCESS_URL 留空以启用路径路由: /@user/workspace.main/apps/code-server
-      # 关闭遥测和自动更新检查（内网环境）
+      CODER_PROXY_TRUSTED_ORIGINS: "172.28.0.0/16"
       CODER_TELEMETRY_ENABLE: "false"
       CODER_UPDATE_CHECK: "false"
-      # Terraform provider 离线缓存配置（filesystem_mirror）
-      # 该变量在 safeenv.go 中被明确加入白名单，会透传到 terraform 子进程
       TF_CLI_CONFIG_FILE: "/home/coder/.terraformrc"
-      # 将缓存目录指向 /tmp，避免 named volume 初始化时 root 所有权导致 permission denied
-      # Coder 所有持久状态存储在 PostgreSQL 中，缓存目录仅含可重新生成的二进制和站点资源
       CODER_CACHE_DIRECTORY: "/tmp/coder-cache"
     volumes:
-      # Docker socket：Coder 的 provisioner 通过此 socket 创建 workspace 容器
       - /var/run/docker.sock:/var/run/docker.sock
-      # Terraform 离线 provider 配置（filesystem_mirror 指向下方 provider 目录）
-      - ../configs/terraform.rc:/home/coder/.terraformrc:ro
-      # Terraform provider zip 包（离线使用）
+      - ${TF_CLI_CONFIG_MOUNT:-../configs/terraform-offline.rc}:/home/coder/.terraformrc:ro
       - ../configs/terraform-providers:/opt/terraform-providers:ro
     depends_on:
       postgres:
@@ -78,16 +50,11 @@ services:
       coderplatform:
         aliases:
           - coder.local
-    # 以 root 运行确保 docker.sock 可访问（内网部署可接受；
-    # 也可改为 group_add: ["0"] 或宿主机执行 chmod 666 /var/run/docker.sock）
     user: "root"
     restart: unless-stopped
 
-  # ==========================================================
-  # 3. PostgreSQL（Coder 状态存储）
-  # ==========================================================
   postgres:
-    image: postgres:16-alpine
+    image: ${POSTGRES_IMAGE_REF:-postgres:16-alpine}
     container_name: coder-postgres
     hostname: postgres
     environment:
@@ -107,21 +74,17 @@ services:
       timeout: 5s
       retries: 5
 
-  # ==========================================================
-  # 4. LiteLLM 统一 LLM 网关（可选，--profile llm 启用）
-  #    通过 /llm/ 路径访问，对所有 workspace 用户共享
-  # ==========================================================
   llm-gateway:
-    image: ghcr.io/berriai/litellm:main-latest
+    image: ${LITELLM_IMAGE_REF:-ghcr.io/berriai/litellm:main-latest}
     container_name: llm-gateway
     hostname: llm-gateway
     profiles:
       - llm
     command: --config /app/config.yaml --port 4000
     environment:
-      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-devenv}
-      - INTERNAL_API_BASE=${INTERNAL_API_BASE:-}
-      - INTERNAL_API_KEY=${INTERNAL_API_KEY:-}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-devenv}
+      INTERNAL_API_BASE: ${INTERNAL_API_BASE:-}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
     volumes:
       - ../configs/litellm_config.yaml:/app/config.yaml:ro
       - litellm-cache:/app/.cache
@@ -142,8 +105,9 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.20.0.0/24
+        - subnet: 172.28.0.0/16
 
 volumes:
   postgres-data:
   litellm-cache:
+

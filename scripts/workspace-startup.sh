@@ -25,9 +25,23 @@ if [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
   }
 }
 CONFIG_EOF
+
+    # 标记已完成新手引导，这是独立在根目录的 .claude.json，强制覆盖旧状态
+    rm -f "${HOME}/.claude.json"
+    cat > "${HOME}/.claude.json" <<ONBOARDING_EOF
+{
+  "hasCompletedOnboarding": true
+}
+ONBOARDING_EOF
+
     echo "[startup] Claude Code configured: ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-<default Anthropic>}"
 else
-    echo "[startup] No API config found, Claude Code will use interactive login"
+    echo "[startup] WARNING: No API config found."
+    echo "[startup]   In offline/intranet deployments, Claude Code requires either:"
+    echo "[startup]     A) ANTHROPIC_BASE_URL pointing to an internal LiteLLM gateway"
+    echo "[startup]     B) ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL pointing to an internal model server"
+    echo "[startup]   Interactive login (OAuth) requires external internet access and WILL fail offline."
+    echo "[startup]   Configure the workspace template vars via: manage.sh init + manage.sh setup-coder"
 fi
 
 # ---- 验证 claude CLI ----

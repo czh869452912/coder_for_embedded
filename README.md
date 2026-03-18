@@ -1,278 +1,381 @@
-# Coder for Embedded Development — Multi-User Web IDE Platform
+# Coder for Embedded Development
 
-A production-ready deployment of [Coder](https://github.com/coder/coder) tailored for embedded software teams, providing a browser-accessible VS Code environment with a full ARM/QEMU embedded toolchain, Claude Code AI assistant, and multi-user management — all behind a single IP and port.
+A single-port Coder deployment for embedded software teams. The platform provides browser-based VS Code workspaces, a full embedded C/C++ toolchain, and an optional LiteLLM gateway that adapts existing internal model infrastructure for Claude Code and other editor tools.
 
-## Features
+## What This Repository Guarantees
 
-| Feature | Details |
-|---------|---------|
-| **Multi-user management** | Coder built-in RBAC: users, organizations, permissions |
-| **Single IP, single port** | All services (admin dashboard + per-user IDE + LiteLLM) served from one `IP:8443` |
-| **Fully offline deployable** | Docker image tarballs + Terraform provider local cache; no internet required at runtime |
-| **Embedded toolchain** | ARM GNU Toolchain, Clang/LLVM, OpenOCD, QEMU — full embedded C/C++ dev environment |
-| **Claude Code** | Every workspace ships Claude Code CLI + VS Code extension pre-installed |
-| **Persistent workspaces** | Each user's `home` directory is a Docker volume; data survives container stop/restart |
+- Single external entrypoint: `https://<host>:8443/`
+- Multi-user Coder platform with per-user workspaces
+- Path-based workspace apps, no wildcard DNS required
+- Offline deployment after an online preparation step
+- Reproducible deployment images pinned in `configs/versions.lock.env`
+
+## What LiteLLM Means Here
+
+LiteLLM is used as a unified internal model gateway.
+It is not used to download or host local models in this repository.
+
+That means:
+
+- The Coder platform itself can run fully inside an offline intranet.
+- AI features still depend on an internal model API that LiteLLM can reach.
+- If no internal model backend exists, Coder, workspaces, terminal, and code-server still work; only AI features are unavailable.
 
 ## Architecture
 
-```
-[Browser]  HTTPS :8443 (single port)
-     │
-[Nginx :8443]  TLS termination
-     ├── /          ──► [Coder :7080]   admin dashboard + workspace app proxy
-     └── /llm/      ──► [LiteLLM :4000] AI gateway (optional, --profile llm)
+```text
+Browser
+  -> https://<host>:8443/
 
-[Coder] ──/var/run/docker.sock──► [Docker Engine]
-                                     ├── coder-<user1>-<ws>  (code-server :8080)
-                                     ├── coder-<user2>-<ws>  (code-server :8080)
-                                     └── ...
+Nginx :8443
+  -> /            -> Coder :7080
+  -> /llm/        -> LiteLLM :4000 (optional)
 
-Workspace access (no wildcard DNS needed):
-  Admin:    https://IP:8443/
-  User IDE: https://IP:8443/@<username>/<workspace>.main/apps/code-server
+Coder
+  -> Docker socket
+  -> creates one workspace container per user/workspace
+
+Workspace app path
+  -> /@<username>/<workspace>.main/apps/code-server
 ```
+
+## Prerequisites
+
+- Windows: Docker Desktop, PowerShell 7 recommended, Git for Windows (`openssl`)
+- Linux: Docker Engine + Compose v2, `bash`, `openssl`, `curl`, `python3`
+- Internet is required only for online preparation and explicit version refresh operations.
 
 ## Quick Start
 
-### Prerequisites
-
-- Docker Desktop (Windows) or Docker Engine + Compose v2 (Linux)
-- Git for Windows (provides `openssl` on Windows)
-- Internet access for first run (downloads Terraform providers and Coder agent binary)
-
-### Windows (PowerShell)
+### Windows
 
 ```powershell
-# 1. Allow script execution (first time only)
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-
-# 2. Create configuration
 .\scripts\manage.ps1 init
-
-# 3. Generate SSL certificate (use actual server IP for LAN access)
 .\scripts\manage.ps1 ssl 192.168.1.100
-
-# 4. Build workspace image (~20-40 min, full embedded toolchain)
 .\scripts\manage.ps1 build
-
-# 5. Start platform (auto-initializes Coder on first run)
 .\scripts\manage.ps1 up
 
-# With LiteLLM AI gateway:
+# Enable LiteLLM gateway mode
 .\scripts\manage.ps1 up -Llm
 ```
 
-### Linux / macOS (Bash)
+### Linux
 
 ```bash
-# 1. Create configuration
 bash scripts/manage.sh init
-
-# 2. Generate SSL certificate
 bash scripts/manage.sh ssl 192.168.1.100
-
-# 3. Build workspace image
 bash scripts/manage.sh build
-
-# 4. Start platform
 bash scripts/manage.sh up
 
-# With LiteLLM AI gateway:
+# Enable LiteLLM gateway mode
 bash scripts/manage.sh up --llm
 ```
 
-After startup, open `https://<IP>:8443/` in your browser.
+## TLS Model
+
+The platform uses a root CA plus target-specific leaf certificates.
+
+- The workspace image trusts `configs/ssl/ca.crt`.
+- `ssl <host>` issues or rotates `server.crt` and `server.key` for the deployment target.
+- If only the leaf certificate changes, you do not need to rebuild the workspace image.
+- If the root CA changes, rebuild the workspace image once.
+
+This removes the old requirement to rebuild the workspace image on every offline target.
+
+## Terraform Modes
+
+There are two Terraform CLI configs:
+
+- `configs/terraform-offline.rc`: strict offline mode, no registry fallback
+- `configs/terraform.rc`: connected mode, filesystem mirror first and registry fallback allowed
+
+Default behavior is strict offline mode.
+
+`docker/.env` contains:
+
+```env
+TF_CLI_CONFIG_MOUNT=../configs/terraform-offline.rc
+```
+
+If you want connected fallback for maintenance or experimentation, change it to:
+
+```env
+TF_CLI_CONFIG_MOUNT=../configs/terraform.rc
+```
 
 ## Offline Deployment
 
-### Step 1 — Prepare resources on an internet-connected machine
+### Step 1: Prepare on an Internet-Connected Machine
+
+Windows:
 
 ```powershell
-# Windows
 .\scripts\prepare-offline.ps1
-
-# Linux
-bash scripts/prepare-offline.sh
+.\scripts\verify-offline.ps1
 ```
 
-This downloads:
-- Terraform provider zips → `configs/terraform-providers/`
-- Platform Docker images → `images/*.tar`
-- Builds and saves workspace image → `images/workspace-embedded_latest.tar`
-
-### Step 2 — Transfer to the air-gapped server
-
-Copy the following to the target server:
-```
-images/                         # Docker image tarballs
-configs/terraform-providers/    # Terraform provider zips
-configs/vsix/                   # (optional) VS Code extension .vsix files
-```
-
-### Step 3 — Deploy on the air-gapped server
+Linux:
 
 ```bash
-# Load Docker images
-bash scripts/manage.sh load          # or: .\scripts\manage.ps1 load
+bash scripts/prepare-offline.sh
+bash scripts/verify-offline.sh
+```
 
-# Initialize config
+The preparation step:
+
+- Downloads Terraform providers into `configs/terraform-providers/`
+- Pulls pinned runtime images and saves them into `images/`
+- Builds the workspace image and saves it into `images/`
+- Generates a root CA in `configs/ssl/` if one does not already exist
+- Writes `offline-manifest.json`
+
+If you intentionally run `prepare-offline.ps1 -SkipBuild` or `prepare-offline.sh --skip-build`, `verify-offline` will fail until the workspace image tarball has also been produced.
+
+### Step 2: Transfer to the Offline Server
+
+Transfer the entire project directory, including at least:
+
+- `images/`
+- `configs/ssl/`
+- `configs/terraform-providers/`
+- `offline-manifest.json`
+- `configs/vsix/` if you use offline VSIX packages
+
+Important:
+Keep `configs/ssl/ca.crt` and `configs/ssl/ca.key` from the prepared bundle. The offline target should reuse that CA and only reissue the leaf certificate.
+
+### Step 3: Deploy on the Offline Server
+
+Windows:
+
+```powershell
+.\scripts\verify-offline.ps1
+.\scripts\manage.ps1 load
+.\scripts\manage.ps1 init
+.\scripts\manage.ps1 ssl 10.0.1.50
+.\scripts\manage.ps1 up
+```
+
+Linux:
+
+```bash
+bash scripts/verify-offline.sh
+bash scripts/manage.sh load
 bash scripts/manage.sh init
-
-# Generate SSL cert for the server IP
 bash scripts/manage.sh ssl 10.0.1.50
-
-# Rebuild workspace image with the correct cert baked in
-bash scripts/manage.sh build
-
-# Start platform
 bash scripts/manage.sh up
 ```
 
-## Configuration
+Notes:
 
-### `docker/.env` key variables
+- `up` will auto-run first-time Coder initialization if `docker/.setup-done` does not exist.
+- If the offline target accidentally generates a new CA instead of reusing the transferred CA, rebuild the workspace image once.
+- In strict offline mode, `up` will fail fast if the provider cache is incomplete.
 
-| Variable | Description |
-|----------|-------------|
-| `SERVER_HOST` | Server IP or hostname (used in SSL cert SAN and `CODER_ACCESS_URL`) |
-| `GATEWAY_PORT` | External port, default `8443` |
-| `CODER_ADMIN_EMAIL` | First admin account email (created automatically on first start) |
-| `CODER_ADMIN_PASSWORD` | First admin account password |
-| `ANTHROPIC_API_KEY` | Claude Code API key (shared across all workspaces) |
-| `ANTHROPIC_BASE_URL` | Internal LLM proxy URL (optional) |
+## Version Locking
 
-When `SERVER_HOST=localhost`, the workspace container still downloads the Coder agent from `https://host.docker.internal:8443`, so the generated TLS certificate must also include `host.docker.internal` in its SAN list.
+Deployment reads pinned refs from `configs/versions.lock.env`.
 
-### Claude Code API options
+Current pinned items include:
 
-| Option | Use case | Config |
-|--------|----------|--------|
-| A — Official API | Internet access available | `ANTHROPIC_API_KEY=sk-ant-...` |
-| B — Internal proxy | Intranet Anthropic-compatible proxy | `ANTHROPIC_BASE_URL=http://10.x.x.x:8000` |
-| C — LiteLLM | OpenAI-compatible internal API | `up --llm`, `ANTHROPIC_BASE_URL=https://IP:8443/llm` |
-| D — Manual login | Testing / temporary use | Leave blank; run `claude` inside workspace to authenticate |
+- Coder runtime image
+- PostgreSQL image
+- Nginx image
+- LiteLLM image
+- code-server base image used to build the workspace image
+- Terraform provider versions
 
-### LiteLLM AI Gateway (Option C)
+Runtime scripts read `docker/.env` for deployment-specific values and `configs/versions.lock.env` for locked image/provider versions.
+
+## Refreshing to the Latest Stable Versions
+
+Version refresh is an explicit maintenance step. It does not happen during deployment.
+
+Windows dry run:
+
+```powershell
+.\scripts\refresh-versions.ps1
+```
+
+Windows apply:
+
+```powershell
+.\scripts\refresh-versions.ps1 -Apply
+```
+
+Linux dry run:
+
+```bash
+bash scripts/refresh-versions.sh
+```
+
+Linux apply:
+
+```bash
+bash scripts/refresh-versions.sh --apply
+```
+
+The refresh scripts:
+
+- Pull the tagged upstream images you have chosen to track
+- Resolve their current digests
+- Query the newest stable provider versions within the current locked major versions
+- Rewrite `configs/versions.lock.env` only when you explicitly apply
+
+## AI Gateway Setup
+
+1. Copy the example config:
 
 ```bash
 cp configs/litellm_config.yaml.example configs/litellm_config.yaml
-# Edit: set internal API base URL and model names
-bash scripts/manage.sh up --llm    # or: .\scripts\manage.ps1 up -Llm
 ```
 
-## Management Commands
+2. Replace `YOUR_INTERNAL_MODEL` and set the real internal API endpoint and key in `docker/.env`.
 
-### Windows PowerShell
+3. Start with LiteLLM enabled:
+
+Windows:
 
 ```powershell
-.\scripts\manage.ps1 init              # Create docker\.env
-.\scripts\manage.ps1 ssl [IP]          # Generate SSL certificate
-.\scripts\manage.ps1 build             # Build workspace image
-.\scripts\manage.ps1 up [-Llm]         # Start platform
-.\scripts\manage.ps1 down              # Stop platform
-.\scripts\manage.ps1 status            # Container status
-.\scripts\manage.ps1 logs [service]    # Stream logs (coder/gateway/postgres/llm-gateway)
-.\scripts\manage.ps1 shell <service>   # Enter container shell
-.\scripts\manage.ps1 setup-coder       # Re-run first-time init (admin account + template push)
-.\scripts\manage.ps1 save              # Export all images to images\*.tar
-.\scripts\manage.ps1 load              # Load images from images\*.tar
-.\scripts\manage.ps1 test-api          # Test LLM API connectivity
+.\scripts\manage.ps1 up -Llm
 ```
 
-### Linux / macOS Bash
+Linux:
 
 ```bash
-bash scripts/manage.sh <command>    # same commands; use --llm instead of -Llm
+bash scripts/manage.sh up --llm
 ```
 
-## User Workflow
+Helpful checks:
 
-1. Admin logs in at `https://IP:8443/` and creates user accounts
-2. User logs in → clicks **New Workspace** → selects `embedded-dev` template
-3. Select CPU/RAM, create workspace (~30 seconds)
-4. Click the **VS Code** icon → full browser IDE with embedded toolchain
-5. Workspace data persists on stop; work continues on next start
+- Windows: `.\scripts\manage.ps1 test-llm-backend`
+- Linux: `bash scripts/manage.sh test-llm-backend`
 
-## Project Structure
+## Common Commands
 
+### Windows
+
+```powershell
+.\scripts\manage.ps1 init
+.\scripts\manage.ps1 ssl [host]
+.\scripts\manage.ps1 pull
+.\scripts\manage.ps1 build
+.\scripts\manage.ps1 save
+.\scripts\manage.ps1 load
+.\scripts\manage.ps1 up [-Llm]
+.\scripts\manage.ps1 down
+.\scripts\manage.ps1 status
+.\scripts\manage.ps1 logs [service]
+.\scripts\manage.ps1 shell <service>
+.\scripts\manage.ps1 setup-coder
+.\scripts\manage.ps1 test-api
+.\scripts\manage.ps1 test-llm-backend
+.\scripts\refresh-versions.ps1 [-Apply]
+.\scripts\verify-offline.ps1
 ```
-coder_production/
-├── docker/
-│   ├── docker-compose.yml       # Platform services: nginx + coder + postgres [+ litellm]
-│   ├── Dockerfile.workspace     # Workspace image: code-server + embedded toolchain
-│   └── .env                     # Instance config (gitignored — created by init)
-├── configs/
-│   ├── nginx.conf               # Single-port TLS reverse proxy config
-│   ├── terraform.rc             # Terraform filesystem_mirror (offline provider cache)
-│   ├── terraform-providers/     # Offline Terraform provider zips (populated by prepare-offline)
-│   ├── ssl/                     # TLS certificates (gitignored — created by ssl command)
-│   ├── settings.json            # VS Code default settings for all workspaces
-│   ├── litellm_config.yaml.example
-│   └── vsix/                    # Offline VS Code extensions (.vsix files)
-├── workspace-template/
-│   └── main.tf                  # Coder Terraform workspace template
-├── scripts/
-│   ├── manage.ps1               # Windows PowerShell management script
-│   ├── manage.sh                # Linux/macOS Bash management script
-│   ├── workspace-startup.sh     # Workspace container init (Claude Code config + code-server)
-│   ├── setup-coder.sh           # First-run Coder setup (admin account + template push)
-│   ├── prepare-offline.ps1      # Windows: download all offline resources
-│   └── prepare-offline.sh       # Linux: download all offline resources
-├── images/                      # Docker image tarballs (gitignored)
-└── .env.example                 # Config template
+
+### Linux
+
+```bash
+bash scripts/manage.sh <command> [--llm]
+bash scripts/refresh-versions.sh [--apply]
+bash scripts/verify-offline.sh [--require-llm]
 ```
+
+## Key Files
+
+- `docker/docker-compose.yml`: platform services
+- `docker/Dockerfile.workspace`: workspace image build
+- `configs/versions.lock.env`: pinned deployment versions
+- `configs/terraform-offline.rc`: strict offline Terraform config
+- `configs/terraform.rc`: connected Terraform config with fallback
+- `configs/litellm_config.yaml.example`: LiteLLM gateway template
+- `workspace-template/main.tf`: Coder template that provisions workspace containers
+- `scripts/manage.ps1`: Windows entrypoint
+- `scripts/manage.sh`: Linux entrypoint
+- `scripts/prepare-offline.ps1`: Windows offline preparation
+- `scripts/prepare-offline.sh`: Linux offline preparation
+- `scripts/refresh-versions.ps1`: Windows version refresh tool
+- `scripts/refresh-versions.sh`: Linux version refresh tool
+- `scripts/verify-offline.ps1`: Windows offline bundle verification
+- `scripts/verify-offline.sh`: Linux offline bundle verification
+- `offline-manifest.json`: expected offline bundle contents
+
+## Windows Smoke Test
+
+The following Windows paths have been exercised successfully in this repository:
+
+- `.\scripts\refresh-versions.ps1` dry run
+- `.\scripts\prepare-offline.ps1 -SkipBuild`
+- `.\scripts\manage.ps1 ssl localhost`
+- `.\scripts\manage.ps1 build`
+- `.\scripts\manage.ps1 save`
+- `.\scripts\verify-offline.ps1`
+- `.\scripts\manage.ps1 up`
+- `.\scripts\manage.ps1 status`
+- `http://localhost:7080/healthz`
+- `.\scripts\manage.ps1 down`
+
+The gateway container also reached `healthy` state during startup verification.
 
 ## Troubleshooting
 
-**Workspace shows "Unreachable"**
-- Check `.\manage.ps1 logs gateway` for nginx errors
-- Confirm `SERVER_HOST` in `.env` matches the URL you use to access Coder
-- Verify `proxy_read_timeout 86400s` is in `nginx.conf`
+### Workspace says the agent has not connected
 
-**SSL certificate errors / workspace agent fails to connect**
-- The SSL cert must be baked into the workspace image *after* running `ssl <IP>`
-- Re-run `build` after generating/changing the SSL cert
-- Verify build output contains "Coder server SSL cert trusted"
-- If the workspace log shows `curl: (60)` and `no alternative certificate subject name matches target host name 'host.docker.internal'`, regenerate the cert with the updated `ssl` command and rebuild the workspace image
-- After updating the cert/image, restart the affected workspace so it retries the agent download with the corrected certificate
+Check the workspace container logs first.
 
-**Terraform provider not found**
-- Connected environment: providers download automatically (internet fallback is enabled)
-- Air-gapped environment: run `prepare-offline.ps1` / `prepare-offline.sh` first, then `load`
+Typical causes:
 
-**Template push failed / first-time init incomplete**
+- The workspace image does not trust the correct root CA.
+- The deployment target reissued the CA instead of only reissuing the leaf certificate.
+- The certificate SANs do not include `host.docker.internal` or the actual target host.
+
+If only the leaf certificate changed:
+
+1. Run `ssl <host>` again.
+2. Restart the affected workspace.
+
+If the CA changed:
+
+1. Run `ssl <host>`.
+2. Rebuild the workspace image.
+3. Restart the platform or reload the new workspace image.
+4. Restart affected workspaces.
+
+### Terraform provider not found
+
+The offline bundle is incomplete, or strict offline mode is active without a full provider cache.
+
+Run `prepare-offline.ps1` or `prepare-offline.sh` again on a connected machine, then run `verify-offline` before deployment.
+
+If you intentionally want registry fallback in a connected environment, set:
+
+```env
+TF_CLI_CONFIG_MOUNT=../configs/terraform.rc
+```
+
+### LiteLLM does not start
+
+Check all of the following:
+
+- `configs/litellm_config.yaml` exists
+- `INTERNAL_API_BASE` is set
+- `INTERNAL_API_KEY` is set
+- `YOUR_INTERNAL_MODEL` placeholders are replaced
+
+### Re-run first-time setup
+
+Windows:
+
 ```powershell
-# Delete the completion marker and re-run
 Remove-Item docker\.setup-done
 .\scripts\manage.ps1 setup-coder
 ```
 
-**Docker socket permission denied (Linux)**
-```bash
-sudo chmod 666 /var/run/docker.sock
-```
-
-**`manage.ps1` blocked by execution policy**
-```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-```
-
-## CI/CD Offline Build Integration
-
-To build the workspace image in an air-gapped CI pipeline, replace online downloads in `docker/Dockerfile.workspace` with pre-staged artifacts:
-
-| Step | Online | Offline replacement |
-|------|--------|---------------------|
-| ARM GNU Toolchain | `wget https://developer.arm.com/...` | `COPY build-artifacts/arm-gnu-toolchain.tar.xz` |
-| Node.js | `curl nodesource.com \| bash` | Internal apt mirror or `COPY build-artifacts/nodejs.deb` |
-| Claude Code CLI | `npm install -g @anthropic-ai/claude-code` | `COPY build-artifacts/claude-code.tgz` + `npm install -g` |
+Linux:
 
 ```bash
-# CI pipeline example:
-# 1. Fetch build-artifacts/ from internal artifact registry
-# 2. Build and tag workspace image
-docker build -f docker/Dockerfile.workspace -t workspace-embedded:${CI_COMMIT_SHA} .
-# 3. Push to internal registry
-docker push registry.internal/workspace-embedded:${CI_COMMIT_SHA}
-# 4. Update WORKSPACE_IMAGE_TAG in docker/.env on the deployment server
+rm -f docker/.setup-done
+bash scripts/manage.sh setup-coder
 ```

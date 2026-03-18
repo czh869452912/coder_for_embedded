@@ -1,5 +1,5 @@
-# Terraform CLI config for connected environments.
-# Uses the local filesystem mirror first and falls back to the public registry.
+# Terraform CLI config for fully offline environments.
+# Only the local filesystem mirror is allowed.
 
 provider_installation {
   filesystem_mirror {
@@ -9,6 +9,4 @@ provider_installation {
       "registry.terraform.io/kreuzwerker/docker"
     ]
   }
-
-  direct {}
 }
