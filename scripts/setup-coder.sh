@@ -17,9 +17,11 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 USE_LLM=false
+USE_LDAP=false
 for arg in "$@"; do
     case "$arg" in
-        --llm) USE_LLM=true ;;
+        --llm)  USE_LLM=true  ;;
+        --ldap) USE_LDAP=true ;;
     esac
 done
 
@@ -38,6 +40,24 @@ CODER_INTERNAL_URL="http://localhost:${CODER_INTERNAL_PORT:-7080}"
 llm_gateway_url() {
     # 容器现已加入 coderplatform，直接通过 Docker DNS 访问网关服务更稳定
     echo "http://llm-gateway:4000"
+}
+
+wait_for_dex() {
+    # 若未配置 OIDC_CLIENT_SECRET 则跳过（未启用 LDAP 模式）
+    local secret="${OIDC_CLIENT_SECRET:-}"
+    [ -n "$secret" ] || return 0
+
+    info "Waiting for Dex OIDC provider..."
+    local url="https://${SERVER_HOST:-localhost}:${GATEWAY_PORT:-8443}/dex/.well-known/openid-configuration"
+    local attempt
+    for attempt in $(seq 1 30); do
+        if curl -sk "$url" >/dev/null 2>&1; then
+            ok "Dex is ready"
+            return 0
+        fi
+        sleep 3
+    done
+    warn "Dex did not become ready within 90 seconds. Coder OIDC init may fail."
 }
 
 wait_for_coder() {
@@ -110,6 +130,7 @@ push_template() {
 
 main() {
     info "Starting Coder bootstrap"
+    wait_for_dex
     wait_for_coder
 
     local first_user_status

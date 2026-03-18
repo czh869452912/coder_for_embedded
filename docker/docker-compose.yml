@@ -39,6 +39,15 @@ services:
       CODER_UPDATE_CHECK: "false"
       TF_CLI_CONFIG_FILE: "/home/coder/.terraformrc"
       CODER_CACHE_DIRECTORY: "/tmp/coder-cache"
+      # OIDC / LDAP 认证（通过 Dex 桥接，需在 .env 中配置 OIDC_CLIENT_SECRET）
+      # 若 OIDC_CLIENT_SECRET 为空则 OIDC 不生效，保持内置密码认证
+      CODER_OIDC_ISSUER_URL: "https://${SERVER_HOST:-localhost}:${GATEWAY_PORT:-8443}/dex"
+      CODER_OIDC_CLIENT_ID: "coder"
+      CODER_OIDC_CLIENT_SECRET: "${OIDC_CLIENT_SECRET:-}"
+      CODER_OIDC_EMAIL_DOMAIN: "${OIDC_EMAIL_DOMAIN:-*}"
+      CODER_OIDC_ALLOW_SIGNUPS: "${OIDC_ALLOW_SIGNUPS:-true}"
+      CODER_OIDC_SCOPES: "openid,profile,email,groups"
+      CODER_OIDC_IGNORE_EMAIL_VERIFIED: "true"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${TF_CLI_CONFIG_MOUNT:-../configs/terraform-offline.rc}:/home/coder/.terraformrc:ro
@@ -63,6 +72,7 @@ services:
       POSTGRES_DB: coder
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ../configs/postgres/init-dex.sql:/docker-entrypoint-initdb.d/10-init-dex.sql:ro
     networks:
       coderplatform:
         aliases:
@@ -73,6 +83,39 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  dex:
+    image: ${DEX_IMAGE_REF:-ghcr.io/dexidp/dex:v2.41.1}
+    container_name: coder-dex
+    hostname: dex
+    profiles:
+      - ldap
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ../configs/dex/config.yaml:/etc/dex/config.yaml:ro
+    environment:
+      SERVER_HOST:            ${SERVER_HOST:-localhost}
+      GATEWAY_PORT:           ${GATEWAY_PORT:-8443}
+      POSTGRES_PASSWORD:      ${POSTGRES_PASSWORD:-changeme_db}
+      OIDC_CLIENT_SECRET:     ${OIDC_CLIENT_SECRET:-changeme_oidc_secret}
+      DEX_LDAP_HOST:          ${DEX_LDAP_HOST:-ldap.company.local:389}
+      DEX_LDAP_BIND_DN:       ${DEX_LDAP_BIND_DN:-}
+      DEX_LDAP_BIND_PW:       ${DEX_LDAP_BIND_PW:-}
+      DEX_LDAP_USER_BASE_DN:  ${DEX_LDAP_USER_BASE_DN:-}
+      DEX_LDAP_GROUP_BASE_DN: ${DEX_LDAP_GROUP_BASE_DN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      coderplatform:
+        aliases:
+          - dex.local
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:5556/dex/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   llm-gateway:
     image: ${LITELLM_IMAGE_REF:-ghcr.io/berriai/litellm:main-latest}

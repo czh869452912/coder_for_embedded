@@ -1,6 +1,6 @@
 # Coder for Embedded Development
 
-A single-port Coder deployment for embedded software teams. The platform provides browser-based VS Code workspaces, a full embedded C/C++ toolchain, and an optional LiteLLM gateway that adapts existing internal model infrastructure for Claude Code and other editor tools.
+A single-port Coder deployment for embedded software teams. The platform provides browser-based VS Code workspaces, a full embedded C/C++ toolchain, an optional LiteLLM gateway that adapts existing internal model infrastructure for Claude Code and other editor tools, and optional LDAP authentication via Dex OIDC.
 
 ## What This Repository Guarantees
 
@@ -29,7 +29,8 @@ Browser
 
 Nginx :8443
   -> /            -> Coder :7080
-  -> /llm/        -> LiteLLM :4000 (optional)
+  -> /llm/        -> LiteLLM :4000  (optional, --llm)
+  -> /dex/        -> Dex OIDC :5556 (optional, --ldap)
 
 Coder
   -> Docker socket
@@ -37,6 +38,14 @@ Coder
 
 Workspace app path
   -> /@<username>/<workspace>.main/apps/code-server
+
+Internal network (coderplatform, 172.28.0.0/16)
+  Workspace containers -> http://llm-gateway:4000  (direct, no SSL overhead)
+  Dex -> PostgreSQL :5432  (shared postgres, separate 'dex' database)
+
+Authentication
+  Built-in password  (always available, used for initial admin)
+  LDAP via Dex OIDC  (optional, --ldap mode)
 ```
 
 ## Prerequisites
@@ -58,6 +67,12 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 # Enable LiteLLM gateway mode
 .\scripts\manage.ps1 up -Llm
+
+# Enable LDAP authentication (configure DEX_LDAP_* in docker/.env first)
+.\scripts\manage.ps1 up -Ldap
+
+# Enable both
+.\scripts\manage.ps1 up -Llm -Ldap
 ```
 
 ### Linux
@@ -70,6 +85,12 @@ bash scripts/manage.sh up
 
 # Enable LiteLLM gateway mode
 bash scripts/manage.sh up --llm
+
+# Enable LDAP authentication (configure DEX_LDAP_* in docker/.env first)
+bash scripts/manage.sh up --ldap
+
+# Enable both
+bash scripts/manage.sh up --llm --ldap
 ```
 
 ## TLS Model
@@ -182,7 +203,8 @@ Current pinned items include:
 - Coder runtime image
 - PostgreSQL image
 - Nginx image
-- LiteLLM image
+- LiteLLM image (used with `--llm`)
+- Dex OIDC image (used with `--ldap`)
 - code-server base image used to build the workspace image
 - Terraform provider versions
 
@@ -231,9 +253,24 @@ The refresh scripts:
 cp configs/litellm_config.yaml.example configs/litellm_config.yaml
 ```
 
-2. Replace `YOUR_INTERNAL_MODEL` and set the real internal API endpoint and key in `docker/.env`.
+2. Replace `YOUR_INTERNAL_MODEL` and set the real internal API endpoint and key in `docker/.env`:
 
-3. Start with LiteLLM enabled:
+```env
+INTERNAL_API_BASE=https://api.your-model-provider.com/v1
+INTERNAL_API_KEY=your-key
+LITELLM_MASTER_KEY=sk-devenv
+```
+
+3. Set the Claude Code API variables so workspace containers reach LiteLLM directly over the internal Docker network:
+
+```env
+ANTHROPIC_API_KEY=sk-devenv          # must match LITELLM_MASTER_KEY
+ANTHROPIC_BASE_URL=http://llm-gateway:4000
+```
+
+> **Note:** Do not use `https://<host>:8443/llm` as `ANTHROPIC_BASE_URL`. Workspace containers are on the `coderplatform` Docker network and resolve `localhost` as themselves, not as the host or Nginx. The direct internal URL `http://llm-gateway:4000` is the correct address. The `/llm/` Nginx path is for external browser/tool access only.
+
+4. Start with LiteLLM enabled:
 
 Windows:
 
@@ -252,6 +289,68 @@ Helpful checks:
 - Windows: `.\scripts\manage.ps1 test-llm-backend`
 - Linux: `bash scripts/manage.sh test-llm-backend`
 
+## LDAP Authentication Setup
+
+LDAP authentication uses Dex as an OIDC bridge. Coder OSS supports OIDC natively; Dex connects to your LDAP server and exposes an OIDC interface to Coder.
+
+1. Add the following to `docker/.env`:
+
+```env
+# Shared secret between Dex and Coder. Generate with: openssl rand -hex 32
+OIDC_CLIENT_SECRET=your-random-secret
+
+# Restrict to your email domain, or use * for all
+OIDC_EMAIL_DOMAIN=company.local
+OIDC_ALLOW_SIGNUPS=true
+
+# LDAP server (plain: host:389, TLS: ldaps://host:636)
+DEX_LDAP_HOST=ldap.company.local:389
+
+# Service account for user search (read-only recommended)
+DEX_LDAP_BIND_DN=cn=svc-coder,ou=serviceaccounts,dc=company,dc=local
+DEX_LDAP_BIND_PW=bind-password
+
+# Search base DNs
+DEX_LDAP_USER_BASE_DN=ou=users,dc=company,dc=local
+DEX_LDAP_GROUP_BASE_DN=ou=groups,dc=company,dc=local
+```
+
+2. Adjust LDAP attribute mapping if needed in `configs/dex/config.yaml` (default uses `uid`/`mail`/`displayName`, suitable for standard OpenLDAP).
+
+3. Start with LDAP enabled:
+
+Windows:
+
+```powershell
+.\scripts\manage.ps1 up -Ldap
+```
+
+Linux:
+
+```bash
+bash scripts/manage.sh up --ldap
+```
+
+4. Verify Dex is running:
+
+```bash
+curl -sk https://<host>:8443/dex/.well-known/openid-configuration | python3 -m json.tool
+```
+
+The Coder login page will show a "Sign in with 企业 LDAP" button alongside the built-in password form.
+
+> **First deployment note:** The `dex` PostgreSQL database is created automatically via `configs/postgres/init-dex.sql` on first container start. If the `postgres-data` volume already exists from a previous deployment, create it manually:
+> ```bash
+> docker exec coder-postgres psql -U coder -c "CREATE DATABASE dex OWNER coder;"
+> docker compose --profile ldap restart dex
+> ```
+
+> **Offline preparation:** Include the Dex image with:
+> ```bash
+> bash scripts/prepare-offline.sh --ldap
+> # Windows: .\scripts\prepare-offline.ps1 -Ldap
+> ```
+
 ## Common Commands
 
 ### Windows
@@ -259,12 +358,12 @@ Helpful checks:
 ```powershell
 .\scripts\manage.ps1 init
 .\scripts\manage.ps1 ssl [host]
-.\scripts\manage.ps1 pull
+.\scripts\manage.ps1 pull [-Llm] [-Ldap]
 .\scripts\manage.ps1 build
-.\scripts\manage.ps1 save
+.\scripts\manage.ps1 save [-Llm] [-Ldap]
 .\scripts\manage.ps1 load
-.\scripts\manage.ps1 up [-Llm]
-.\scripts\manage.ps1 down
+.\scripts\manage.ps1 up [-Llm] [-Ldap]
+.\scripts\manage.ps1 down [-Llm] [-Ldap]
 .\scripts\manage.ps1 status
 .\scripts\manage.ps1 logs [service]
 .\scripts\manage.ps1 shell <service>
@@ -278,19 +377,22 @@ Helpful checks:
 ### Linux
 
 ```bash
-bash scripts/manage.sh <command> [--llm]
+bash scripts/manage.sh <command> [--llm] [--ldap]
 bash scripts/refresh-versions.sh [--apply]
 bash scripts/verify-offline.sh [--require-llm]
 ```
 
 ## Key Files
 
-- `docker/docker-compose.yml`: platform services
+- `docker/docker-compose.yml`: platform services (gateway, coder, postgres, llm-gateway, dex)
 - `docker/Dockerfile.workspace`: workspace image build
 - `configs/versions.lock.env`: pinned deployment versions
+- `configs/nginx.conf`: Nginx gateway routing (`/`, `/llm/`, `/dex/`)
 - `configs/terraform-offline.rc`: strict offline Terraform config
 - `configs/terraform.rc`: connected Terraform config with fallback
 - `configs/litellm_config.yaml.example`: LiteLLM gateway template
+- `configs/dex/config.yaml`: Dex OIDC + LDAP connector config (--ldap mode)
+- `configs/postgres/init-dex.sql`: auto-creates `dex` database on first postgres start
 - `workspace-template/main.tf`: Coder template that provisions workspace containers
 - `scripts/manage.ps1`: Windows entrypoint
 - `scripts/manage.sh`: Linux entrypoint
@@ -363,6 +465,38 @@ Check all of the following:
 - `INTERNAL_API_BASE` is set
 - `INTERNAL_API_KEY` is set
 - `YOUR_INTERNAL_MODEL` placeholders are replaced
+
+### Claude Code cannot reach LiteLLM from inside workspace
+
+Confirm `ANTHROPIC_BASE_URL=http://llm-gateway:4000` in `docker/.env`. The internal Docker DNS name `llm-gateway` resolves correctly from workspace containers on the `coderplatform` network. Using `https://localhost:8443/llm` will fail because `localhost` inside a container refers to the container itself.
+
+### Dex does not start (LDAP mode)
+
+Check all of the following:
+
+- Started with `--ldap` / `-Ldap` flag
+- `OIDC_CLIENT_SECRET` is non-empty in `docker/.env`
+- All `DEX_LDAP_*` variables are filled in
+- The `dex` database exists in PostgreSQL (see First deployment note above)
+- `configs/dex/config.yaml` is present
+
+To check Dex logs:
+
+```bash
+docker logs coder-dex
+```
+
+To verify the OIDC discovery endpoint:
+
+```bash
+curl -sk https://<host>:8443/dex/.well-known/openid-configuration
+```
+
+### Coder login page does not show LDAP button
+
+- Confirm `OIDC_CLIENT_SECRET` is non-empty — if empty, Coder skips OIDC entirely
+- Restart the coder container after changing OIDC env vars: `docker restart coder-server`
+- Check Coder logs for OIDC initialization errors: `docker logs coder-server`
 
 ### Re-run first-time setup
 

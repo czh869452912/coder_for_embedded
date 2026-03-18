@@ -5,7 +5,8 @@ param(
     [string]$Command = "help",
     [Parameter(Position=1)]
     [string]$Arg1 = "",
-    [switch]$Llm
+    [switch]$Llm,
+    [switch]$Ldap
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,7 +19,8 @@ $DockerDir   = Join-Path $ProjectRoot "docker"
 $ConfigsDir  = Join-Path $ProjectRoot "configs"
 $EnvFile     = Join-Path $DockerDir ".env"
 $SetupDone   = Join-Path $DockerDir ".setup-done"
-$script:UseLlm = $Llm.IsPresent
+$script:UseLlm  = $Llm.IsPresent
+$script:UseLdap = $Ldap.IsPresent
 
 . (Join-Path $ScriptDir "lib\offline-common.ps1")
 
@@ -247,6 +249,9 @@ function Invoke-Pull {
     if ($script:UseLlm) {
         $images.Add($cfg['LITELLM_IMAGE_REF'])
     }
+    if ($script:UseLdap) {
+        $images.Add($cfg['DEX_IMAGE_REF'])
+    }
 
     foreach ($image in $images) {
         Write-Info "Pulling $image"
@@ -306,6 +311,9 @@ function Invoke-Save {
     if ($script:UseLlm) {
         $images.Add($cfg['LITELLM_IMAGE_REF'])
     }
+    if ($script:UseLdap) {
+        $images.Add($cfg['DEX_IMAGE_REF'])
+    }
 
     # Build a digest-ref -> name:tag fallback map in case the digest ref is no longer cached
     # (e.g. after pulling a newer version of the tag via refresh-versions without -Apply).
@@ -315,7 +323,8 @@ function Invoke-Save {
         @{ Ref = 'POSTGRES_IMAGE_REF';         Tag = 'POSTGRES_IMAGE_TAG' },
         @{ Ref = 'NGINX_IMAGE_REF';            Tag = 'NGINX_IMAGE_TAG' },
         @{ Ref = 'LITELLM_IMAGE_REF';          Tag = 'LITELLM_IMAGE_TAG' },
-        @{ Ref = 'CODE_SERVER_BASE_IMAGE_REF'; Tag = 'CODE_SERVER_BASE_IMAGE_TAG' }
+        @{ Ref = 'CODE_SERVER_BASE_IMAGE_REF'; Tag = 'CODE_SERVER_BASE_IMAGE_TAG' },
+        @{ Ref = 'DEX_IMAGE_REF';              Tag = 'DEX_IMAGE_TAG' }
     )) {
         $r = $cfg[$entry.Ref]; $t = $cfg[$entry.Tag]
         if ($r -and $t -and ($r -match '@sha256:')) {
@@ -383,7 +392,8 @@ function Invoke-Load {
         @{ Ref = 'POSTGRES_IMAGE_REF';         Tag = 'POSTGRES_IMAGE_TAG' },
         @{ Ref = 'NGINX_IMAGE_REF';            Tag = 'NGINX_IMAGE_TAG' },
         @{ Ref = 'LITELLM_IMAGE_REF';          Tag = 'LITELLM_IMAGE_TAG' },
-        @{ Ref = 'CODE_SERVER_BASE_IMAGE_REF'; Tag = 'CODE_SERVER_BASE_IMAGE_TAG' }
+        @{ Ref = 'CODE_SERVER_BASE_IMAGE_REF'; Tag = 'CODE_SERVER_BASE_IMAGE_TAG' },
+        @{ Ref = 'DEX_IMAGE_REF';              Tag = 'DEX_IMAGE_TAG' }
     )) {
         $ref = $cfg[$entry.Ref]
         $tag = $cfg[$entry.Tag]
@@ -481,7 +491,8 @@ function Invoke-Up {
         @{ Ref = 'CODER_IMAGE_REF';    Tag = 'CODER_IMAGE_TAG'    },
         @{ Ref = 'POSTGRES_IMAGE_REF'; Tag = 'POSTGRES_IMAGE_TAG' },
         @{ Ref = 'NGINX_IMAGE_REF';    Tag = 'NGINX_IMAGE_TAG'    },
-        @{ Ref = 'LITELLM_IMAGE_REF';  Tag = 'LITELLM_IMAGE_TAG'  }
+        @{ Ref = 'LITELLM_IMAGE_REF';  Tag = 'LITELLM_IMAGE_TAG'  },
+        @{ Ref = 'DEX_IMAGE_REF';      Tag = 'DEX_IMAGE_TAG'      }
     )) {
         $ref = $cfg[$mapping.Ref]
         $tag = $cfg[$mapping.Tag]
@@ -500,7 +511,8 @@ function Invoke-Up {
     $eapPf = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     foreach ($img in $requiredImages) {
-        if (-not $script:UseLlm -and $img -match 'litellm') { continue }
+        if (-not $script:UseLlm  -and $img -match 'litellm') { continue }
+        if (-not $script:UseLdap -and $img -match 'dexidp')  { continue }
         docker image inspect $img 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { $missingImages.Add($img) }
     }
@@ -511,7 +523,10 @@ function Invoke-Up {
         exit 1
     }
 
-    $composeArgs = if ($script:UseLlm) { @('--profile', 'llm', 'up', '-d') } else { @('up', '-d') }
+    $composeArgs = [System.Collections.Generic.List[string]]@()
+    if ($script:UseLlm)  { $composeArgs.AddRange([string[]]@('--profile', 'llm')) }
+    if ($script:UseLdap) { $composeArgs.AddRange([string[]]@('--profile', 'ldap')) }
+    $composeArgs.AddRange([string[]]@('up', '-d'))
     Push-Location $DockerDir
     docker compose @composeArgs
     $composeExit = $LASTEXITCODE
@@ -534,12 +549,12 @@ function Invoke-Up {
 
 function Invoke-Down {
     Assert-Docker
+    $downArgs = [System.Collections.Generic.List[string]]@()
+    if ($script:UseLlm)  { $downArgs.AddRange([string[]]@('--profile', 'llm')) }
+    if ($script:UseLdap) { $downArgs.AddRange([string[]]@('--profile', 'ldap')) }
+    $downArgs.Add('down')
     Push-Location $DockerDir
-    if ($script:UseLlm) {
-        docker compose --profile llm down
-    } else {
-        docker compose down
-    }
+    docker compose @downArgs
     $composeExit = $LASTEXITCODE
     Pop-Location
     if ($composeExit -ne 0) {
@@ -690,6 +705,9 @@ function Show-AccessInfo {
     if ($script:UseLlm) {
         Write-Host "  LiteLLM:         https://${serverHost}:${gatewayPort}/llm/" -ForegroundColor White
     }
+    if ($script:UseLdap) {
+        Write-Host "  Dex OIDC:        https://${serverHost}:${gatewayPort}/dex/" -ForegroundColor White
+    }
 }
 
 function Invoke-TestApi {
@@ -773,7 +791,7 @@ function Invoke-Clean {
 function Show-Help {
     $text = @(
         '',
-        'Usage: .\scripts\manage.ps1 <command> [arg] [-Llm]',
+        'Usage: .\scripts\manage.ps1 <command> [arg] [-Llm] [-Ldap]',
         '',
         'Commands:',
         '  init                  Create docker/.env',
@@ -791,6 +809,11 @@ function Show-Help {
         '  test-api              Test Anthropic/LiteLLM API access',
         '  test-llm-backend      Test the internal LLM backend base URL',
         '  clean                 Clean Docker build cache',
+        '',
+        'Flags:',
+        '  -Llm   Enable LiteLLM AI gateway (--profile llm)',
+        '  -Ldap  Enable Dex OIDC + LDAP authentication (--profile ldap)',
+        '         Requires DEX_LDAP_* and OIDC_CLIENT_SECRET in docker/.env',
         '',
         'Notes:',
         '  Deployment uses pinned image refs from configs/versions.lock.env.',

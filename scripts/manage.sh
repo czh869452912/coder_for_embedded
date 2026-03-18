@@ -17,10 +17,12 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 USE_LLM=false
+USE_LDAP=false
 ARGS=()
 for arg in "$@"; do
     case "$arg" in
-        --llm) USE_LLM=true ;;
+        --llm)  USE_LLM=true  ;;
+        --ldap) USE_LDAP=true ;;
         *) ARGS+=("$arg") ;;
     esac
 done
@@ -37,7 +39,7 @@ fail() { echo -e "${RED}[FAIL]${NC} $*" >&2; exit 1; }
 
 usage() {
     cat <<'EOF'
-Usage: bash scripts/manage.sh <command> [arg] [--llm]
+Usage: bash scripts/manage.sh <command> [arg] [--llm] [--ldap]
 
 Commands:
   init                  Create docker/.env
@@ -55,6 +57,11 @@ Commands:
   test-api              Test Anthropic/LiteLLM API access
   test-llm-backend      Test the internal LLM backend base URL
   clean                 Clean Docker build cache
+
+Flags:
+  --llm   Enable LiteLLM AI gateway (--profile llm)
+  --ldap  Enable Dex OIDC + LDAP authentication (--profile ldap)
+          Requires DEX_LDAP_* and OIDC_CLIENT_SECRET in docker/.env
 
 Notes:
   Deployment uses pinned image refs from configs/versions.lock.env.
@@ -235,6 +242,9 @@ pull_images() {
     if [ "$USE_LLM" = true ]; then
         images+=("$LITELLM_IMAGE_REF")
     fi
+    if [ "$USE_LDAP" = true ]; then
+        images+=("$DEX_IMAGE_REF")
+    fi
 
     local image
     for image in "${images[@]}"; do
@@ -280,6 +290,9 @@ save_images() {
     if [ "$USE_LLM" = true ]; then
         images+=("$LITELLM_IMAGE_REF")
     fi
+    if [ "$USE_LDAP" = true ]; then
+        images+=("$DEX_IMAGE_REF")
+    fi
 
     # If the digest ref is no longer in the local cache (e.g. after pulling a newer tag via
     # refresh-versions without -Apply), fall back to name:tag so the save can still succeed.
@@ -292,7 +305,7 @@ save_images() {
         if [[ "$image" == *@sha256:* ]]; then
             if ! docker image inspect "$image" >/dev/null 2>&1; then
                 fallback=""
-                for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF; do
+                for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF DEX_IMAGE_REF; do
                     ref="${!ref_key:-}"
                     [ "$ref" = "$image" ] || continue
                     tag_key="${ref_key/_REF/_TAG}"
@@ -343,7 +356,7 @@ load_images() {
         image_id="$(echo "$load_output" | awk '/Loaded image ID:/{print $NF}')"
         if [ -n "$image_id" ]; then
             local ref_key ref fn tag_key tag
-            for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF; do
+            for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF DEX_IMAGE_REF; do
                 ref="${!ref_key:-}"
                 [[ "$ref" == *@sha256:* ]] || continue
                 fn="$(printf '%s' "$ref" | tr '/:@' '_').tar"
@@ -432,7 +445,7 @@ start_services() {
     # so compose resolves against the locally loaded (and retagged) images.
     local ref_key ref tag_key tag
     local -a required_images=()
-    for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF; do
+    for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF DEX_IMAGE_REF; do
         ref="${!ref_key:-}"
         [ -n "$ref" ] || continue
         if [[ "$ref" == *@sha256:* ]]; then
@@ -449,7 +462,8 @@ start_services() {
     # Pre-flight: verify every required image exists locally so compose never falls back to a pull
     local missing_images=()
     for img in "${required_images[@]}"; do
-        [ "$USE_LLM" = false ] && [[ "$img" == *litellm* ]] && continue
+        [ "$USE_LLM" = false ]  && [[ "$img" == *litellm* ]] && continue
+        [ "$USE_LDAP" = false ] && [[ "$img" == *dexidp*  ]] && continue
         if ! docker image inspect "$img" >/dev/null 2>&1; then
             missing_images+=("$img")
         fi
@@ -459,11 +473,10 @@ start_services() {
     fi
 
     cd "$DOCKER_DIR"
-    if [ "$USE_LLM" = true ]; then
-        "${COMPOSE_CMD[@]}" --profile llm up -d
-    else
-        "${COMPOSE_CMD[@]}" up -d
-    fi
+    local compose_profiles=()
+    [ "$USE_LLM"  = true ] && compose_profiles+=(--profile llm)
+    [ "$USE_LDAP" = true ] && compose_profiles+=(--profile ldap)
+    "${COMPOSE_CMD[@]}" "${compose_profiles[@]}" up -d
 
     ok "Platform started"
     echo
@@ -487,16 +500,18 @@ show_access_info() {
     if [ "$USE_LLM" = true ]; then
         echo -e "  ${BLUE}https://${host}:${port}/llm/${NC}"
     fi
+    if [ "$USE_LDAP" = true ]; then
+        echo -e "  ${BLUE}https://${host}:${port}/dex/${NC}  (Dex OIDC provider)"
+    fi
 }
 
 stop_services() {
     check_deps
     cd "$DOCKER_DIR"
-    if [ "$USE_LLM" = true ]; then
-        "${COMPOSE_CMD[@]}" --profile llm down
-    else
-        "${COMPOSE_CMD[@]}" down
-    fi
+    local compose_profiles=()
+    [ "$USE_LLM"  = true ] && compose_profiles+=(--profile llm)
+    [ "$USE_LDAP" = true ] && compose_profiles+=(--profile ldap)
+    "${COMPOSE_CMD[@]}" "${compose_profiles[@]}" down
     ok "Platform stopped"
 }
 
@@ -527,11 +542,10 @@ enter_shell() {
 run_setup_coder() {
     [ -f "$ENV_FILE" ] || fail "Run init first."
     rm -f "$SETUP_DONE_FILE"
-    if [ "$USE_LLM" = true ]; then
-        bash "$SCRIPT_DIR/setup-coder.sh" --llm
-    else
-        bash "$SCRIPT_DIR/setup-coder.sh"
-    fi
+    local setup_args=()
+    [ "$USE_LLM"  = true ] && setup_args+=(--llm)
+    [ "$USE_LDAP" = true ] && setup_args+=(--ldap)
+    bash "$SCRIPT_DIR/setup-coder.sh" "${setup_args[@]}"
 }
 
 test_api() {
