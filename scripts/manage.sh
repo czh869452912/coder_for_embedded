@@ -359,6 +359,25 @@ load_images() {
     done
 
     ok "Images loaded"
+
+    fix_provider_permissions
+}
+
+fix_provider_permissions() {
+    local provider_root="$CONFIGS_DIR/terraform-providers"
+    [ -d "$provider_root" ] || return 0
+
+    local fixed_count=0
+    while IFS= read -r -d '' bin_path; do
+        chmod +x "$bin_path"
+        fixed_count=$(( fixed_count + 1 ))
+    done < <(find "$provider_root" -type f -name 'terraform-provider-*' ! -name '*.zip' -print0)
+
+    if [ "$fixed_count" -gt 0 ]; then
+        ok "Fixed execute permissions on $fixed_count Terraform provider binary/binaries"
+    else
+        info "Terraform provider binaries already executable (or none found)"
+    fi
 }
 
 start_services() {
@@ -405,6 +424,8 @@ start_services() {
     elif [ "$offline_terraform_mode" = false ]; then
         info "Connected Terraform mode is active. Local providers will be used first, then registry fallback is allowed."
     fi
+
+    fix_provider_permissions
 
     # In offline/loaded mode Docker cannot resolve digest refs against the registry.
     # Override image ref env vars to use name:tag format before invoking compose,

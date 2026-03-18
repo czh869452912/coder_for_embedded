@@ -129,6 +129,7 @@ download_terraform_providers() {
         download_url="$(curl -fsSL "https://registry.terraform.io/v1/providers/${namespace}/${provider_type}/${version}/download/${os}/${arch}" | python3 -c "import json,sys; print(json.load(sys.stdin)['download_url'])")"
         curl -fL "$download_url" -o "$zip_path"
         unzip -q -o "$zip_path" -d "$destination_dir"
+        find "$destination_dir" -maxdepth 1 -name 'terraform-provider-*' ! -name '*.zip' -exec chmod +x {} +
         rm -f "$zip_path"
         touch "$extracted_marker"
         ok "Saved and extracted $zip_name"
