@@ -113,30 +113,45 @@ download_terraform_providers() {
         local version="$3"
         local os="linux"
         local arch="amd64"
-        local destination_dir="$CONFIGS_DIR/terraform-providers/registry.terraform.io/${namespace}/${provider_type}/${version}/${os}_${arch}"
         local zip_name="terraform-provider-${provider_type}_${version}_${os}_${arch}.zip"
-        local zip_path="$destination_dir/$zip_name"
-        local extracted_marker="$destination_dir/.extracted"
 
-        mkdir -p "$destination_dir"
-        if [ -f "$extracted_marker" ]; then
-            ok "Already downloaded and extracted: $zip_name"
-            return 0
+        # --- Network mirror location (zip kept for serving by provider-mirror nginx) ---
+        local mirror_dir="$CONFIGS_DIR/provider-mirror/registry.terraform.io/${namespace}/${provider_type}/${version}/${os}_${arch}"
+        local mirror_zip="$mirror_dir/$zip_name"
+
+        mkdir -p "$mirror_dir"
+        if [ ! -f "$mirror_zip" ]; then
+            info "Downloading $zip_name"
+            local download_url
+            download_url="$(curl -fsSL "https://registry.terraform.io/v1/providers/${namespace}/${provider_type}/${version}/download/${os}/${arch}" | python3 -c "import json,sys; print(json.load(sys.stdin)['download_url'])")"
+            curl -fL "$download_url" -o "$mirror_zip"
+            ok "Saved (mirror) $mirror_zip"
+        else
+            ok "Already present (mirror): $zip_name"
         fi
 
-        info "Downloading $zip_name"
-        local download_url
-        download_url="$(curl -fsSL "https://registry.terraform.io/v1/providers/${namespace}/${provider_type}/${version}/download/${os}/${arch}" | python3 -c "import json,sys; print(json.load(sys.stdin)['download_url'])")"
-        curl -fL "$download_url" -o "$zip_path"
-        unzip -q -o "$zip_path" -d "$destination_dir"
-        find "$destination_dir" -maxdepth 1 -name 'terraform-provider-*' ! -name '*.zip' -exec chmod +x {} +
-        rm -f "$zip_path"
-        touch "$extracted_marker"
-        ok "Saved and extracted $zip_name"
+        # --- Filesystem mirror location (extracted binary, kept for backward compat) ---
+        local fs_dir="$CONFIGS_DIR/terraform-providers/registry.terraform.io/${namespace}/${provider_type}/${version}/${os}_${arch}"
+        local extracted_marker="$fs_dir/.extracted"
+
+        mkdir -p "$fs_dir"
+        if [ ! -f "$extracted_marker" ]; then
+            info "Extracting $zip_name -> filesystem-mirror (backward compat)"
+            unzip -q -o "$mirror_zip" -d "$fs_dir"
+            find "$fs_dir" -maxdepth 1 -name 'terraform-provider-*' ! -name '*.zip' -exec chmod +x {} +
+            touch "$extracted_marker"
+            ok "Extracted to $fs_dir"
+        fi
     }
 
     download_provider coder coder "$TF_PROVIDER_CODER_VERSION"
     download_provider kreuzwerker docker "$TF_PROVIDER_DOCKER_VERSION"
+
+    # Build index.json and <version>.json for the network mirror
+    info "Building network mirror indexes..."
+    bash "$SCRIPT_DIR/update-provider-mirror.sh" coder/coder
+    bash "$SCRIPT_DIR/update-provider-mirror.sh" kreuzwerker/docker
+    ok "Network mirror indexes built"
 }
 
 save_runtime_images() {
@@ -226,8 +241,8 @@ PY
     {"ref": "${WORKSPACE_IMAGE:-workspace-embedded}:${WORKSPACE_IMAGE_TAG:-latest}", "archive": "images/$(workspace_archive_name)"}${llm_manifest}
   ],
   "providers": [
-    {"source": "registry.terraform.io/coder/coder", "version": "${TF_PROVIDER_CODER_VERSION}", "archive": "configs/terraform-providers/registry.terraform.io/coder/coder/${TF_PROVIDER_CODER_VERSION}/linux_amd64/.extracted"},
-    {"source": "registry.terraform.io/kreuzwerker/docker", "version": "${TF_PROVIDER_DOCKER_VERSION}", "archive": "configs/terraform-providers/registry.terraform.io/kreuzwerker/docker/${TF_PROVIDER_DOCKER_VERSION}/linux_amd64/.extracted"}
+    {"source": "registry.terraform.io/coder/coder", "version": "${TF_PROVIDER_CODER_VERSION}", "archive": "configs/provider-mirror/registry.terraform.io/coder/coder/${TF_PROVIDER_CODER_VERSION}/linux_amd64/terraform-provider-coder_${TF_PROVIDER_CODER_VERSION}_linux_amd64.zip"},
+    {"source": "registry.terraform.io/kreuzwerker/docker", "version": "${TF_PROVIDER_DOCKER_VERSION}", "archive": "configs/provider-mirror/registry.terraform.io/kreuzwerker/docker/${TF_PROVIDER_DOCKER_VERSION}/linux_amd64/terraform-provider-docker_${TF_PROVIDER_DOCKER_VERSION}_linux_amd64.zip"}
   ]
 }
 EOF

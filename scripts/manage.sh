@@ -89,7 +89,8 @@ init_dirs() {
         "$PROJECT_ROOT/logs/nginx" \
         "$CONFIGS_DIR/ssl" \
         "$CONFIGS_DIR/vsix" \
-        "$CONFIGS_DIR/terraform-providers"
+        "$CONFIGS_DIR/terraform-providers" \
+        "$CONFIGS_DIR/provider-mirror/registry.terraform.io"
 }
 
 load_config() {
@@ -429,13 +430,14 @@ start_services() {
         offline_terraform_mode=true
     fi
 
-    if [ ! -d "$CONFIGS_DIR/terraform-providers/registry.terraform.io" ]; then
+    if ! find "$CONFIGS_DIR/provider-mirror/registry.terraform.io" \
+             -name "index.json" -quit 2>/dev/null | grep -q .; then
         if [ "$offline_terraform_mode" = true ]; then
-            fail "Offline Terraform mode is active but the provider cache is missing."
+            fail "Offline Terraform mode is active but the provider mirror is empty. Run prepare-offline.sh or update-provider-mirror.sh first."
         fi
-        warn "Connected Terraform mode is active and the provider cache is missing. Terraform will fall back to the public registry."
+        warn "Provider mirror is empty. Terraform will attempt direct registry access."
     elif [ "$offline_terraform_mode" = false ]; then
-        info "Connected Terraform mode is active. Local providers will be used first, then registry fallback is allowed."
+        info "Provider mirror ready. Connected mode: local mirror first, then registry fallback."
     fi
 
     fix_provider_permissions

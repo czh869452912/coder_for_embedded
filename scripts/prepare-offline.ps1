@@ -94,32 +94,46 @@ function Get-TerraformProviders {
     $cfg = Get-Config
 
     $providers = @(
-        @{ Namespace = 'coder'; Type = 'coder'; Version = $cfg['TF_PROVIDER_CODER_VERSION']; Os = 'linux'; Arch = 'amd64' },
+        @{ Namespace = 'coder';       Type = 'coder';  Version = $cfg['TF_PROVIDER_CODER_VERSION'];   Os = 'linux'; Arch = 'amd64' },
         @{ Namespace = 'kreuzwerker'; Type = 'docker'; Version = $cfg['TF_PROVIDER_DOCKER_VERSION']; Os = 'linux'; Arch = 'amd64' }
     )
 
     foreach ($provider in $providers) {
-        $downloadInfoUrl = "https://registry.terraform.io/v1/providers/$($provider.Namespace)/$($provider.Type)/$($provider.Version)/download/$($provider.Os)/$($provider.Arch)"
-        $destinationDir = Join-Path $ConfigsDir "terraform-providers\registry.terraform.io\$($provider.Namespace)\$($provider.Type)\$($provider.Version)\$($provider.Os)_$($provider.Arch)"
-        New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
-
         $zipName = "terraform-provider-$($provider.Type)_$($provider.Version)_$($provider.Os)_$($provider.Arch).zip"
-        $zipPath = Join-Path $destinationDir $zipName
-        $extractedMarker = Join-Path $destinationDir '.extracted'
-        
-        if (Test-Path $extractedMarker) {
-            Write-OK "Already downloaded and extracted: $zipName"
-            continue
+
+        # --- Network mirror location (zip kept for serving by provider-mirror nginx) ---
+        $mirrorDir = Join-Path $ConfigsDir "provider-mirror\registry.terraform.io\$($provider.Namespace)\$($provider.Type)\$($provider.Version)\$($provider.Os)_$($provider.Arch)"
+        $mirrorZip = Join-Path $mirrorDir $zipName
+        New-Item -ItemType Directory -Path $mirrorDir -Force | Out-Null
+
+        if (-not (Test-Path $mirrorZip)) {
+            Write-Info "Downloading $zipName"
+            $downloadInfoUrl = "https://registry.terraform.io/v1/providers/$($provider.Namespace)/$($provider.Type)/$($provider.Version)/download/$($provider.Os)/$($provider.Arch)"
+            $downloadInfo = Invoke-RestMethod -Uri $downloadInfoUrl -TimeoutSec 30
+            Invoke-WebRequest -Uri $downloadInfo.download_url -OutFile $mirrorZip -TimeoutSec 300 -UseBasicParsing
+            Write-OK "Saved (mirror) $mirrorZip"
+        } else {
+            Write-OK "Already present (mirror): $zipName"
         }
 
-        Write-Info "Downloading $zipName"
-        $downloadInfo = Invoke-RestMethod -Uri $downloadInfoUrl -TimeoutSec 30
-        Invoke-WebRequest -Uri $downloadInfo.download_url -OutFile $zipPath -TimeoutSec 300
-        Expand-Archive -Path $zipPath -DestinationPath $destinationDir -Force
-        Remove-Item $zipPath -Force
-        Set-Content -Path $extractedMarker -Value '1'
-        Write-OK "Saved and extracted $zipName"
+        # --- Filesystem mirror location (extracted binary, kept for backward compat) ---
+        $fsDir = Join-Path $ConfigsDir "terraform-providers\registry.terraform.io\$($provider.Namespace)\$($provider.Type)\$($provider.Version)\$($provider.Os)_$($provider.Arch)"
+        $extractedMarker = Join-Path $fsDir '.extracted'
+        New-Item -ItemType Directory -Path $fsDir -Force | Out-Null
+
+        if (-not (Test-Path $extractedMarker)) {
+            Write-Info "Extracting $zipName -> filesystem-mirror (backward compat)"
+            Expand-Archive -Path $mirrorZip -DestinationPath $fsDir -Force
+            Set-Content -Path $extractedMarker -Value '1'
+            Write-OK "Extracted to $fsDir"
+        }
     }
+
+    # Build index.json and <version>.json for the network mirror
+    Write-Info "Building network mirror indexes..."
+    & (Join-Path $ScriptDir 'update-provider-mirror.ps1') -Provider 'coder/coder'
+    & (Join-Path $ScriptDir 'update-provider-mirror.ps1') -Provider 'kreuzwerker/docker'
+    Write-OK "Network mirror indexes built"
 }
 
 function Save-PlatformImages {
@@ -198,14 +212,14 @@ function Write-OfflineManifest {
 
     $providers = @(
         [ordered]@{
-            source = 'registry.terraform.io/coder/coder'
+            source  = 'registry.terraform.io/coder/coder'
             version = $cfg['TF_PROVIDER_CODER_VERSION']
-            archive = "configs/terraform-providers/registry.terraform.io/coder/coder/$($cfg['TF_PROVIDER_CODER_VERSION'])/linux_amd64/.extracted"
+            archive = "configs/provider-mirror/registry.terraform.io/coder/coder/$($cfg['TF_PROVIDER_CODER_VERSION'])/linux_amd64/terraform-provider-coder_$($cfg['TF_PROVIDER_CODER_VERSION'])_linux_amd64.zip"
         },
         [ordered]@{
-            source = 'registry.terraform.io/kreuzwerker/docker'
+            source  = 'registry.terraform.io/kreuzwerker/docker'
             version = $cfg['TF_PROVIDER_DOCKER_VERSION']
-            archive = "configs/terraform-providers/registry.terraform.io/kreuzwerker/docker/$($cfg['TF_PROVIDER_DOCKER_VERSION'])/linux_amd64/.extracted"
+            archive = "configs/provider-mirror/registry.terraform.io/kreuzwerker/docker/$($cfg['TF_PROVIDER_DOCKER_VERSION'])/linux_amd64/terraform-provider-docker_$($cfg['TF_PROVIDER_DOCKER_VERSION'])_linux_amd64.zip"
         }
     )
 

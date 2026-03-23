@@ -23,6 +23,25 @@ services:
       timeout: 10s
       retries: 3
 
+  provider-mirror:
+    image: ${NGINX_IMAGE_REF:-nginx:alpine}
+    container_name: coder-provider-mirror
+    hostname: provider-mirror
+    volumes:
+      - ../configs/provider-mirror/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../configs/ssl:/etc/nginx/ssl:ro
+      - ../configs/provider-mirror/registry.terraform.io:/srv/mirror/registry.terraform.io:ro
+    networks:
+      coderplatform:
+        aliases:
+          - provider-mirror
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --no-check-certificate --spider https://localhost/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
   coder:
     image: ${CODER_IMAGE_REF:-ghcr.io/coder/coder:latest}
     container_name: coder-server
@@ -39,6 +58,10 @@ services:
       CODER_UPDATE_CHECK: "false"
       TF_CLI_CONFIG_FILE: "/home/coder/.terraformrc"
       CODER_CACHE_DIRECTORY: "/tmp/coder-cache"
+      # Go crypto/x509 reads SSL_CERT_DIR as a colon-separated list of cert directories.
+      # This allows Terraform (a Go binary) to trust the internal provider-mirror TLS cert
+      # without modifying the official Coder image.
+      SSL_CERT_DIR: "/custom-certs:/etc/ssl/certs"
       # OIDC / LDAP 认证（通过 Dex 桥接，需在 .env 中配置 OIDC_CLIENT_SECRET）
       # 若 OIDC_CLIENT_SECRET 为空则 OIDC 不生效，保持内置密码认证
       CODER_OIDC_ISSUER_URL: "https://${SERVER_HOST:-localhost}:${GATEWAY_PORT:-8443}/dex"
@@ -52,8 +75,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${TF_CLI_CONFIG_MOUNT:-../configs/terraform-offline.rc}:/home/coder/.terraformrc:ro
       - ../configs/terraform-providers:/opt/terraform-providers:ro
+      - ../configs/ssl/ca.crt:/custom-certs/coder-offline-ca.crt:ro
     depends_on:
       postgres:
+        condition: service_healthy
+      provider-mirror:
         condition: service_healthy
     networks:
       coderplatform:

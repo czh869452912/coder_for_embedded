@@ -117,12 +117,13 @@ function Get-LeafAltNames {
     $entries.Add('DNS.1 = localhost')
     $entries.Add('DNS.2 = coder.local')
     $entries.Add('DNS.3 = host.docker.internal')
+    $entries.Add('DNS.4 = provider-mirror')
     $entries.Add('IP.1  = 127.0.0.1')
     if ($ServerHost) {
         if ($ServerHost -match '^\d+\.\d+\.\d+\.\d+$') {
             $entries.Add("IP.2  = $ServerHost")
-        } elseif ($ServerHost -notin @('localhost', 'coder.local', 'host.docker.internal')) {
-            $entries.Add("DNS.4 = $ServerHost")
+        } elseif ($ServerHost -notin @('localhost', 'coder.local', 'host.docker.internal', 'provider-mirror')) {
+            $entries.Add("DNS.5 = $ServerHost")
         }
     }
     return ($entries -join [Environment]::NewLine)

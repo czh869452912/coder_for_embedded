@@ -1,14 +1,14 @@
 # Terraform CLI config for connected environments.
-# Uses the local filesystem mirror first and falls back to the public registry.
+# Uses the local network mirror first; falls back to the public registry for
+# any provider not served by the mirror.
 
 provider_installation {
-  filesystem_mirror {
-    path    = "/opt/terraform-providers"
-    include = [
-      "registry.terraform.io/coder/coder",
-      "registry.terraform.io/kreuzwerker/docker"
-    ]
+  network_mirror {
+    url     = "https://provider-mirror/"
+    include = ["registry.terraform.io/*/*"]
   }
 
-  direct {}
+  direct {
+    exclude = ["registry.terraform.io/*/*"]
+  }
 }

@@ -59,6 +59,7 @@ function Initialize-Dirs {
         (Join-Path $ConfigsDir "ssl"),
         (Join-Path $ConfigsDir "terraform-providers"),
         (Join-Path $ConfigsDir "vsix"),
+        (Join-Path $ConfigsDir "provider-mirror\registry.terraform.io"),
         (Join-Path $ProjectRoot "images"),
         (Join-Path $ProjectRoot "logs\nginx")
     )) {
@@ -471,16 +472,17 @@ function Invoke-Up {
         exit 1
     }
 
-    $providerRoot = Join-Path $ConfigsDir 'terraform-providers\registry.terraform.io'
+    $mirrorRoot = Join-Path $ConfigsDir 'provider-mirror\registry.terraform.io'
     $offlineTerraformMode = ([System.IO.Path]::GetFileName($terraformConfigHostPath) -ieq 'terraform-offline.rc')
-    if (-not (Test-Path $providerRoot)) {
+    $mirrorHasIndexes = (Get-ChildItem -Path $mirrorRoot -Filter 'index.json' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) -ne $null
+    if (-not $mirrorHasIndexes) {
         if ($offlineTerraformMode) {
-            Write-Fail 'Offline Terraform mode is active but the provider cache is missing.'
+            Write-Fail 'Offline Terraform mode is active but the provider mirror is empty. Run prepare-offline.ps1 or update-provider-mirror.ps1 first.'
             exit 1
         }
-        Write-Warn 'Connected Terraform mode is active and the provider cache is missing. Terraform will fall back to the public registry.'
+        Write-Warn 'Provider mirror is empty. Terraform will attempt direct registry access.'
     } elseif (-not $offlineTerraformMode) {
-        Write-Info 'Connected Terraform mode is active. Local providers will be used first, then registry fallback is allowed.'
+        Write-Info 'Provider mirror ready. Connected mode: local mirror first, then registry fallback.'
     }
 
     # In offline/loaded mode Docker cannot resolve digest refs against the registry.

@@ -155,13 +155,16 @@ get_leaf_alt_names() {
     entries+=("DNS.1 = localhost")
     entries+=("DNS.2 = coder.local")
     entries+=("DNS.3 = host.docker.internal")
+    entries+=("DNS.4 = provider-mirror")
     entries+=("IP.1  = 127.0.0.1")
 
     if [ -n "$server_host" ]; then
         if [[ "$server_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             entries+=("IP.2  = $server_host")
-        elif [[ "$server_host" != "localhost" && "$server_host" != "coder.local" && "$server_host" != "host.docker.internal" ]]; then
-            entries+=("DNS.4 = $server_host")
+        elif [[ "$server_host" != "localhost" && "$server_host" != "coder.local" \
+             && "$server_host" != "host.docker.internal" \
+             && "$server_host" != "provider-mirror" ]]; then
+            entries+=("DNS.5 = $server_host")
         fi
     fi
 
