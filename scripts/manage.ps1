@@ -6,7 +6,12 @@ param(
     [Parameter(Position=1)]
     [string]$Arg1 = "",
     [switch]$Llm,
-    [switch]$Ldap
+    [switch]$Ldap,
+    [string]$Tag = "",
+    [switch]$Apply,
+    [switch]$RequireLlm,
+    [switch]$SkipImages,
+    [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,8 +24,14 @@ $DockerDir   = Join-Path $ProjectRoot "docker"
 $ConfigsDir  = Join-Path $ProjectRoot "configs"
 $EnvFile     = Join-Path $DockerDir ".env"
 $SetupDone   = Join-Path $DockerDir ".setup-done"
-$script:UseLlm  = $Llm.IsPresent
-$script:UseLdap = $Ldap.IsPresent
+$ImagesDir   = Join-Path $ProjectRoot "images"
+$LockFile    = Join-Path $ConfigsDir "versions.lock.env"
+$script:UseLlm     = $Llm.IsPresent
+$script:UseLdap    = $Ldap.IsPresent
+$script:Apply      = $Apply.IsPresent
+$script:RequireLlm = $RequireLlm.IsPresent
+$script:SkipImages = $SkipImages.IsPresent
+$script:SkipBuild  = $SkipBuild.IsPresent
 
 . (Join-Path $ScriptDir "lib\offline-common.ps1")
 
@@ -477,7 +488,7 @@ function Invoke-Up {
     $mirrorHasIndexes = (Get-ChildItem -Path $mirrorRoot -Filter 'index.json' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) -ne $null
     if (-not $mirrorHasIndexes) {
         if ($offlineTerraformMode) {
-            Write-Fail 'Offline Terraform mode is active but the provider mirror is empty. Run prepare-offline.ps1 or update-provider-mirror.ps1 first.'
+            Write-Fail "Offline Terraform mode is active but the provider mirror is empty. Run '.\scripts\manage.ps1 prepare' or 'update-provider-mirror.ps1' first."
             exit 1
         }
         Write-Warn 'Provider mirror is empty. Terraform will attempt direct registry access.'
@@ -607,19 +618,9 @@ function Invoke-SetupCoder {
     $adminEmail = if ($cfg['CODER_ADMIN_EMAIL']) { $cfg['CODER_ADMIN_EMAIL'] } else { 'admin@company.local' }
     $adminUsername = if ($cfg['CODER_ADMIN_USERNAME']) { $cfg['CODER_ADMIN_USERNAME'] } else { 'admin' }
     $adminPassword = if ($cfg['CODER_ADMIN_PASSWORD']) { $cfg['CODER_ADMIN_PASSWORD'] } else { '' }
-    $workspaceImageName = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
-    $workspaceImageTag = if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
-    $anthropicKey = if ($cfg['ANTHROPIC_API_KEY']) { $cfg['ANTHROPIC_API_KEY'] } else { '' }
-    $anthropicUrl = if ($cfg['ANTHROPIC_BASE_URL']) { $cfg['ANTHROPIC_BASE_URL'] } else { '' }
 
     if ($script:UseLlm) {
         Assert-LlmConfig
-        if (-not $anthropicKey -and $cfg['LITELLM_MASTER_KEY']) {
-            $anthropicKey = $cfg['LITELLM_MASTER_KEY']
-        }
-        if (-not $anthropicUrl) {
-            $anthropicUrl = Get-LlmGatewayUrl -Config $cfg
-        }
     }
 
     Write-Info 'Waiting for Coder health endpoint...'
@@ -675,25 +676,45 @@ function Invoke-SetupCoder {
         Write-Info "Template 'embedded-dev' already exists. Pushing a new version to apply current variables."
     }
 
-    $templateDir = Join-Path $ProjectRoot 'workspace-template'
-    Write-Info 'Pushing workspace template...'
+    Invoke-PushTemplate -SessionToken $sessionToken
+
+    Get-Date | Set-Content $SetupDone
+    Show-AccessInfo
+}
+
+# Shared template push — called by setup-coder, push-template, update-workspace, load-workspace
+function Invoke-PushTemplate {
+    param([string]$SessionToken)
+    $cfg = Get-Config
+    $workspaceImageName = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
+    $workspaceImageTag  = if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
+    $anthropicKey = if ($cfg['ANTHROPIC_API_KEY']) { $cfg['ANTHROPIC_API_KEY'] } else { '' }
+    $anthropicUrl = if ($cfg['ANTHROPIC_BASE_URL']) { $cfg['ANTHROPIC_BASE_URL'] } else { '' }
+
+    if ($script:UseLlm) {
+        if (-not $anthropicKey -and $cfg['LITELLM_MASTER_KEY']) {
+            $anthropicKey = $cfg['LITELLM_MASTER_KEY']
+        }
+        if (-not $anthropicUrl) {
+            $anthropicUrl = Get-LlmGatewayUrl -Config $cfg
+        }
+    }
+
+    Write-Info "Pushing workspace template (image=${workspaceImageName}:${workspaceImageTag})"
     docker exec coder-server sh -c "rm -rf /tmp/template-push && mkdir -p /tmp/template-push" | Out-Null
-    docker cp "$templateDir/." "coder-server:/tmp/template-push/"
+    docker cp "$($ProjectRoot)\workspace-template\." "coder-server:/tmp/template-push/"
     if ($LASTEXITCODE -ne 0) {
         Write-Fail 'Failed to copy template into coder-server.'
         exit 1
     }
 
-    $pushCommand = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$sessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' ; rm -rf /tmp/template-push"
-    docker exec coder-server sh -c $pushCommand
+    $pushCmd = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$SessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' ; rm -rf /tmp/template-push"
+    docker exec coder-server sh -c $pushCmd
     if ($LASTEXITCODE -ne 0) {
         Write-Fail 'Template push failed.'
         exit 1
     }
     Write-OK 'Workspace template pushed.'
-
-    Get-Date | Set-Content $SetupDone
-    Show-AccessInfo
 }
 
 function Show-AccessInfo {
@@ -790,35 +811,577 @@ function Invoke-Clean {
     Write-OK 'Cleanup complete.'
 }
 
+# ─── push-template ────────────────────────────────────────────────────────────
+
+function Invoke-CmdPushTemplate {
+    Assert-Docker
+    if (-not (Test-Path $EnvFile)) { Write-Fail 'Run init first.'; exit 1 }
+    $cfg = Get-Config
+    $port = if ($cfg['CODER_INTERNAL_PORT']) { $cfg['CODER_INTERNAL_PORT'] } else { '7080' }
+    $baseUrl = "http://localhost:$port"
+
+    try {
+        $h = Invoke-WebRequest -Uri "$baseUrl/healthz" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        if ($h.StatusCode -ne 200) { throw "not ready" }
+    } catch {
+        Write-Fail "Coder is not reachable at $baseUrl. Is the platform running?"
+        exit 1
+    }
+
+    $adminEmail    = if ($cfg['CODER_ADMIN_EMAIL'])    { $cfg['CODER_ADMIN_EMAIL'] }    else { 'admin@company.local' }
+    $adminPassword = if ($cfg['CODER_ADMIN_PASSWORD']) { $cfg['CODER_ADMIN_PASSWORD'] } else { '' }
+    $loginBody = '{"email":"' + $adminEmail + '","password":"' + $adminPassword + '"}'
+    $loginResponse = Invoke-RestMethod -Uri "$baseUrl/api/v2/users/login" -Method POST -ContentType 'application/json' -Body $loginBody
+    $sessionToken = $loginResponse.session_token
+    if (-not $sessionToken) { Write-Fail 'Failed to get Coder session token. Check admin credentials in docker/.env.'; exit 1 }
+    Write-OK 'Obtained session token.'
+
+    Invoke-PushTemplate -SessionToken $sessionToken
+}
+
+# ─── update-workspace ─────────────────────────────────────────────────────────
+
+function Update-LockWorkspaceTag {
+    param([string]$NewTag)
+    $lockContent = Get-Content $LockFile -Raw
+    if ($lockContent -match 'WORKSPACE_IMAGE_TAG=') {
+        $lockContent = $lockContent -replace 'WORKSPACE_IMAGE_TAG=.*', "WORKSPACE_IMAGE_TAG=$NewTag"
+    } else {
+        $lockContent += "`r`nWORKSPACE_IMAGE_TAG=$NewTag"
+    }
+    [System.IO.File]::WriteAllText($LockFile, $lockContent, [System.Text.UTF8Encoding]::new($false))
+    Write-OK "Updated WORKSPACE_IMAGE_TAG=$NewTag in versions.lock.env"
+}
+
+function Invoke-UpdateWorkspace {
+    param([string]$NewTag = '')
+
+    if (-not $NewTag) {
+        $NewTag = "v$(Get-Date -Format 'yyyyMMdd')"
+        Write-Info "No tag specified, using auto-generated: $NewTag"
+    }
+
+    Assert-Docker
+    Initialize-Dirs
+    if (-not (Test-Path $EnvFile)) { Write-Fail 'Run init first.'; exit 1 }
+    $cfg = Get-Config
+    $imageName = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
+
+    # Step 1: Update lock file
+    Update-LockWorkspaceTag -NewTag $NewTag
+    $cfg = Get-Config  # reload
+
+    # Step 2: Ensure CA and build
+    $sslDir = Join-Path $ConfigsDir 'ssl'
+    Ensure-RootCA -SslDir $sslDir | Out-Null
+    $codeServerBase = $cfg['CODE_SERVER_BASE_IMAGE_REF']
+    Write-Info "Building ${imageName}:${NewTag}"
+    docker build -f "$DockerDir\Dockerfile.workspace" --build-arg "CODE_SERVER_BASE_IMAGE_REF=$codeServerBase" -t "${imageName}:${NewTag}" $ProjectRoot
+    if ($LASTEXITCODE -ne 0) { Write-Fail 'Workspace image build failed.'; exit 1 }
+    Write-OK "Built ${imageName}:${NewTag}"
+
+    # Step 3: Save to tar
+    New-Item -ItemType Directory -Path $ImagesDir -Force | Out-Null
+    $tarFile = Join-Path $ImagesDir "${imageName}_${NewTag}.tar"
+    Write-Info "Saving ${imageName}:${NewTag} -> $(Split-Path $tarFile -Leaf)"
+    docker save "${imageName}:${NewTag}" -o $tarFile
+    if ($LASTEXITCODE -ne 0) { Write-Fail 'Failed to save workspace image.'; exit 1 }
+    $sizeMb = [math]::Round((Get-Item $tarFile).Length / 1MB)
+    Write-OK "Saved ${sizeMb} MB  ($(Split-Path $tarFile -Leaf))"
+
+    # Step 4: Push template if Coder is running
+    $port = if ($cfg['CODER_INTERNAL_PORT']) { $cfg['CODER_INTERNAL_PORT'] } else { '7080' }
+    $baseUrl = "http://localhost:$port"
+    $coderRunning = $false
+    try {
+        $h = Invoke-WebRequest -Uri "$baseUrl/healthz" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+        $coderRunning = ($h.StatusCode -eq 200)
+    } catch {}
+
+    if ($coderRunning) {
+        Write-Info 'Coder is running — pushing updated template.'
+        $adminEmail    = if ($cfg['CODER_ADMIN_EMAIL'])    { $cfg['CODER_ADMIN_EMAIL'] }    else { 'admin@company.local' }
+        $adminPassword = if ($cfg['CODER_ADMIN_PASSWORD']) { $cfg['CODER_ADMIN_PASSWORD'] } else { '' }
+        $loginBody = '{"email":"' + $adminEmail + '","password":"' + $adminPassword + '"}'
+        $loginResponse = Invoke-RestMethod -Uri "$baseUrl/api/v2/users/login" -Method POST -ContentType 'application/json' -Body $loginBody
+        $sessionToken = $loginResponse.session_token
+        if (-not $sessionToken) { Write-Fail 'Failed to get Coder session token.'; exit 1 }
+        Invoke-PushTemplate -SessionToken $sessionToken
+    } else {
+        Write-Warn 'Coder is not running locally — skipping template push.'
+        Write-Info "To push later: .\scripts\manage.ps1 push-template"
+    }
+
+    Write-Host ''
+    Write-OK "Workspace image update complete: ${imageName}:${NewTag}"
+    Write-Info "Transfer $(Split-Path $tarFile -Leaf) and configs\versions.lock.env to the offline server."
+    Write-Info "Then run: .\scripts\manage.ps1 load-workspace -Arg1 $(Split-Path $tarFile -Leaf)"
+}
+
+# ─── load-workspace ───────────────────────────────────────────────────────────
+
+function Invoke-LoadWorkspace {
+    param([string]$TarPath)
+
+    if (-not $TarPath) { Write-Fail 'Usage: manage.ps1 load-workspace <path\to\workspace-image_tag.tar>'; exit 1 }
+    if (-not (Test-Path $TarPath)) { Write-Fail "File not found: $TarPath"; exit 1 }
+    if (-not (Test-Path $EnvFile)) { Write-Fail 'Run init first.'; exit 1 }
+    Assert-Docker
+
+    # Parse image name and tag from filename: <image-name>_<tag>.tar
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($TarPath)
+    $lastUnderscore = $baseName.LastIndexOf('_')
+    if ($lastUnderscore -le 0) {
+        Write-Fail "Cannot parse image name and tag from filename: $(Split-Path $TarPath -Leaf). Expected format: <image-name>_<tag>.tar"
+        exit 1
+    }
+    $imageName = $baseName.Substring(0, $lastUnderscore)
+    $tag       = $baseName.Substring($lastUnderscore + 1)
+
+    Write-Info "Loading workspace image from $(Split-Path $TarPath -Leaf)"
+    docker load -i $TarPath
+    if ($LASTEXITCODE -ne 0) { Write-Fail 'docker load failed.'; exit 1 }
+    Write-OK "Loaded ${imageName}:${tag}"
+
+    # Update lock file
+    Update-LockWorkspaceTag -NewTag $tag
+
+    # Reload config
+    $cfg = Get-Config
+    $port = if ($cfg['CODER_INTERNAL_PORT']) { $cfg['CODER_INTERNAL_PORT'] } else { '7080' }
+    $baseUrl = "http://localhost:$port"
+
+    try {
+        $h = Invoke-WebRequest -Uri "$baseUrl/healthz" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        if ($h.StatusCode -ne 200) { throw "not ready" }
+    } catch {
+        Write-Fail "Coder is not reachable at $baseUrl. Is the platform running?"
+        exit 1
+    }
+
+    Write-Info 'Pushing updated template to Coder.'
+    $adminEmail    = if ($cfg['CODER_ADMIN_EMAIL'])    { $cfg['CODER_ADMIN_EMAIL'] }    else { 'admin@company.local' }
+    $adminPassword = if ($cfg['CODER_ADMIN_PASSWORD']) { $cfg['CODER_ADMIN_PASSWORD'] } else { '' }
+    $loginBody = '{"email":"' + $adminEmail + '","password":"' + $adminPassword + '"}'
+    $loginResponse = Invoke-RestMethod -Uri "$baseUrl/api/v2/users/login" -Method POST -ContentType 'application/json' -Body $loginBody
+    $sessionToken = $loginResponse.session_token
+    if (-not $sessionToken) { Write-Fail 'Failed to get Coder session token.'; exit 1 }
+    Invoke-PushTemplate -SessionToken $sessionToken
+
+    Write-Host ''
+    Write-OK "Workspace image ${imageName}:${tag} is now active."
+    Write-Warn 'Users must stop and restart their workspaces in the Coder UI to pick up the new image.'
+}
+
+# ─── prepare (migrated from prepare-offline.ps1) ──────────────────────────────
+
+function Invoke-PrepareDownloadVsix {
+    Write-Info '=== Step 0: Downloading VS Code extensions (.vsix) ==='
+    $vsixDir = Join-Path $ConfigsDir 'vsix'
+    New-Item -ItemType Directory -Path $vsixDir -Force | Out-Null
+
+    $cmakeDest = Join-Path $vsixDir 'ms-vscode.cmake-tools.vsix'
+    if (Test-Path $cmakeDest) {
+        Write-OK 'Already downloaded: ms-vscode.cmake-tools.vsix'
+    } else {
+        Write-Info 'Downloading ms-vscode.cmake-tools'
+        $cmakeUrl = 'https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-vscode/vsextensions/cmake-tools/latest/vspackage'
+        try {
+            Invoke-WebRequest -Uri $cmakeUrl -OutFile $cmakeDest -TimeoutSec 120 -UseBasicParsing -ErrorAction Stop
+            Write-OK 'Saved ms-vscode.cmake-tools.vsix'
+        } catch {
+            Write-Warn "Failed to download cmake-tools — continuing without it (not fatal)"
+            Remove-Item $cmakeDest -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $cpptoolsDest = Join-Path $vsixDir 'ms-vscode.cpptools-linux-x64.vsix'
+    if (Test-Path $cpptoolsDest) {
+        Write-OK 'Already downloaded: ms-vscode.cpptools-linux-x64.vsix'
+    } else {
+        Write-Info 'Downloading ms-vscode.cpptools (linux-x64)'
+        try {
+            $queryBody = '{"filters":[{"criteria":[{"filterType":7,"value":"ms-vscode.cpptools"}]}],"flags":2151}'
+            $apiResp = Invoke-RestMethod -Uri 'https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery' `
+                -Method POST -ContentType 'application/json' -Body $queryBody `
+                -Headers @{ 'Accept' = 'application/json;api-version=3.0-preview.1' } -TimeoutSec 20 -ErrorAction Stop
+            $versions = $apiResp.results[0].extensions[0].versions
+            $linuxVer = $versions | Where-Object { $_.targetPlatform -eq 'linux-x64' } | Select-Object -First 1
+            $vsixAsset = $linuxVer.files | Where-Object { $_.assetType -eq 'Microsoft.VisualStudio.Services.VSIXPackage' }
+            Invoke-WebRequest -Uri $vsixAsset.source -OutFile $cpptoolsDest -TimeoutSec 300 -UseBasicParsing -ErrorAction Stop
+            Write-OK 'Saved ms-vscode.cpptools-linux-x64.vsix'
+        } catch {
+            Write-Warn "Failed to download cpptools — continuing without it (not fatal)"
+            Remove-Item $cpptoolsDest -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Invoke-PrepareDownloadProviders {
+    Write-Info '=== Step 1: Downloading Terraform providers ==='
+    $cfg = Get-Config
+
+    $providers = @(
+        @{ Namespace = 'coder';       Type = 'coder';  Version = $cfg['TF_PROVIDER_CODER_VERSION'];   Os = 'linux'; Arch = 'amd64' },
+        @{ Namespace = 'kreuzwerker'; Type = 'docker'; Version = $cfg['TF_PROVIDER_DOCKER_VERSION']; Os = 'linux'; Arch = 'amd64' }
+    )
+
+    foreach ($provider in $providers) {
+        $zipName = "terraform-provider-$($provider.Type)_$($provider.Version)_$($provider.Os)_$($provider.Arch).zip"
+        $mirrorDir = Join-Path $ConfigsDir "provider-mirror\registry.terraform.io\$($provider.Namespace)\$($provider.Type)\$($provider.Version)\$($provider.Os)_$($provider.Arch)"
+        $mirrorZip = Join-Path $mirrorDir $zipName
+        New-Item -ItemType Directory -Path $mirrorDir -Force | Out-Null
+
+        if (-not (Test-Path $mirrorZip)) {
+            Write-Info "Downloading $zipName"
+            $downloadInfoUrl = "https://registry.terraform.io/v1/providers/$($provider.Namespace)/$($provider.Type)/$($provider.Version)/download/$($provider.Os)/$($provider.Arch)"
+            $downloadInfo = Invoke-RestMethod -Uri $downloadInfoUrl -TimeoutSec 30
+            Invoke-WebRequest -Uri $downloadInfo.download_url -OutFile $mirrorZip -TimeoutSec 300 -UseBasicParsing
+            Write-OK "Saved (mirror) $mirrorZip"
+        } else {
+            Write-OK "Already present (mirror): $zipName"
+        }
+
+        $fsDir = Join-Path $ConfigsDir "terraform-providers\registry.terraform.io\$($provider.Namespace)\$($provider.Type)\$($provider.Version)\$($provider.Os)_$($provider.Arch)"
+        $extractedMarker = Join-Path $fsDir '.extracted'
+        New-Item -ItemType Directory -Path $fsDir -Force | Out-Null
+        if (-not (Test-Path $extractedMarker)) {
+            Write-Info "Extracting $zipName -> filesystem-mirror"
+            Expand-Archive -Path $mirrorZip -DestinationPath $fsDir -Force
+            Set-Content -Path $extractedMarker -Value '1'
+            Write-OK "Extracted to $fsDir"
+        }
+    }
+
+    Write-Info "Building network mirror indexes..."
+    & (Join-Path $ScriptDir 'update-provider-mirror.ps1') -Provider 'coder/coder'
+    & (Join-Path $ScriptDir 'update-provider-mirror.ps1') -Provider 'kreuzwerker/docker'
+    Write-OK "Network mirror indexes built"
+}
+
+function Invoke-PrepareSavePlatformImages {
+    Write-Info '=== Step 2: Pulling and saving platform images ==='
+    $cfg = Get-Config
+    New-Item -ItemType Directory -Path $ImagesDir -Force | Out-Null
+
+    $images = [System.Collections.Generic.List[string]]@(
+        $cfg['CODER_IMAGE_REF'],
+        $cfg['POSTGRES_IMAGE_REF'],
+        $cfg['NGINX_IMAGE_REF']
+    )
+    if ($script:UseLlm) { $images.Add($cfg['LITELLM_IMAGE_REF']) }
+
+    foreach ($image in $images) {
+        Write-Info "Pulling $image"
+        docker pull $image
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to pull $image"; exit 1 }
+        $fileName = ($image -replace '[:/@]', '_') + '.tar'
+        $filePath = Join-Path $ImagesDir $fileName
+        Write-Info "Saving $image -> $fileName"
+        docker save $image -o $filePath
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to save $image"; exit 1 }
+        Write-OK "Saved $fileName"
+    }
+}
+
+function Invoke-PrepareBuildWorkspace {
+    Write-Info '=== Step 3: Building and saving workspace image ==='
+    $cfg = Get-Config
+    $sslDir = Join-Path $ConfigsDir 'ssl'
+    $serverHost = if ($cfg['SERVER_HOST']) { $cfg['SERVER_HOST'] } else { 'localhost' }
+    $workspaceImage = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
+    $workspaceTag   = if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
+
+    if (-not (Test-Path (Join-Path $sslDir 'ca.crt')) -or -not (Test-Path (Join-Path $sslDir 'server.crt'))) {
+        Write-Warn 'Missing CA or leaf certificate. Generating them now.'
+        Issue-LeafCertificate -SslDir $sslDir -ServerHost $serverHost | Out-Null
+    }
+
+    Write-Info "Pulling build base image $($cfg['CODE_SERVER_BASE_IMAGE_REF'])"
+    docker pull $cfg['CODE_SERVER_BASE_IMAGE_REF']
+    if ($LASTEXITCODE -ne 0) { Write-Fail 'Failed to pull code-server base image'; exit 1 }
+
+    Write-Info "Building ${workspaceImage}:${workspaceTag}"
+    docker build -f "$DockerDir\Dockerfile.workspace" --build-arg "CODE_SERVER_BASE_IMAGE_REF=$($cfg['CODE_SERVER_BASE_IMAGE_REF'])" -t "${workspaceImage}:${workspaceTag}" $ProjectRoot
+    if ($LASTEXITCODE -ne 0) { Write-Fail 'Workspace image build failed'; exit 1 }
+
+    New-Item -ItemType Directory -Path $ImagesDir -Force | Out-Null
+    $tarFile = Join-Path $ImagesDir "${workspaceImage}_${workspaceTag}.tar"
+    Write-Info "Saving ${workspaceImage}:${workspaceTag} -> $(Split-Path $tarFile -Leaf)"
+    docker save "${workspaceImage}:${workspaceTag}" -o $tarFile
+    if ($LASTEXITCODE -ne 0) { Write-Fail 'Failed to save workspace image'; exit 1 }
+    Write-OK "Saved $(Split-Path $tarFile -Leaf)"
+}
+
+function Invoke-PrepareWriteManifest {
+    $cfg = Get-Config
+    $caCert = Join-Path $ConfigsDir 'ssl\ca.crt'
+    $wsImage = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
+    $wsTag   = if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
+
+    $imageEntry = { param([string]$Ref) [ordered]@{ ref = $Ref; archive = "images/$(($Ref -replace '[:/@]','_') + '.tar')" } }
+    $images = @(
+        (& $imageEntry $cfg['CODER_IMAGE_REF']),
+        (& $imageEntry $cfg['POSTGRES_IMAGE_REF']),
+        (& $imageEntry $cfg['NGINX_IMAGE_REF']),
+        [ordered]@{ ref = "${wsImage}:${wsTag}"; archive = "images/${wsImage}_${wsTag}.tar" }
+    )
+    if ($script:UseLlm) { $images += (& $imageEntry $cfg['LITELLM_IMAGE_REF']) }
+
+    $manifest = [ordered]@{
+        generated_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        include_llm = [bool]$script:UseLlm
+        terraform_cli_config_mount_default = '../configs/terraform-offline.rc'
+        ca_sha256 = if (Test-Path $caCert) { (Get-FileHash $caCert -Algorithm SHA256).Hash.ToLowerInvariant() } else { '' }
+        images = $images
+        providers = @(
+            [ordered]@{
+                source  = 'registry.terraform.io/coder/coder'
+                version = $cfg['TF_PROVIDER_CODER_VERSION']
+                archive = "configs/provider-mirror/registry.terraform.io/coder/coder/$($cfg['TF_PROVIDER_CODER_VERSION'])/linux_amd64/terraform-provider-coder_$($cfg['TF_PROVIDER_CODER_VERSION'])_linux_amd64.zip"
+            },
+            [ordered]@{
+                source  = 'registry.terraform.io/kreuzwerker/docker'
+                version = $cfg['TF_PROVIDER_DOCKER_VERSION']
+                archive = "configs/provider-mirror/registry.terraform.io/kreuzwerker/docker/$($cfg['TF_PROVIDER_DOCKER_VERSION'])/linux_amd64/terraform-provider-docker_$($cfg['TF_PROVIDER_DOCKER_VERSION'])_linux_amd64.zip"
+            }
+        )
+    }
+
+    $json = $manifest | ConvertTo-Json -Depth 6
+    $manifestPath = Join-Path $ProjectRoot 'offline-manifest.json'
+    [System.IO.File]::WriteAllText($manifestPath, $json + "`r`n", [System.Text.UTF8Encoding]::new($false))
+    Write-OK "Wrote $manifestPath"
+}
+
+function Invoke-Prepare {
+    Assert-Docker
+    Initialize-Dirs
+
+    Write-Host '=== Coder Offline Resource Preparation ===' -ForegroundColor Blue
+    Write-Host ''
+
+    Invoke-PrepareDownloadVsix
+    Write-Host ''
+    Invoke-PrepareDownloadProviders
+    Write-Host ''
+
+    if (-not $script:SkipImages) {
+        Invoke-PrepareSavePlatformImages
+        Write-Host ''
+    }
+
+    if (-not $script:SkipBuild) {
+        Invoke-PrepareBuildWorkspace
+        Write-Host ''
+    }
+
+    Invoke-PrepareWriteManifest
+    Write-Host ''
+    Write-Host '========================================' -ForegroundColor Green
+    Write-Host ' Offline preparation complete' -ForegroundColor Green
+    Write-Host '========================================' -ForegroundColor Green
+    Write-Host ''
+    Write-Host 'Recommended next steps:' -ForegroundColor Cyan
+    Write-Host '  .\scripts\manage.ps1 verify' -ForegroundColor White
+    Write-Host '  Transfer the whole project directory to the offline server' -ForegroundColor White
+    Write-Host '  # On the offline server:' -ForegroundColor DarkGray
+    Write-Host '  .\scripts\manage.ps1 init' -ForegroundColor White
+    Write-Host '  .\scripts\manage.ps1 ssl <TARGET_IP_OR_HOST>' -ForegroundColor White
+    Write-Host '  .\scripts\manage.ps1 load' -ForegroundColor White
+    Write-Host '  .\scripts\manage.ps1 up' -ForegroundColor White
+}
+
+# ─── verify (migrated from verify-offline.ps1) ────────────────────────────────
+
+function Invoke-Verify {
+    $manifestPath = Join-Path $ProjectRoot 'offline-manifest.json'
+    if (-not (Test-Path $manifestPath)) {
+        Write-Fail "offline-manifest.json is missing. Run '.\scripts\manage.ps1 prepare' first."
+        exit 1
+    }
+
+    $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+    $missing = [System.Collections.Generic.List[string]]::new()
+
+    if ($script:RequireLlm -and -not $manifest.include_llm) {
+        $missing.Add('Manifest does not include LiteLLM artifacts, but -RequireLlm was requested.')
+    }
+
+    $requiredFiles = @(
+        (Join-Path $ConfigsDir 'ssl\ca.crt'),
+        (Join-Path $ConfigsDir 'ssl\ca.key'),
+        (Join-Path $ConfigsDir 'terraform-offline.rc'),
+        (Join-Path $ConfigsDir 'versions.lock.env')
+    )
+    foreach ($path in $requiredFiles) {
+        if (-not (Test-Path $path)) {
+            $missing.Add([System.IO.Path]::GetRelativePath($ProjectRoot, $path))
+        }
+    }
+
+    foreach ($image in $manifest.images) {
+        $archivePath = Join-Path $ProjectRoot $image.archive
+        if (-not (Test-Path $archivePath)) { $missing.Add($image.archive) }
+    }
+
+    foreach ($provider in $manifest.providers) {
+        $archivePath = Join-Path $ProjectRoot $provider.archive
+        if (-not (Test-Path $archivePath)) { $missing.Add($provider.archive) }
+    }
+
+    $caCert = Join-Path $ConfigsDir 'ssl\ca.crt'
+    if ((Test-Path $caCert) -and $manifest.ca_sha256) {
+        $currentHash = (Get-FileHash $caCert -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($currentHash -ne $manifest.ca_sha256.ToLowerInvariant()) {
+            $missing.Add("CA fingerprint mismatch: manifest=$($manifest.ca_sha256) current=$currentHash")
+        }
+    }
+
+    if ($missing.Count -gt 0) {
+        Write-Host '[FAIL]  Offline bundle verification failed.' -ForegroundColor Red
+        foreach ($item in $missing) { Write-Host "  - $item" -ForegroundColor Red }
+        exit 1
+    }
+
+    Write-Host '[ OK ]  Offline bundle verification passed.' -ForegroundColor Green
+    Write-Host "[INFO]  Manifest: $manifestPath" -ForegroundColor Cyan
+    Write-Host "[INFO]  Images checked: $($manifest.images.Count)" -ForegroundColor Cyan
+    Write-Host "[INFO]  Providers checked: $($manifest.providers.Count)" -ForegroundColor Cyan
+}
+
+# ─── refresh-versions (migrated from refresh-versions.ps1) ────────────────────
+
+function Invoke-RefreshVersions {
+    Assert-Docker
+    if (-not (Test-Path $LockFile)) { Write-Fail "versions.lock.env not found: $LockFile"; exit 1 }
+
+    $current = Read-KeyValueFile $LockFile
+    $updated = @{}
+    foreach ($entry in $current.GetEnumerator()) { $updated[$entry.Key] = $entry.Value }
+
+    $imageTargets = @(
+        @{ RefKey = 'CODER_IMAGE_REF';           TagKey = 'CODER_IMAGE_TAG' },
+        @{ RefKey = 'POSTGRES_IMAGE_REF';         TagKey = 'POSTGRES_IMAGE_TAG' },
+        @{ RefKey = 'NGINX_IMAGE_REF';            TagKey = 'NGINX_IMAGE_TAG' },
+        @{ RefKey = 'LITELLM_IMAGE_REF';          TagKey = 'LITELLM_IMAGE_TAG' },
+        @{ RefKey = 'CODE_SERVER_BASE_IMAGE_REF'; TagKey = 'CODE_SERVER_BASE_IMAGE_TAG' }
+    )
+
+    foreach ($target in $imageTargets) {
+        $repository = ($current[$target.RefKey] -split '@')[0]
+        $tag = $current[$target.TagKey]
+        $tagRef = "${repository}:${tag}"
+        Write-Info "Pulling $tagRef"
+        docker pull $tagRef | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to pull $tagRef"; exit 1 }
+        $repoDigests = (docker image inspect $tagRef --format '{{json .RepoDigests}}' | ConvertFrom-Json)
+        $resolved = $repoDigests | Where-Object { $_ -like "$repository@*" } | Select-Object -First 1
+        if (-not $resolved) { $resolved = $repoDigests[0] }
+        $updated[$target.RefKey] = $resolved
+    }
+
+    $updated['TF_PROVIDER_CODER_VERSION'] = (Invoke-RestMethod -Uri "https://registry.terraform.io/v1/providers/coder/coder/versions" -TimeoutSec 30).versions.version |
+        Where-Object { $_ -match "^$([regex]::Escape(($current['TF_PROVIDER_CODER_VERSION'] -split '\.')[0]))\.\d+(?:\.\d+)*$" } |
+        Sort-Object { [version]$_ } -Descending | Select-Object -First 1
+
+    $updated['TF_PROVIDER_DOCKER_VERSION'] = (Invoke-RestMethod -Uri "https://registry.terraform.io/v1/providers/kreuzwerker/docker/versions" -TimeoutSec 30).versions.version |
+        Where-Object { $_ -match "^$([regex]::Escape(($current['TF_PROVIDER_DOCKER_VERSION'] -split '\.')[0]))\.\d+(?:\.\d+)*$" } |
+        Sort-Object { [version]$_ } -Descending | Select-Object -First 1
+
+    Write-Host ''
+    Write-Host 'Proposed version lock updates:' -ForegroundColor Cyan
+    foreach ($key in @('CODER_IMAGE_REF','POSTGRES_IMAGE_REF','NGINX_IMAGE_REF','LITELLM_IMAGE_REF','CODE_SERVER_BASE_IMAGE_REF','TF_PROVIDER_CODER_VERSION','TF_PROVIDER_DOCKER_VERSION')) {
+        if ($current[$key] -ne $updated[$key]) {
+            Write-Host "  $key" -ForegroundColor Yellow
+            Write-Host "    old: $($current[$key])" -ForegroundColor DarkGray
+            Write-Host "    new: $($updated[$key])" -ForegroundColor White
+        } else {
+            Write-Host "  $key unchanged" -ForegroundColor DarkGray
+        }
+    }
+
+    if ($script:Apply) {
+        $orderedKeys = @('CODER_IMAGE_REF','CODER_IMAGE_TAG','POSTGRES_IMAGE_REF','POSTGRES_IMAGE_TAG','NGINX_IMAGE_REF','NGINX_IMAGE_TAG','LITELLM_IMAGE_REF','LITELLM_IMAGE_TAG','CODE_SERVER_BASE_IMAGE_REF','CODE_SERVER_BASE_IMAGE_TAG','WORKSPACE_IMAGE','WORKSPACE_IMAGE_TAG','TF_PROVIDER_CODER_VERSION','TF_PROVIDER_DOCKER_VERSION')
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add('# Locked versions and digests for reproducible offline bundles.')
+        foreach ($key in $orderedKeys) { $lines.Add("$key=$($updated[$key])") }
+        [System.IO.File]::WriteAllText($LockFile, ($lines -join "`r`n") + "`r`n", [System.Text.UTF8Encoding]::new($false))
+        Write-OK "Updated $LockFile"
+    } else {
+        Write-Warn 'Dry run only. Re-run with -Apply to rewrite configs/versions.lock.env.'
+    }
+}
+
 function Show-Help {
     $text = @(
         '',
-        'Usage: .\scripts\manage.ps1 <command> [arg] [-Llm] [-Ldap]',
+        'Usage: .\scripts\manage.ps1 <command> [arg] [-Llm] [-Ldap] [flags]',
         '',
-        'Commands:',
-        '  init                  Create docker/.env',
-        '  ssl [host]            Issue/update TLS leaf certificate',
-        '  pull                  Pull pinned runtime and build-base images',
-        '  build                 Build the workspace image',
-        '  save                  Save deployment images into images/',
-        '  load                  Load images from images/*.tar',
-        '  up                    Start the platform',
-        '  down                  Stop the platform',
-        '  status                Show service status',
-        '  logs [service]        Follow logs',
-        '  shell <service>       Enter a service shell',
-        '  setup-coder           Create admin and push template',
-        '  test-api              Test Anthropic/LiteLLM API access',
-        '  test-llm-backend      Test the internal LLM backend base URL',
-        '  clean                 Clean Docker build cache',
+        'Platform lifecycle:',
+        '  init                        Create docker/.env from defaults',
+        '  ssl [host]                  Issue/update TLS leaf certificate',
+        '  pull                        Pull pinned runtime and build-base images',
+        '  build                       Build the workspace image (tag from versions.lock.env)',
+        '  save                        Save deployment images into images/',
+        '  load                        Load images from images/*.tar',
+        '  up                          Start the platform (runs setup-coder on first boot)',
+        '  down                        Stop the platform',
+        '  status                      Show service status',
+        '  logs [service]              Follow logs',
+        '  shell <service>             Enter a service shell',
+        '  setup-coder                 Create admin user and push initial template',
+        '  push-template               Push/update template (platform must be running)',
+        '  test-api                    Test Anthropic/LiteLLM API access',
+        '  test-llm-backend            Test the internal LLM backend base URL',
+        '  clean                       Clean Docker build cache',
+        '',
+        'Workspace image versioning:',
+        '  update-workspace [-Tag v]   Build versioned workspace image, save tar, push template',
+        '                              Auto-generates tag v<YYYYMMDD> when -Tag is omitted',
+        '  load-workspace <tar>        (Offline server) Load workspace tar, update lock, push template',
+        '',
+        'Offline bundle preparation (online machine):',
+        '  prepare [-SkipImages] [-SkipBuild] [-Llm]',
+        '                              Download VSIX + TF providers, pull/save images,',
+        '                              build workspace image, write offline-manifest.json',
+        '  verify [-RequireLlm]        Verify offline-manifest.json and all referenced files',
+        '  refresh-versions [-Apply]   Check upstream for newer image digests / provider versions',
+        '                              Add -Apply to rewrite configs/versions.lock.env',
         '',
         'Flags:',
-        '  -Llm   Enable LiteLLM AI gateway (--profile llm)',
-        '  -Ldap  Enable Dex OIDC + LDAP authentication (--profile ldap)',
-        '         Requires DEX_LDAP_* and OIDC_CLIENT_SECRET in docker/.env',
+        '  -Llm          Enable LiteLLM AI gateway (--profile llm)',
+        '  -Ldap         Enable Dex OIDC + LDAP authentication (--profile ldap)',
+        '                Requires DEX_LDAP_* and OIDC_CLIENT_SECRET in docker/.env',
+        '  -Tag <v>      Workspace image tag for update-workspace',
+        '  -Apply        Write changes to disk (refresh-versions)',
+        '  -RequireLlm   Fail verify if LiteLLM image is absent',
+        '  -SkipImages   Skip pulling/saving runtime images (prepare)',
+        '  -SkipBuild    Skip building workspace image (prepare)',
+        '',
+        'Online preparation workflow:',
+        '  .\scripts\manage.ps1 init',
+        '  .\scripts\manage.ps1 ssl <offline-server-ip>',
+        '  .\scripts\manage.ps1 prepare',
+        '  .\scripts\manage.ps1 verify',
+        '  # Transfer project directory to offline server',
+        '',
+        'Offline deployment workflow:',
+        '  .\scripts\manage.ps1 init',
+        '  .\scripts\manage.ps1 ssl <this-server-ip>',
+        '  .\scripts\manage.ps1 load',
+        '  .\scripts\manage.ps1 up',
+        '',
+        'Workspace update workflow:',
+        '  # [Online] build and save new version',
+        '  .\scripts\manage.ps1 update-workspace -Tag v20240324',
+        '  # Transfer images\workspace-embedded_v20240324.tar + configs\versions.lock.env',
+        '  # [Offline server] load image and push new template version',
+        '  .\scripts\manage.ps1 load-workspace images\workspace-embedded_v20240324.tar',
+        '  # Users stop and restart their workspaces to pick up the new image',
         '',
         'Notes:',
-        '  Deployment uses pinned image refs from configs/versions.lock.env.',
+        '  Pinned image refs are stored in configs/versions.lock.env.',
         '  A new root CA requires one workspace rebuild. Later leaf rotations do not.',
         '  LiteLLM remains a gateway layer to existing internal model infrastructure.',
         '  Set TF_CLI_CONFIG_MOUNT=../configs/terraform.rc to allow connected Terraform fallback.'
@@ -845,6 +1408,12 @@ switch ($Command.ToLower()) {
     'logs'             { Invoke-Logs; break }
     'shell'            { Invoke-Shell; break }
     'setup-coder'      { Invoke-SetupCoder; break }
+    'push-template'    { Invoke-CmdPushTemplate; break }
+    'update-workspace' { Invoke-UpdateWorkspace -Tag $Tag; break }
+    'load-workspace'   { Invoke-LoadWorkspace -TarFile $Arg1; break }
+    'prepare'          { Invoke-Prepare; break }
+    'verify'           { Invoke-Verify; break }
+    'refresh-versions' { Invoke-RefreshVersions; break }
     'test-api'         { Invoke-TestApi; break }
     'test-llm-backend' { Invoke-TestLlmBackend; break }
     'clean'            { Invoke-Clean; break }

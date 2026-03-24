@@ -9,6 +9,7 @@ A single-port Coder deployment for embedded software teams. The platform provide
 - Path-based workspace apps, no wildcard DNS required
 - Offline deployment after an online preparation step
 - Reproducible deployment images pinned in `configs/versions.lock.env`
+- Workspace image versioning: build and push new workspace versions without redeploying the platform
 
 ## What LiteLLM Means Here
 
@@ -53,6 +54,17 @@ Authentication
 - Windows: Docker Desktop, PowerShell 7 recommended, Git for Windows (`openssl`)
 - Linux: Docker Engine + Compose v2, `bash`, `openssl`, `curl`, `python3`
 - Internet is required only for online preparation and explicit version refresh operations.
+
+## Script Entry Points
+
+All operations go through a single entry point:
+
+| Platform | Script |
+|----------|--------|
+| Windows  | `.\scripts\manage.ps1 <command> [flags]` |
+| Linux    | `bash scripts/manage.sh <command> [flags]` |
+
+Legacy standalone scripts (`prepare-offline.sh/ps1`, `verify-offline.sh/ps1`, `refresh-versions.sh/ps1`, `setup-coder.sh`) are preserved as thin shims that delegate to `manage.sh`/`manage.ps1` for backward compatibility.
 
 ## Quick Start
 
@@ -132,26 +144,29 @@ TF_CLI_CONFIG_MOUNT=../configs/terraform.rc
 Windows:
 
 ```powershell
-.\scripts\prepare-offline.ps1
-.\scripts\verify-offline.ps1
+.\scripts\manage.ps1 prepare
+.\scripts\manage.ps1 verify
 ```
 
 Linux:
 
 ```bash
-bash scripts/prepare-offline.sh
-bash scripts/verify-offline.sh
+bash scripts/manage.sh prepare
+bash scripts/manage.sh verify
 ```
 
 The preparation step:
 
-- Downloads Terraform providers into `configs/terraform-providers/`
+- Downloads VS Code extensions (`.vsix`) into `configs/vsix/`
+- Downloads Terraform providers into `configs/provider-mirror/` and `configs/terraform-providers/`
 - Pulls pinned runtime images and saves them into `images/`
 - Builds the workspace image and saves it into `images/`
 - Generates a root CA in `configs/ssl/` if one does not already exist
 - Writes `offline-manifest.json`
 
-If you intentionally run `prepare-offline.ps1 -SkipBuild` or `prepare-offline.sh --skip-build`, `verify-offline` will fail until the workspace image tarball has also been produced.
+Skip flags: `-SkipImages` / `--skip-images` skips pulling runtime images; `-SkipBuild` / `--skip-build` skips building the workspace image. Running `verify` after a partial prepare will fail until all artifacts are present.
+
+Optional LLM flag: `-Llm` / `--llm` also saves the LiteLLM image.
 
 ### Step 2: Transfer to the Offline Server
 
@@ -160,31 +175,31 @@ Transfer the entire project directory, including at least:
 - `images/`
 - `configs/ssl/`
 - `configs/terraform-providers/`
+- `configs/provider-mirror/`
+- `configs/vsix/`
 - `offline-manifest.json`
-- `configs/vsix/` if you use offline VSIX packages
 
-Important:
-Keep `configs/ssl/ca.crt` and `configs/ssl/ca.key` from the prepared bundle. The offline target should reuse that CA and only reissue the leaf certificate.
+Important: Keep `configs/ssl/ca.crt` and `configs/ssl/ca.key` from the prepared bundle. The offline target should reuse that CA and only reissue the leaf certificate.
 
 ### Step 3: Deploy on the Offline Server
 
 Windows:
 
 ```powershell
-.\scripts\verify-offline.ps1
-.\scripts\manage.ps1 load
+.\scripts\manage.ps1 verify
 .\scripts\manage.ps1 init
 .\scripts\manage.ps1 ssl 10.0.1.50
+.\scripts\manage.ps1 load
 .\scripts\manage.ps1 up
 ```
 
 Linux:
 
 ```bash
-bash scripts/verify-offline.sh
-bash scripts/manage.sh load
+bash scripts/manage.sh verify
 bash scripts/manage.sh init
 bash scripts/manage.sh ssl 10.0.1.50
+bash scripts/manage.sh load
 bash scripts/manage.sh up
 ```
 
@@ -193,6 +208,82 @@ Notes:
 - `up` will auto-run first-time Coder initialization if `docker/.setup-done` does not exist.
 - If the offline target accidentally generates a new CA instead of reusing the transferred CA, rebuild the workspace image once.
 - In strict offline mode, `up` will fail fast if the provider cache is incomplete.
+
+## Workspace Image Versioning
+
+Each `manage.sh prepare` / `manage.ps1 prepare` builds the workspace image with the tag stored in `configs/versions.lock.env` (`WORKSPACE_IMAGE_TAG`). When you need to update the workspace toolchain on a running offline deployment, use the update workflow below.
+
+### Update Workflow
+
+**Step 1 — Build a new version on a connected machine**
+
+Windows:
+
+```powershell
+# Auto-generates tag v<YYYYMMDD>, or supply your own with -Tag
+.\scripts\manage.ps1 update-workspace
+.\scripts\manage.ps1 update-workspace -Tag v20240324
+```
+
+Linux:
+
+```bash
+bash scripts/manage.sh update-workspace
+bash scripts/manage.sh update-workspace --tag v20240324
+```
+
+This:
+- Builds `workspace-embedded:<tag>` using the current `Dockerfile.workspace`
+- Saves it to `images/workspace-embedded_<tag>.tar`
+- Updates `WORKSPACE_IMAGE_TAG` in `configs/versions.lock.env`
+- Pushes a new template version to Coder if the platform is currently running
+
+**Step 2 — Transfer to the offline server**
+
+```bash
+scp images/workspace-embedded_v20240324.tar  offline-server:/deploy/images/
+scp configs/versions.lock.env                offline-server:/deploy/configs/
+```
+
+**Step 3 — Load and activate on the offline server**
+
+Windows:
+
+```powershell
+.\scripts\manage.ps1 load-workspace images\workspace-embedded_v20240324.tar
+```
+
+Linux:
+
+```bash
+bash scripts/manage.sh load-workspace images/workspace-embedded_v20240324.tar
+```
+
+This:
+- Loads the image into Docker
+- Parses the tag from the filename (`workspace-embedded_v20240324.tar` → tag `v20240324`)
+- Updates `WORKSPACE_IMAGE_TAG` in `configs/versions.lock.env`
+- Pushes a new template version to Coder (the platform must be running)
+
+**Step 4 — Users restart their workspaces**
+
+In the Coder UI, stop then restart each workspace. Coder will rebuild the container using the new image.
+
+### Push Template Only
+
+If you need to push a template update without rebuilding the image (e.g., after changing template variables):
+
+Windows:
+
+```powershell
+.\scripts\manage.ps1 push-template
+```
+
+Linux:
+
+```bash
+bash scripts/manage.sh push-template
+```
 
 ## Version Locking
 
@@ -206,6 +297,7 @@ Current pinned items include:
 - LiteLLM image (used with `--llm`)
 - Dex OIDC image (used with `--ldap`)
 - code-server base image used to build the workspace image
+- Workspace image tag (`WORKSPACE_IMAGE_TAG`)
 - Terraform provider versions
 
 Runtime scripts read `docker/.env` for deployment-specific values and `configs/versions.lock.env` for locked image/provider versions.
@@ -217,33 +309,33 @@ Version refresh is an explicit maintenance step. It does not happen during deplo
 Windows dry run:
 
 ```powershell
-.\scripts\refresh-versions.ps1
+.\scripts\manage.ps1 refresh-versions
 ```
 
 Windows apply:
 
 ```powershell
-.\scripts\refresh-versions.ps1 -Apply
+.\scripts\manage.ps1 refresh-versions -Apply
 ```
 
 Linux dry run:
 
 ```bash
-bash scripts/refresh-versions.sh
+bash scripts/manage.sh refresh-versions
 ```
 
 Linux apply:
 
 ```bash
-bash scripts/refresh-versions.sh --apply
+bash scripts/manage.sh refresh-versions --apply
 ```
 
-The refresh scripts:
+The refresh command:
 
-- Pull the tagged upstream images you have chosen to track
-- Resolve their current digests
-- Query the newest stable provider versions within the current locked major versions
-- Rewrite `configs/versions.lock.env` only when you explicitly apply
+- Pulls the tagged upstream images you have chosen to track
+- Resolves their current digests
+- Queries the newest stable provider versions within the current locked major versions
+- Rewrites `configs/versions.lock.env` only when you explicitly apply
 
 ## AI Gateway Setup
 
@@ -347,8 +439,8 @@ The Coder login page will show a "Sign in with 企业 LDAP" button alongside the
 
 > **Offline preparation:** Include the Dex image with:
 > ```bash
-> bash scripts/prepare-offline.sh --ldap
-> # Windows: .\scripts\prepare-offline.ps1 -Ldap
+> bash scripts/manage.sh prepare --ldap
+> # Windows: .\scripts\manage.ps1 prepare -Ldap
 > ```
 
 ## Common Commands
@@ -356,6 +448,7 @@ The Coder login page will show a "Sign in with 企业 LDAP" button alongside the
 ### Windows
 
 ```powershell
+# Platform lifecycle
 .\scripts\manage.ps1 init
 .\scripts\manage.ps1 ssl [host]
 .\scripts\manage.ps1 pull [-Llm] [-Ldap]
@@ -368,25 +461,41 @@ The Coder login page will show a "Sign in with 企业 LDAP" button alongside the
 .\scripts\manage.ps1 logs [service]
 .\scripts\manage.ps1 shell <service>
 .\scripts\manage.ps1 setup-coder
+.\scripts\manage.ps1 push-template
 .\scripts\manage.ps1 test-api
 .\scripts\manage.ps1 test-llm-backend
-.\scripts\refresh-versions.ps1 [-Apply]
-.\scripts\verify-offline.ps1
+
+# Workspace image versioning
+.\scripts\manage.ps1 update-workspace [-Tag v20240324]
+.\scripts\manage.ps1 load-workspace images\workspace-embedded_v20240324.tar
+
+# Offline bundle preparation (connected machine)
+.\scripts\manage.ps1 prepare [-SkipImages] [-SkipBuild] [-Llm]
+.\scripts\manage.ps1 verify [-RequireLlm]
+.\scripts\manage.ps1 refresh-versions [-Apply]
 ```
 
 ### Linux
 
 ```bash
+# Platform lifecycle
 bash scripts/manage.sh <command> [--llm] [--ldap]
-bash scripts/refresh-versions.sh [--apply]
-bash scripts/verify-offline.sh [--require-llm]
+
+# Workspace image versioning
+bash scripts/manage.sh update-workspace [--tag v20240324]
+bash scripts/manage.sh load-workspace images/workspace-embedded_v20240324.tar
+
+# Offline bundle preparation (connected machine)
+bash scripts/manage.sh prepare [--skip-images] [--skip-build] [--llm]
+bash scripts/manage.sh verify [--require-llm]
+bash scripts/manage.sh refresh-versions [--apply]
 ```
 
 ## Key Files
 
 - `docker/docker-compose.yml`: platform services (gateway, coder, postgres, llm-gateway, dex)
 - `docker/Dockerfile.workspace`: workspace image build
-- `configs/versions.lock.env`: pinned deployment versions
+- `configs/versions.lock.env`: pinned deployment versions and workspace image tag
 - `configs/nginx.conf`: Nginx gateway routing (`/`, `/llm/`, `/dex/`)
 - `configs/terraform-offline.rc`: strict offline Terraform config
 - `configs/terraform.rc`: connected Terraform config with fallback
@@ -394,26 +503,29 @@ bash scripts/verify-offline.sh [--require-llm]
 - `configs/dex/config.yaml`: Dex OIDC + LDAP connector config (--ldap mode)
 - `configs/postgres/init-dex.sql`: auto-creates `dex` database on first postgres start
 - `workspace-template/main.tf`: Coder template that provisions workspace containers
-- `scripts/manage.ps1`: Windows entrypoint
-- `scripts/manage.sh`: Linux entrypoint
-- `scripts/prepare-offline.ps1`: Windows offline preparation
-- `scripts/prepare-offline.sh`: Linux offline preparation
-- `scripts/refresh-versions.ps1`: Windows version refresh tool
-- `scripts/refresh-versions.sh`: Linux version refresh tool
-- `scripts/verify-offline.ps1`: Windows offline bundle verification
-- `scripts/verify-offline.sh`: Linux offline bundle verification
-- `offline-manifest.json`: expected offline bundle contents
+- `scripts/manage.ps1`: **Windows entry point** — all commands
+- `scripts/manage.sh`: **Linux entry point** — all commands
+- `scripts/prepare-offline.ps1`: shim → `manage.ps1 prepare`
+- `scripts/prepare-offline.sh`: shim → `manage.sh prepare`
+- `scripts/verify-offline.ps1`: shim → `manage.ps1 verify`
+- `scripts/verify-offline.sh`: shim → `manage.sh verify`
+- `scripts/refresh-versions.ps1`: shim → `manage.ps1 refresh-versions`
+- `scripts/refresh-versions.sh`: shim → `manage.sh refresh-versions`
+- `scripts/setup-coder.sh`: shim → `manage.sh setup-coder`
+- `scripts/lib/offline-common.sh`: shared Bash library (SSL, config, env parsing)
+- `scripts/lib/offline-common.ps1`: shared PowerShell library
+- `offline-manifest.json`: expected offline bundle contents (written by `prepare`)
 
 ## Windows Smoke Test
 
 The following Windows paths have been exercised successfully in this repository:
 
-- `.\scripts\refresh-versions.ps1` dry run
-- `.\scripts\prepare-offline.ps1 -SkipBuild`
+- `.\scripts\manage.ps1 refresh-versions` dry run
+- `.\scripts\manage.ps1 prepare -SkipBuild`
 - `.\scripts\manage.ps1 ssl localhost`
 - `.\scripts\manage.ps1 build`
 - `.\scripts\manage.ps1 save`
-- `.\scripts\verify-offline.ps1`
+- `.\scripts\manage.ps1 verify`
 - `.\scripts\manage.ps1 up`
 - `.\scripts\manage.ps1 status`
 - `http://localhost:7080/healthz`
@@ -449,7 +561,7 @@ If the CA changed:
 
 The offline bundle is incomplete, or strict offline mode is active without a full provider cache.
 
-Run `prepare-offline.ps1` or `prepare-offline.sh` again on a connected machine, then run `verify-offline` before deployment.
+Run `manage.ps1 prepare` or `manage.sh prepare` again on a connected machine, then run `manage.sh verify` before deployment.
 
 If you intentionally want registry fallback in a connected environment, set:
 
@@ -469,6 +581,10 @@ Check all of the following:
 ### Claude Code cannot reach LiteLLM from inside workspace
 
 Confirm `ANTHROPIC_BASE_URL=http://llm-gateway:4000` in `docker/.env`. The internal Docker DNS name `llm-gateway` resolves correctly from workspace containers on the `coderplatform` network. Using `https://localhost:8443/llm` will fail because `localhost` inside a container refers to the container itself.
+
+### Workspace did not pick up the new image after load-workspace
+
+Coder only applies the new template version to workspaces when they are restarted. In the Coder UI, stop the workspace and then start it again. The new image will be used for the fresh container.
 
 ### Dex does not start (LDAP mode)
 
