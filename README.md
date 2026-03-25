@@ -1,6 +1,6 @@
 # Coder for Embedded Development
 
-A single-port Coder deployment for embedded software teams. The platform provides browser-based VS Code workspaces, a full embedded C/C++ toolchain, an optional LiteLLM gateway that adapts existing internal model infrastructure for Claude Code and other editor tools, and optional LDAP authentication via Dex OIDC.
+A single-port Coder deployment for embedded software teams. The platform provides browser-based VS Code workspaces, a full embedded C/C++ toolchain, an optional LiteLLM gateway that adapts existing internal model infrastructure for Claude Code and other editor tools, optional LDAP authentication via Dex OIDC, GPU-accelerated document-to-Markdown conversion via MinerU, and Markdown-to-Word/PDF conversion via Pandoc.
 
 ## What This Repository Guarantees
 
@@ -30,8 +30,10 @@ Browser
 
 Nginx :8443
   -> /            -> Coder :7080
-  -> /llm/        -> LiteLLM :4000  (optional, --llm)
-  -> /dex/        -> Dex OIDC :5556 (optional, --ldap)
+  -> /llm/        -> LiteLLM :4000   (optional, --llm)
+  -> /dex/        -> Dex OIDC :5556  (optional, --ldap)
+  -> /mineru/     -> MinerU :7860    (optional, --mineru, GPU required)
+  -> /docconv/    -> Pandoc :3030    (optional, --doctools)
 
 Coder
   -> Docker socket
@@ -42,6 +44,8 @@ Workspace app path
 
 Internal network (coderplatform, 172.28.0.0/16)
   Workspace containers -> http://llm-gateway:4000  (direct, no SSL overhead)
+  Workspace containers -> http://mineru:7860        (direct access to MinerU)
+  Workspace containers -> http://docconv:3030       (direct access to Pandoc)
   Dex -> PostgreSQL :5432  (shared postgres, separate 'dex' database)
 
 Authentication
@@ -54,6 +58,18 @@ Authentication
 - Windows: Docker Desktop, PowerShell 7 recommended, Git for Windows (`openssl`)
 - Linux: Docker Engine + Compose v2, `bash`, `openssl`, `curl`, `python3`
 - Internet is required only for online preparation and explicit version refresh operations.
+
+**For MinerU GPU service (`--mineru`) only:**
+
+- NVIDIA GPU (RTX series recommended; MinerU uses vLLM for layout analysis)
+- `nvidia-docker2` package installed on the Linux host
+- Docker 18.09+ with `runtime: nvidia` support (note: `--gpus` syntax requires Docker 19.03+; this platform uses `runtime: nvidia` for compatibility)
+- `docker-compose` ≥ 1.28 for `profiles:` support (upgrade the standalone binary independently of Docker Engine if needed)
+
+Verify GPU runtime availability before starting MinerU:
+```bash
+docker run --runtime=nvidia --rm nvidia/cuda:12.8.0-base-ubuntu22.04 nvidia-smi
+```
 
 ## Script Entry Points
 
@@ -83,8 +99,14 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 # Enable LDAP authentication (configure DEX_LDAP_* in docker/.env first)
 .\scripts\manage.ps1 up -Ldap
 
-# Enable both
-.\scripts\manage.ps1 up -Llm -Ldap
+# Enable MinerU GPU document conversion (requires nvidia-docker2 on host)
+.\scripts\manage.ps1 up -Mineru
+
+# Enable Pandoc Markdown->Word/PDF conversion
+.\scripts\manage.ps1 up -Doctools
+
+# Enable everything
+.\scripts\manage.ps1 up -Llm -Ldap -Mineru -Doctools
 ```
 
 ### Linux
@@ -101,8 +123,14 @@ bash scripts/manage.sh up --llm
 # Enable LDAP authentication (configure DEX_LDAP_* in docker/.env first)
 bash scripts/manage.sh up --ldap
 
-# Enable both
-bash scripts/manage.sh up --llm --ldap
+# Enable MinerU GPU document conversion (requires nvidia-docker2 on host)
+bash scripts/manage.sh up --mineru
+
+# Enable Pandoc Markdown->Word/PDF conversion
+bash scripts/manage.sh up --doctools
+
+# Enable everything
+bash scripts/manage.sh up --llm --ldap --mineru --doctools
 ```
 
 ## TLS Model
@@ -166,7 +194,11 @@ The preparation step:
 
 Skip flags: `-SkipImages` / `--skip-images` skips pulling runtime images; `-SkipBuild` / `--skip-build` skips building the workspace image. Running `verify` after a partial prepare will fail until all artifacts are present.
 
-Optional LLM flag: `-Llm` / `--llm` also saves the LiteLLM image.
+Optional flags:
+
+- `-Llm` / `--llm` also saves the LiteLLM image
+- `-Mineru` / `--mineru` also saves the MinerU image (large: ~20 GB compressed)
+- `-Doctools` / `--doctools` also saves the Pandoc image (~2 GB compressed)
 
 ### Step 2: Transfer to the Offline Server
 
@@ -296,6 +328,8 @@ Current pinned items include:
 - Nginx image
 - LiteLLM image (used with `--llm`)
 - Dex OIDC image (used with `--ldap`)
+- MinerU image (used with `--mineru`)
+- Pandoc image (used with `--doctools`)
 - code-server base image used to build the workspace image
 - Workspace image tag (`WORKSPACE_IMAGE_TAG`)
 - Terraform provider versions
@@ -381,6 +415,101 @@ Helpful checks:
 - Windows: `.\scripts\manage.ps1 test-llm-backend`
 - Linux: `bash scripts/manage.sh test-llm-backend`
 
+## MinerU Document-to-Markdown Service
+
+MinerU converts PDF, Word, PowerPoint, and image files to Markdown with GPU-accelerated OCR and layout analysis. It is served as a Gradio web UI accessible at `https://<host>:8443/mineru/`.
+
+**Host prerequisites:** `nvidia-docker2` installed, GPU runtime verified (see [Prerequisites](#prerequisites)).
+
+**GPU allocation:** MinerU binds to GPU 0 (`CUDA_VISIBLE_DEVICES=0`). If LiteLLM workloads also use a GPU, configure them on GPU 1 to avoid VRAM contention. Each RTX A6000 provides 48 GB VRAM.
+
+**Model weights:** On first startup, MinerU downloads its model weights (~5–10 GB) and caches them in the `mineru-models` Docker volume. Subsequent restarts are fast. In fully offline deployments, pre-populate the volume before disconnecting from the network.
+
+1. Start with MinerU enabled:
+
+Linux:
+
+```bash
+bash scripts/manage.sh up --mineru
+```
+
+Windows:
+
+```powershell
+.\scripts\manage.ps1 up -Mineru
+```
+
+2. Access the Gradio UI at `https://<host>:8443/mineru/`
+
+3. Include in offline bundle preparation:
+
+```bash
+bash scripts/manage.sh prepare --mineru
+bash scripts/manage.sh verify
+# Windows: .\scripts\manage.ps1 prepare -Mineru
+```
+
+**Gradio WebSocket note:** The Nginx location for `/mineru/` proxies WebSocket connections required by Gradio's real-time progress updates. No additional client-side configuration is needed.
+
+**docker-compose profile:** `mineru` — only active when started with `--mineru` / `-Mineru`.
+
+## Pandoc Markdown-to-Word/PDF Service
+
+Pandoc converts Markdown to Word (`.docx`) or PDF with full math formula support. It is served via `pandoc --server` (Pandoc 3.x built-in HTTP server) on port 3030, accessible at `https://<host>:8443/docconv/`.
+
+**Formula support:**
+
+- DOCX output: uses `--mathml` — Word 2016+ renders MathML equations natively
+- PDF output: uses `--pdf-engine=xelatex` — the `pandoc/latex` image includes a full TeX Live distribution
+
+**API usage** (from workspace terminal or any HTTP client):
+
+```bash
+# Markdown -> DOCX with math
+curl -k -X POST https://<host>:8443/docconv/ \
+  -H "Content-Type: application/json" \
+  -d '{"text":"# Title\n\n$$E=mc^2$$\n","from":"markdown+tex_math_dollars","to":"docx","options":{"mathml":true}}' \
+  -o output.docx
+
+# Markdown -> PDF (requires xelatex, slower)
+curl -k -X POST https://<host>:8443/docconv/ \
+  -H "Content-Type: application/json" \
+  -d '{"text":"# Title\n\n$$E=mc^2$$\n","from":"markdown+tex_math_dollars","to":"pdf","options":{"pdf-engine":"xelatex"}}' \
+  -o output.pdf
+```
+
+Or directly from workspace containers via the internal Docker DNS:
+
+```bash
+curl -s -X POST http://docconv:3030/ \
+  -H "Content-Type: application/json" \
+  -d '{"text":"# Hello\n\n$$F=ma$$","from":"markdown+tex_math_dollars","to":"docx","options":{"mathml":true}}' \
+  -o output.docx
+```
+
+1. Start with docconv enabled:
+
+Linux:
+
+```bash
+bash scripts/manage.sh up --doctools
+```
+
+Windows:
+
+```powershell
+.\scripts\manage.ps1 up -Doctools
+```
+
+2. Include in offline bundle preparation:
+
+```bash
+bash scripts/manage.sh prepare --doctools
+# Windows: .\scripts\manage.ps1 prepare -Doctools
+```
+
+**docker-compose profile:** `doctools` — only active when started with `--doctools` / `-Doctools`.
+
 ## LDAP Authentication Setup
 
 LDAP authentication uses Dex as an OIDC bridge. Coder OSS supports OIDC natively; Dex connects to your LDAP server and exposes an OIDC interface to Coder.
@@ -451,12 +580,12 @@ The Coder login page will show a "Sign in with 企业 LDAP" button alongside the
 # Platform lifecycle
 .\scripts\manage.ps1 init
 .\scripts\manage.ps1 ssl [host]
-.\scripts\manage.ps1 pull [-Llm] [-Ldap]
+.\scripts\manage.ps1 pull [-Llm] [-Ldap] [-Mineru] [-Doctools]
 .\scripts\manage.ps1 build
-.\scripts\manage.ps1 save [-Llm] [-Ldap]
+.\scripts\manage.ps1 save [-Llm] [-Ldap] [-Mineru] [-Doctools]
 .\scripts\manage.ps1 load
-.\scripts\manage.ps1 up [-Llm] [-Ldap]
-.\scripts\manage.ps1 down [-Llm] [-Ldap]
+.\scripts\manage.ps1 up [-Llm] [-Ldap] [-Mineru] [-Doctools]
+.\scripts\manage.ps1 down [-Llm] [-Ldap] [-Mineru] [-Doctools]
 .\scripts\manage.ps1 status
 .\scripts\manage.ps1 logs [service]
 .\scripts\manage.ps1 shell <service>
@@ -470,7 +599,7 @@ The Coder login page will show a "Sign in with 企业 LDAP" button alongside the
 .\scripts\manage.ps1 load-workspace images\workspace-embedded_v20240324.tar
 
 # Offline bundle preparation (connected machine)
-.\scripts\manage.ps1 prepare [-SkipImages] [-SkipBuild] [-Llm]
+.\scripts\manage.ps1 prepare [-SkipImages] [-SkipBuild] [-Llm] [-Mineru] [-Doctools]
 .\scripts\manage.ps1 verify [-RequireLlm]
 .\scripts\manage.ps1 refresh-versions [-Apply]
 ```
@@ -479,14 +608,14 @@ The Coder login page will show a "Sign in with 企业 LDAP" button alongside the
 
 ```bash
 # Platform lifecycle
-bash scripts/manage.sh <command> [--llm] [--ldap]
+bash scripts/manage.sh <command> [--llm] [--ldap] [--mineru] [--doctools]
 
 # Workspace image versioning
 bash scripts/manage.sh update-workspace [--tag v20240324]
 bash scripts/manage.sh load-workspace images/workspace-embedded_v20240324.tar
 
 # Offline bundle preparation (connected machine)
-bash scripts/manage.sh prepare [--skip-images] [--skip-build] [--llm]
+bash scripts/manage.sh prepare [--skip-images] [--skip-build] [--llm] [--mineru] [--doctools]
 bash scripts/manage.sh verify [--require-llm]
 bash scripts/manage.sh refresh-versions [--apply]
 ```

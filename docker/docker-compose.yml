@@ -168,6 +168,62 @@ services:
       timeout: 10s
       retries: 3
 
+  # ── MinerU：GPU 加速文档转 Markdown（Gradio UI）──────────────────────────
+  # 启用方式：manage.sh up --mineru
+  # 依赖：主机已安装 nvidia-docker2；Docker 18.09 用 runtime: nvidia 替代 --gpus
+  # GPU 分配：CUDA_VISIBLE_DEVICES=0（第 0 块 A6000，第 1 块留给 LLM workload）
+  # 首次启动会自动下载模型权重（~5-10 GB），通过 mineru-models volume 持久化
+  mineru:
+    image: ${MINERU_IMAGE_REF:-alexsuntop/mineru:2.7.6}
+    container_name: coder-mineru
+    hostname: mineru
+    profiles:
+      - mineru
+    # Docker 18.09 GPU 方式：runtime + env vars（不支持 deploy.resources.reservations.devices）
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      MINERU_MODEL_SOURCE: local
+    command: ["mineru-gradio", "--server-name", "0.0.0.0", "--server-port", "7860"]
+    ipc: host
+    shm_size: "32g"
+    volumes:
+      - mineru-models:/root/.mineru
+    networks:
+      coderplatform:
+        aliases:
+          - mineru.local
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:7860/ || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 180s
+
+  # ── docconv：Pandoc Markdown→Word/PDF（公式支持丰富）───────────────────────
+  # 启用方式：manage.sh up --doctools
+  # 使用 pandoc --server 模式（Pandoc 3.x 内置，端口 3030）
+  # 支持 --mathml（Word MathML）和 --pdf-engine=xelatex（PDF 公式）
+  docconv:
+    image: ${DOCCONV_IMAGE_REF:-pandoc/latex:latest}
+    container_name: coder-docconv
+    hostname: docconv
+    profiles:
+      - doctools
+    command: ["pandoc", "--server"]
+    networks:
+      coderplatform:
+        aliases:
+          - docconv.local
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3030/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
 networks:
   coderplatform:
     name: coderplatform
@@ -179,4 +235,6 @@ networks:
 volumes:
   postgres-data:
   litellm-cache:
+  mineru-models:
+  docconv-tmp:
 

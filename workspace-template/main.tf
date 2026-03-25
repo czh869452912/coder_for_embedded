@@ -183,6 +183,32 @@ resource "coder_app" "code_server" {
 }
 
 # ============================================================
+# MinerU 文档转 Markdown（Gradio UI）
+# 需要 manage.sh up --mineru 启用，否则链接返回 502
+# ============================================================
+resource "coder_app" "mineru" {
+  agent_id     = coder_agent.main.id
+  slug         = "mineru"
+  display_name = "MinerU 文档转 Markdown"
+  icon         = "/icon/pdf.svg"
+  url          = "https://${var.server_host}:${var.gateway_port}/mineru/"
+  external     = true
+}
+
+# ============================================================
+# Pandoc docconv Markdown→Word/PDF 转换
+# 需要 manage.sh up --doctools 启用，否则链接返回 502
+# ============================================================
+resource "coder_app" "docconv" {
+  agent_id     = coder_agent.main.id
+  slug         = "docconv"
+  display_name = "Pandoc Markdown→Word"
+  icon         = "/icon/markdown.svg"
+  url          = "https://${var.server_host}:${var.gateway_port}/docconv/"
+  external     = true
+}
+
+# ============================================================
 # 持久化 home 目录（每个 workspace 独立 volume）
 # workspace 停止/删除后 volume 保留，数据不丢失
 # ============================================================
@@ -298,4 +324,15 @@ variable "anthropic_api_key" {
 variable "anthropic_base_url" {
   description = "Anthropic API Base URL（内网代理地址，留空使用官方 API）"
   default     = ""
+}
+
+# 平台网关地址（用于生成内网服务快捷链接）
+variable "server_host" {
+  description = "平台服务器 IP 或主机名（与 docker/.env SERVER_HOST 一致）"
+  default     = "localhost"
+}
+
+variable "gateway_port" {
+  description = "HTTPS 网关端口（与 docker/.env GATEWAY_PORT 一致）"
+  default     = "8443"
 }

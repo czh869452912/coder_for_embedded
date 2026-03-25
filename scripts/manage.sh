@@ -21,11 +21,15 @@ NC='\033[0m'
 
 USE_LLM=false
 USE_LDAP=false
+USE_MINERU=false
+USE_DOCTOOLS=false
 ARGS=()
 for arg in "$@"; do
     case "$arg" in
-        --llm)  USE_LLM=true  ;;
-        --ldap) USE_LDAP=true ;;
+        --llm)      USE_LLM=true      ;;
+        --ldap)     USE_LDAP=true     ;;
+        --mineru)   USE_MINERU=true   ;;
+        --doctools) USE_DOCTOOLS=true ;;
         *) ARGS+=("$arg") ;;
     esac
 done
@@ -79,9 +83,13 @@ Workspace image version management:
                         (for applying updates on an already-deployed offline server)
 
 Flags:
-  --llm   Enable LiteLLM AI gateway (--profile llm)
-  --ldap  Enable Dex OIDC + LDAP authentication (--profile ldap)
-          Requires DEX_LDAP_* and OIDC_CLIENT_SECRET in docker/.env
+  --llm      Enable LiteLLM AI gateway (--profile llm)
+  --ldap     Enable Dex OIDC + LDAP authentication (--profile ldap)
+             Requires DEX_LDAP_* and OIDC_CLIENT_SECRET in docker/.env
+  --mineru   Enable MinerU GPU document-to-Markdown service (--profile mineru)
+             Requires nvidia-docker2 on host (runtime: nvidia, GPU 0)
+  --doctools Enable Pandoc Markdown→Word/PDF conversion service (--profile doctools)
+             Uses pandoc --server (port 3030), supports mathml + xelatex
 
 Typical online preparation workflow:
   manage.sh init
@@ -294,6 +302,12 @@ pull_images() {
     if [ "$USE_LDAP" = true ]; then
         images+=("$DEX_IMAGE_REF")
     fi
+    if [ "$USE_MINERU" = true ]; then
+        images+=("$MINERU_IMAGE_REF")
+    fi
+    if [ "$USE_DOCTOOLS" = true ]; then
+        images+=("$DOCCONV_IMAGE_REF")
+    fi
 
     local image
     for image in "${images[@]}"; do
@@ -346,6 +360,12 @@ save_images() {
     if [ "$USE_LDAP" = true ]; then
         images+=("$DEX_IMAGE_REF")
     fi
+    if [ "$USE_MINERU" = true ]; then
+        images+=("$MINERU_IMAGE_REF")
+    fi
+    if [ "$USE_DOCTOOLS" = true ]; then
+        images+=("$DOCCONV_IMAGE_REF")
+    fi
 
     # If the digest ref is no longer in the local cache (e.g. after pulling a newer tag via
     # refresh-versions without --apply), fall back to name:tag so the save can still succeed.
@@ -358,7 +378,7 @@ save_images() {
         if [[ "$image" == *@sha256:* ]]; then
             if ! docker image inspect "$image" >/dev/null 2>&1; then
                 fallback=""
-                for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF DEX_IMAGE_REF; do
+                for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF; do
                     ref="${!ref_key:-}"
                     [ "$ref" = "$image" ] || continue
                     tag_key="${ref_key/_REF/_TAG}"
@@ -411,7 +431,7 @@ load_images() {
         image_id="$(echo "$load_output" | awk '/Loaded image ID:/{print $NF}')"
         if [ -n "$image_id" ]; then
             local ref_key ref fn tag_key tag
-            for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF DEX_IMAGE_REF; do
+            for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF; do
                 ref="${!ref_key:-}"
                 [[ "$ref" == *@sha256:* ]] || continue
                 fn="$(printf '%s' "$ref" | tr '/:@' '_').tar"
@@ -503,7 +523,7 @@ start_services() {
     # so compose resolves against the locally loaded (and retagged) images.
     local ref_key ref tag_key tag
     local -a required_images=()
-    for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF DEX_IMAGE_REF; do
+    for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF; do
         ref="${!ref_key:-}"
         [ -n "$ref" ] || continue
         if [[ "$ref" == *@sha256:* ]]; then
@@ -520,8 +540,10 @@ start_services() {
     # Pre-flight: verify every required image exists locally so compose never falls back to a pull
     local missing_images=()
     for img in "${required_images[@]}"; do
-        [ "$USE_LLM" = false ]  && [[ "$img" == *litellm* ]] && continue
-        [ "$USE_LDAP" = false ] && [[ "$img" == *dexidp*  ]] && continue
+        [ "$USE_LLM"      = false ] && [[ "$img" == *litellm*  ]] && continue
+        [ "$USE_LDAP"     = false ] && [[ "$img" == *dexidp*   ]] && continue
+        [ "$USE_MINERU"   = false ] && [[ "$img" == *mineru*   ]] && continue
+        [ "$USE_DOCTOOLS" = false ] && [[ "$img" == *pandoc*   ]] && continue
         if ! docker image inspect "$img" >/dev/null 2>&1; then
             missing_images+=("$img")
         fi
@@ -532,8 +554,10 @@ start_services() {
 
     cd "$DOCKER_DIR"
     local compose_profiles=()
-    [ "$USE_LLM"  = true ] && compose_profiles+=(--profile llm)
-    [ "$USE_LDAP" = true ] && compose_profiles+=(--profile ldap)
+    [ "$USE_LLM"      = true ] && compose_profiles+=(--profile llm)
+    [ "$USE_LDAP"     = true ] && compose_profiles+=(--profile ldap)
+    [ "$USE_MINERU"   = true ] && compose_profiles+=(--profile mineru)
+    [ "$USE_DOCTOOLS" = true ] && compose_profiles+=(--profile doctools)
     "${COMPOSE_CMD[@]}" "${compose_profiles[@]}" up -d
 
     ok "Platform started"
@@ -561,6 +585,12 @@ show_access_info() {
     if [ "$USE_LDAP" = true ]; then
         echo -e "  ${BLUE}https://${host}:${port}/dex/${NC}  (Dex OIDC provider)"
     fi
+    if [ "$USE_MINERU" = true ]; then
+        echo -e "  ${BLUE}https://${host}:${port}/mineru/${NC}  (MinerU document → Markdown, Gradio UI)"
+    fi
+    if [ "$USE_DOCTOOLS" = true ]; then
+        echo -e "  ${BLUE}https://${host}:${port}/docconv/${NC}  (Pandoc Markdown → Word/PDF)"
+    fi
 }
 
 # ─── down ─────────────────────────────────────────────────────────────────────
@@ -569,8 +599,10 @@ stop_services() {
     check_deps
     cd "$DOCKER_DIR"
     local compose_profiles=()
-    [ "$USE_LLM"  = true ] && compose_profiles+=(--profile llm)
-    [ "$USE_LDAP" = true ] && compose_profiles+=(--profile ldap)
+    [ "$USE_LLM"      = true ] && compose_profiles+=(--profile llm)
+    [ "$USE_LDAP"     = true ] && compose_profiles+=(--profile ldap)
+    [ "$USE_MINERU"   = true ] && compose_profiles+=(--profile mineru)
+    [ "$USE_DOCTOOLS" = true ] && compose_profiles+=(--profile doctools)
     "${COMPOSE_CMD[@]}" "${compose_profiles[@]}" down
     ok "Platform stopped"
 }
@@ -678,7 +710,7 @@ _do_push_template() {
     docker exec coder-server sh -c 'rm -rf /tmp/template-push && mkdir -p /tmp/template-push' >/dev/null
     docker cp "$template_dir/." 'coder-server:/tmp/template-push/'
 
-    docker exec coder-server sh -c "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=${token} /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=${workspace_image} --var workspace_image_tag=${workspace_tag} --var anthropic_api_key='${anthropic_key}' --var anthropic_base_url='${anthropic_url}' ; rm -rf /tmp/template-push"
+    docker exec coder-server sh -c "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=${token} /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=${workspace_image} --var workspace_image_tag=${workspace_tag} --var anthropic_api_key='${anthropic_key}' --var anthropic_base_url='${anthropic_url}' --var server_host='${SERVER_HOST:-localhost}' --var gateway_port='${GATEWAY_PORT:-8443}' ; rm -rf /tmp/template-push"
     ok "Workspace template pushed"
 }
 
@@ -973,6 +1005,12 @@ _prepare_save_platform_images() {
     if [ "$USE_LLM" = true ]; then
         images+=("$LITELLM_IMAGE_REF")
     fi
+    if [ "$USE_MINERU" = true ]; then
+        images+=("$MINERU_IMAGE_REF")
+    fi
+    if [ "$USE_DOCTOOLS" = true ]; then
+        images+=("$DOCCONV_IMAGE_REF")
+    fi
 
     local image filename filepath
     for image in "${images[@]}"; do
@@ -1041,6 +1079,18 @@ PY
         litellm_tar="$(printf '%s' "$LITELLM_IMAGE_REF" | tr '/:@' '_').tar"
         llm_entry=",\n    {\"ref\": \"${LITELLM_IMAGE_REF}\", \"archive\": \"images/${litellm_tar}\"}"
     fi
+    local mineru_entry=''
+    if [ "$USE_MINERU" = true ]; then
+        local mineru_tar
+        mineru_tar="$(printf '%s' "$MINERU_IMAGE_REF" | tr '/:@' '_').tar"
+        mineru_entry=",\n    {\"ref\": \"${MINERU_IMAGE_REF}\", \"archive\": \"images/${mineru_tar}\"}"
+    fi
+    local docconv_entry=''
+    if [ "$USE_DOCTOOLS" = true ]; then
+        local docconv_tar
+        docconv_tar="$(printf '%s' "$DOCCONV_IMAGE_REF" | tr '/:@' '_').tar"
+        docconv_entry=",\n    {\"ref\": \"${DOCCONV_IMAGE_REF}\", \"archive\": \"images/${docconv_tar}\"}"
+    fi
 
     cat > "$MANIFEST_PATH" <<EOF
 {
@@ -1050,13 +1100,15 @@ print(datetime.now(timezone.utc).isoformat())
 PY
 )",
   "include_llm": ${USE_LLM,,},
+  "include_mineru": ${USE_MINERU,,},
+  "include_doctools": ${USE_DOCTOOLS,,},
   "terraform_cli_config_mount_default": "../configs/terraform-offline.rc",
   "ca_sha256": "${ca_sha256}",
   "images": [
     {"ref": "${CODER_IMAGE_REF}", "archive": "images/${coder_tar}"},
     {"ref": "${POSTGRES_IMAGE_REF}", "archive": "images/${postgres_tar}"},
     {"ref": "${NGINX_IMAGE_REF}", "archive": "images/${nginx_tar}"},
-    {"ref": "${ws_image}:${ws_tag}", "archive": "images/${ws_tar}"}${llm_entry}
+    {"ref": "${ws_image}:${ws_tag}", "archive": "images/${ws_tar}"}${llm_entry}${mineru_entry}${docconv_entry}
   ],
   "providers": [
     {"source": "registry.terraform.io/coder/coder", "version": "${TF_PROVIDER_CODER_VERSION}", "archive": "configs/provider-mirror/registry.terraform.io/coder/coder/${TF_PROVIDER_CODER_VERSION}/linux_amd64/terraform-provider-coder_${TF_PROVIDER_CODER_VERSION}_linux_amd64.zip"},
@@ -1242,6 +1294,8 @@ refresh_versions() {
     local OLD_CODE_SERVER_BASE_IMAGE_REF="$CODE_SERVER_BASE_IMAGE_REF"
     local OLD_TF_PROVIDER_CODER_VERSION="$TF_PROVIDER_CODER_VERSION"
     local OLD_TF_PROVIDER_DOCKER_VERSION="$TF_PROVIDER_DOCKER_VERSION"
+    local OLD_MINERU_IMAGE_REF="${MINERU_IMAGE_REF:-}"
+    local OLD_DOCCONV_IMAGE_REF="${DOCCONV_IMAGE_REF:-}"
 
     CODER_IMAGE_REF="$(_rv_resolve_digest "${CODER_IMAGE_REF%%@*}" "$CODER_IMAGE_TAG")"
     POSTGRES_IMAGE_REF="$(_rv_resolve_digest "${POSTGRES_IMAGE_REF%%@*}" "$POSTGRES_IMAGE_TAG")"
@@ -1250,9 +1304,19 @@ refresh_versions() {
     CODE_SERVER_BASE_IMAGE_REF="$(_rv_resolve_digest "${CODE_SERVER_BASE_IMAGE_REF%%@*}" "$CODE_SERVER_BASE_IMAGE_TAG")"
     TF_PROVIDER_CODER_VERSION="$(_rv_latest_provider_version coder coder "$TF_PROVIDER_CODER_VERSION")"
     TF_PROVIDER_DOCKER_VERSION="$(_rv_latest_provider_version kreuzwerker docker "$TF_PROVIDER_DOCKER_VERSION")"
+    # Resolve optional service images only when they are present in the lock file
+    if [ -n "${MINERU_IMAGE_REF:-}" ]; then
+        MINERU_IMAGE_REF="$(_rv_resolve_digest "${MINERU_IMAGE_REF%%@*}" "$MINERU_IMAGE_TAG")"
+    fi
+    if [ -n "${DOCCONV_IMAGE_REF:-}" ]; then
+        DOCCONV_IMAGE_REF="$(_rv_resolve_digest "${DOCCONV_IMAGE_REF%%@*}" "$DOCCONV_IMAGE_TAG")"
+    fi
 
     echo
-    for key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF TF_PROVIDER_CODER_VERSION TF_PROVIDER_DOCKER_VERSION; do
+    local _rv_keys=(CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF TF_PROVIDER_CODER_VERSION TF_PROVIDER_DOCKER_VERSION)
+    [ -n "${MINERU_IMAGE_REF:-}"  ] && _rv_keys+=(MINERU_IMAGE_REF)
+    [ -n "${DOCCONV_IMAGE_REF:-}" ] && _rv_keys+=(DOCCONV_IMAGE_REF)
+    for key in "${_rv_keys[@]}"; do
         local old_var="OLD_${key}"
         local old_value="${!old_var}"
         local new_value="${!key}"
@@ -1266,6 +1330,19 @@ refresh_versions() {
     done
 
     if [ "$apply" = true ]; then
+        # Build optional image lines conditionally so the lock file only includes
+        # entries for services that are already tracked (avoids orphan entries).
+        local _mineru_lines='' _docconv_lines=''
+        if [ -n "${MINERU_IMAGE_REF:-}" ]; then
+            _mineru_lines="# MinerU GPU 文档转 Markdown（--profile mineru，需 runtime: nvidia）
+MINERU_IMAGE_REF=${MINERU_IMAGE_REF}
+MINERU_IMAGE_TAG=${MINERU_IMAGE_TAG}"
+        fi
+        if [ -n "${DOCCONV_IMAGE_REF:-}" ]; then
+            _docconv_lines="# Pandoc Markdown→Word/PDF（--profile doctools）
+DOCCONV_IMAGE_REF=${DOCCONV_IMAGE_REF}
+DOCCONV_IMAGE_TAG=${DOCCONV_IMAGE_TAG}"
+        fi
         cat > "$LOCK_FILE" <<EOF
 # Locked versions and digests for reproducible offline bundles.
 CODER_IMAGE_REF=${CODER_IMAGE_REF}
@@ -1276,12 +1353,17 @@ NGINX_IMAGE_REF=${NGINX_IMAGE_REF}
 NGINX_IMAGE_TAG=${NGINX_IMAGE_TAG}
 LITELLM_IMAGE_REF=${LITELLM_IMAGE_REF}
 LITELLM_IMAGE_TAG=${LITELLM_IMAGE_TAG}
+# Dex OIDC 提供方（LDAP 模式，--profile ldap 启用）
+DEX_IMAGE_REF=${DEX_IMAGE_REF}
+DEX_IMAGE_TAG=${DEX_IMAGE_TAG}
 CODE_SERVER_BASE_IMAGE_REF=${CODE_SERVER_BASE_IMAGE_REF}
 CODE_SERVER_BASE_IMAGE_TAG=${CODE_SERVER_BASE_IMAGE_TAG}
 WORKSPACE_IMAGE=${WORKSPACE_IMAGE}
 WORKSPACE_IMAGE_TAG=${WORKSPACE_IMAGE_TAG}
 TF_PROVIDER_CODER_VERSION=${TF_PROVIDER_CODER_VERSION}
 TF_PROVIDER_DOCKER_VERSION=${TF_PROVIDER_DOCKER_VERSION}
+${_mineru_lines}
+${_docconv_lines}
 EOF
         ok "Updated $LOCK_FILE"
     else

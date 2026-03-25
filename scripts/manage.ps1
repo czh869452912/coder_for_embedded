@@ -7,6 +7,8 @@ param(
     [string]$Arg1 = "",
     [switch]$Llm,
     [switch]$Ldap,
+    [switch]$Mineru,
+    [switch]$Doctools,
     [string]$Tag = "",
     [switch]$Apply,
     [switch]$RequireLlm,
@@ -26,8 +28,10 @@ $EnvFile     = Join-Path $DockerDir ".env"
 $SetupDone   = Join-Path $DockerDir ".setup-done"
 $ImagesDir   = Join-Path $ProjectRoot "images"
 $LockFile    = Join-Path $ConfigsDir "versions.lock.env"
-$script:UseLlm     = $Llm.IsPresent
-$script:UseLdap    = $Ldap.IsPresent
+$script:UseLlm      = $Llm.IsPresent
+$script:UseLdap     = $Ldap.IsPresent
+$script:UseMineru   = $Mineru.IsPresent
+$script:UseDoctools = $Doctools.IsPresent
 $script:Apply      = $Apply.IsPresent
 $script:RequireLlm = $RequireLlm.IsPresent
 $script:SkipImages = $SkipImages.IsPresent
@@ -258,12 +262,10 @@ function Invoke-Pull {
         $cfg['NGINX_IMAGE_REF'],
         $cfg['CODE_SERVER_BASE_IMAGE_REF']
     )
-    if ($script:UseLlm) {
-        $images.Add($cfg['LITELLM_IMAGE_REF'])
-    }
-    if ($script:UseLdap) {
-        $images.Add($cfg['DEX_IMAGE_REF'])
-    }
+    if ($script:UseLlm)      { $images.Add($cfg['LITELLM_IMAGE_REF']) }
+    if ($script:UseLdap)     { $images.Add($cfg['DEX_IMAGE_REF']) }
+    if ($script:UseMineru)   { $images.Add($cfg['MINERU_IMAGE_REF']) }
+    if ($script:UseDoctools) { $images.Add($cfg['DOCCONV_IMAGE_REF']) }
 
     foreach ($image in $images) {
         Write-Info "Pulling $image"
@@ -320,12 +322,10 @@ function Invoke-Save {
         $cfg['NGINX_IMAGE_REF'],
         $workspaceImage
     )
-    if ($script:UseLlm) {
-        $images.Add($cfg['LITELLM_IMAGE_REF'])
-    }
-    if ($script:UseLdap) {
-        $images.Add($cfg['DEX_IMAGE_REF'])
-    }
+    if ($script:UseLlm)      { $images.Add($cfg['LITELLM_IMAGE_REF']) }
+    if ($script:UseLdap)     { $images.Add($cfg['DEX_IMAGE_REF']) }
+    if ($script:UseMineru)   { $images.Add($cfg['MINERU_IMAGE_REF']) }
+    if ($script:UseDoctools) { $images.Add($cfg['DOCCONV_IMAGE_REF']) }
 
     # Build a digest-ref -> name:tag fallback map in case the digest ref is no longer cached
     # (e.g. after pulling a newer version of the tag via refresh-versions without -Apply).
@@ -336,7 +336,9 @@ function Invoke-Save {
         @{ Ref = 'NGINX_IMAGE_REF';            Tag = 'NGINX_IMAGE_TAG' },
         @{ Ref = 'LITELLM_IMAGE_REF';          Tag = 'LITELLM_IMAGE_TAG' },
         @{ Ref = 'CODE_SERVER_BASE_IMAGE_REF'; Tag = 'CODE_SERVER_BASE_IMAGE_TAG' },
-        @{ Ref = 'DEX_IMAGE_REF';              Tag = 'DEX_IMAGE_TAG' }
+        @{ Ref = 'DEX_IMAGE_REF';              Tag = 'DEX_IMAGE_TAG' },
+        @{ Ref = 'MINERU_IMAGE_REF';           Tag = 'MINERU_IMAGE_TAG' },
+        @{ Ref = 'DOCCONV_IMAGE_REF';          Tag = 'DOCCONV_IMAGE_TAG' }
     )) {
         $r = $cfg[$entry.Ref]; $t = $cfg[$entry.Tag]
         if ($r -and $t -and ($r -match '@sha256:')) {
@@ -405,7 +407,9 @@ function Invoke-Load {
         @{ Ref = 'NGINX_IMAGE_REF';            Tag = 'NGINX_IMAGE_TAG' },
         @{ Ref = 'LITELLM_IMAGE_REF';          Tag = 'LITELLM_IMAGE_TAG' },
         @{ Ref = 'CODE_SERVER_BASE_IMAGE_REF'; Tag = 'CODE_SERVER_BASE_IMAGE_TAG' },
-        @{ Ref = 'DEX_IMAGE_REF';              Tag = 'DEX_IMAGE_TAG' }
+        @{ Ref = 'DEX_IMAGE_REF';              Tag = 'DEX_IMAGE_TAG' },
+        @{ Ref = 'MINERU_IMAGE_REF';           Tag = 'MINERU_IMAGE_TAG' },
+        @{ Ref = 'DOCCONV_IMAGE_REF';          Tag = 'DOCCONV_IMAGE_TAG' }
     )) {
         $ref = $cfg[$entry.Ref]
         $tag = $cfg[$entry.Tag]
@@ -524,8 +528,10 @@ function Invoke-Up {
     $eapPf = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     foreach ($img in $requiredImages) {
-        if (-not $script:UseLlm  -and $img -match 'litellm') { continue }
-        if (-not $script:UseLdap -and $img -match 'dexidp')  { continue }
+        if (-not $script:UseLlm      -and $img -match 'litellm') { continue }
+        if (-not $script:UseLdap     -and $img -match 'dexidp')  { continue }
+        if (-not $script:UseMineru   -and $img -match 'mineru')   { continue }
+        if (-not $script:UseDoctools -and $img -match 'pandoc')   { continue }
         docker image inspect $img 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { $missingImages.Add($img) }
     }
@@ -537,8 +543,10 @@ function Invoke-Up {
     }
 
     $composeArgs = [System.Collections.Generic.List[string]]@()
-    if ($script:UseLlm)  { $composeArgs.AddRange([string[]]@('--profile', 'llm')) }
-    if ($script:UseLdap) { $composeArgs.AddRange([string[]]@('--profile', 'ldap')) }
+    if ($script:UseLlm)      { $composeArgs.AddRange([string[]]@('--profile', 'llm')) }
+    if ($script:UseLdap)     { $composeArgs.AddRange([string[]]@('--profile', 'ldap')) }
+    if ($script:UseMineru)   { $composeArgs.AddRange([string[]]@('--profile', 'mineru')) }
+    if ($script:UseDoctools) { $composeArgs.AddRange([string[]]@('--profile', 'doctools')) }
     $composeArgs.AddRange([string[]]@('up', '-d'))
     Push-Location $DockerDir
     docker compose @composeArgs
@@ -563,8 +571,10 @@ function Invoke-Up {
 function Invoke-Down {
     Assert-Docker
     $downArgs = [System.Collections.Generic.List[string]]@()
-    if ($script:UseLlm)  { $downArgs.AddRange([string[]]@('--profile', 'llm')) }
-    if ($script:UseLdap) { $downArgs.AddRange([string[]]@('--profile', 'ldap')) }
+    if ($script:UseLlm)      { $downArgs.AddRange([string[]]@('--profile', 'llm')) }
+    if ($script:UseLdap)     { $downArgs.AddRange([string[]]@('--profile', 'ldap')) }
+    if ($script:UseMineru)   { $downArgs.AddRange([string[]]@('--profile', 'mineru')) }
+    if ($script:UseDoctools) { $downArgs.AddRange([string[]]@('--profile', 'doctools')) }
     $downArgs.Add('down')
     Push-Location $DockerDir
     docker compose @downArgs
@@ -708,7 +718,9 @@ function Invoke-PushTemplate {
         exit 1
     }
 
-    $pushCmd = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$SessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' ; rm -rf /tmp/template-push"
+    $serverHost  = if ($cfg['SERVER_HOST'])  { $cfg['SERVER_HOST'] }  else { 'localhost' }
+    $gatewayPort = if ($cfg['GATEWAY_PORT']) { $cfg['GATEWAY_PORT'] } else { '8443' }
+    $pushCmd = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$SessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' --var server_host='$serverHost' --var gateway_port='$gatewayPort' ; rm -rf /tmp/template-push"
     docker exec coder-server sh -c $pushCmd
     if ($LASTEXITCODE -ne 0) {
         Write-Fail 'Template push failed.'
@@ -730,6 +742,12 @@ function Show-AccessInfo {
     }
     if ($script:UseLdap) {
         Write-Host "  Dex OIDC:        https://${serverHost}:${gatewayPort}/dex/" -ForegroundColor White
+    }
+    if ($script:UseMineru) {
+        Write-Host "  MinerU:          https://${serverHost}:${gatewayPort}/mineru/  (document -> Markdown, Gradio UI)" -ForegroundColor White
+    }
+    if ($script:UseDoctools) {
+        Write-Host "  Pandoc docconv:  https://${serverHost}:${gatewayPort}/docconv/  (Markdown -> Word/PDF)" -ForegroundColor White
     }
 }
 
@@ -1069,7 +1087,9 @@ function Invoke-PrepareSavePlatformImages {
         $cfg['POSTGRES_IMAGE_REF'],
         $cfg['NGINX_IMAGE_REF']
     )
-    if ($script:UseLlm) { $images.Add($cfg['LITELLM_IMAGE_REF']) }
+    if ($script:UseLlm)      { $images.Add($cfg['LITELLM_IMAGE_REF']) }
+    if ($script:UseMineru)   { $images.Add($cfg['MINERU_IMAGE_REF']) }
+    if ($script:UseDoctools) { $images.Add($cfg['DOCCONV_IMAGE_REF']) }
 
     foreach ($image in $images) {
         Write-Info "Pulling $image"
@@ -1126,11 +1146,15 @@ function Invoke-PrepareWriteManifest {
         (& $imageEntry $cfg['NGINX_IMAGE_REF']),
         [ordered]@{ ref = "${wsImage}:${wsTag}"; archive = "images/${wsImage}_${wsTag}.tar" }
     )
-    if ($script:UseLlm) { $images += (& $imageEntry $cfg['LITELLM_IMAGE_REF']) }
+    if ($script:UseLlm)      { $images += (& $imageEntry $cfg['LITELLM_IMAGE_REF']) }
+    if ($script:UseMineru)   { $images += (& $imageEntry $cfg['MINERU_IMAGE_REF']) }
+    if ($script:UseDoctools) { $images += (& $imageEntry $cfg['DOCCONV_IMAGE_REF']) }
 
     $manifest = [ordered]@{
         generated_at_utc = (Get-Date).ToUniversalTime().ToString('o')
-        include_llm = [bool]$script:UseLlm
+        include_llm      = [bool]$script:UseLlm
+        include_mineru   = [bool]$script:UseMineru
+        include_doctools = [bool]$script:UseDoctools
         terraform_cli_config_mount_default = '../configs/terraform-offline.rc'
         ca_sha256 = if (Test-Path $caCert) { (Get-FileHash $caCert -Algorithm SHA256).Hash.ToLowerInvariant() } else { '' }
         images = $images
@@ -1353,6 +1377,10 @@ function Show-Help {
         '  -Llm          Enable LiteLLM AI gateway (--profile llm)',
         '  -Ldap         Enable Dex OIDC + LDAP authentication (--profile ldap)',
         '                Requires DEX_LDAP_* and OIDC_CLIENT_SECRET in docker/.env',
+        '  -Mineru       Enable MinerU GPU document-to-Markdown service (--profile mineru)',
+        '                Requires nvidia-docker2 on host (runtime: nvidia, GPU 0)',
+        '  -Doctools     Enable Pandoc Markdown->Word/PDF service (--profile doctools)',
+        '                Uses pandoc --server (port 3030), supports mathml + xelatex',
         '  -Tag <v>      Workspace image tag for update-workspace',
         '  -Apply        Write changes to disk (refresh-versions)',
         '  -RequireLlm   Fail verify if LiteLLM image is absent',
