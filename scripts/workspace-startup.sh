@@ -92,5 +92,43 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
+# ---- 4. Skill Hub 集成（SKILLHUB_ENABLED=true 时）----
+if [ "${SKILLHUB_ENABLED:-false}" = "true" ]; then
+    # 配置 pip 使用内网 PyPI Mirror（通过 Docker DNS 直达，无 TLS 开销）
+    mkdir -p "${HOME}/.pip"
+    cat > "${HOME}/.pip/pip.conf" <<PIP_EOF
+[global]
+index-url = http://pypi-mirror:8080/simple/
+trusted-host = pypi-mirror
+PIP_EOF
+    echo "[startup] pip configured to use internal PyPI mirror (http://pypi-mirror:8080/simple/)"
+
+    # 从 Gitea 克隆 Claude Code slash commands 到 ~/.claude/commands/
+    # Gitea 内部 URL 通过 Docker DNS 访问（http://gitea:3000）
+    COMMANDS_DIR="${HOME}/.claude/commands"
+    GITEA_URL="http://gitea:3000"
+
+    if [ -d "${COMMANDS_DIR}/.git" ]; then
+        echo "[startup] Updating commands from Gitea..."
+        git -C "$COMMANDS_DIR" pull --quiet 2>/dev/null \
+            || echo "[startup] WARNING: git pull commands failed (non-fatal)"
+    else
+        echo "[startup] Cloning commands from Gitea..."
+        mkdir -p "$(dirname "$COMMANDS_DIR")"
+        git clone --quiet "${GITEA_URL}/admin/commands" "$COMMANDS_DIR" 2>/dev/null \
+            && echo "[startup] Commands installed to ~/.claude/commands/" \
+            || echo "[startup] WARNING: failed to clone commands from Gitea (skill hub may not be running)"
+    fi
+
+    # 添加 skill-sync alias 到 ~/.bashrc（方便手动重新同步）
+    if ! grep -q 'skill-sync' "${HOME}/.bashrc" 2>/dev/null; then
+        cat >> "${HOME}/.bashrc" <<'BASHRC_EOF'
+
+# Claude Code commands sync from Gitea Skill Hub (added by workspace-startup.sh)
+alias skill-sync='git -C "${HOME}/.claude/commands" pull && echo "Commands updated."'
+BASHRC_EOF
+    fi
+fi
+
 echo "[startup] Workspace ready!"
 echo "[startup] Access via Coder dashboard: /@${CODER_WORKSPACE_OWNER_NAME:-user}/${CODER_WORKSPACE_NAME:-workspace}.main/apps/code-server"

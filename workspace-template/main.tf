@@ -114,6 +114,8 @@ resource "coder_agent" "main" {
     GIT_AUTHOR_EMAIL    = data.coder_workspace_owner.me.email
     GIT_COMMITTER_NAME  = coalesce(data.coder_workspace_owner.me.full_name, data.coder_workspace_owner.me.name)
     GIT_COMMITTER_EMAIL = data.coder_workspace_owner.me.email
+    # Skill Hub + PyPI Mirror（--skillhub profile 启用时为 "true"）
+    SKILLHUB_ENABLED    = var.skillhub_enabled
   }
 
   # workspace 启动脚本（在 agent 连接成功后执行一次）
@@ -205,6 +207,19 @@ resource "coder_app" "docconv" {
   display_name = "Pandoc Markdown→Word"
   icon         = "/icon/markdown.svg"
   url          = "https://${var.server_host}:${var.gateway_port}/docconv/"
+  external     = true
+}
+
+# ============================================================
+# Gitea Skill Hub（Claude Code slash command 市场）
+# 需要 manage.sh up --skillhub 启用，否则链接返回 502
+# ============================================================
+resource "coder_app" "skill_hub" {
+  agent_id     = coder_agent.main.id
+  slug         = "skill-hub"
+  display_name = "Gitea (Skills)"
+  icon         = "/icon/git.svg"
+  url          = "https://${var.server_host}:${var.gateway_port}/gitea/"
   external     = true
 }
 
@@ -335,4 +350,9 @@ variable "server_host" {
 variable "gateway_port" {
   description = "HTTPS 网关端口（与 docker/.env GATEWAY_PORT 一致）"
   default     = "8443"
+}
+
+variable "skillhub_enabled" {
+  description = "是否启用 Skill Hub + PyPI Mirror（manage.sh up --skillhub 时设为 true）"
+  default     = "false"
 }

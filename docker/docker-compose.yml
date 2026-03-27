@@ -224,6 +224,70 @@ services:
       timeout: 10s
       retries: 3
 
+  # ── Gitea：内网 Git 平台（Claude Code Skill/Command 市场）──────────────────
+  # 启用方式：manage.sh up --skillhub
+  # 准备阶段：manage.sh skillhub-prepare（镜像社区 skill 仓库到 configs/gitea/seeds/）
+  # 首次启动后自动初始化 admin 用户并导入 seed 仓库
+  # 访问：https://<SERVER>:8443/gitea/
+  gitea:
+    image: ${GITEA_IMAGE_REF:-gitea/gitea:latest}
+    container_name: coder-gitea
+    hostname: gitea
+    profiles:
+      - skillhub
+    environment:
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__server__DOMAIN:    ${SERVER_HOST:-localhost}
+      GITEA__server__ROOT_URL:  "https://${SERVER_HOST:-localhost}:${GATEWAY_PORT:-8443}/gitea/"
+      GITEA__server__HTTP_PORT: "3000"
+      GITEA__server__DISABLE_SSH: "true"
+      GITEA__server__SSH_DOMAIN:  "none"
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__database__PATH:    /data/gitea/gitea.db
+      GITEA__repository__IMPORT_LOCAL_PATHS: "true"
+      GITEA__log__LEVEL: warn
+      USER_UID: "1000"
+      USER_GID: "1000"
+    volumes:
+      - gitea-data:/data
+      - ../configs/gitea/app.ini:/etc/gitea/app.ini:ro
+      - ../configs/gitea/seeds:/repos-seed:ro
+    networks:
+      coderplatform:
+        aliases:
+          - gitea
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/-/ready || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── PyPI Mirror：离线 Python 包服务器（科学/工程常用包，x86_64）────────────
+  # 启用方式：manage.sh up --skillhub
+  # 预下载包：manage.sh skillhub-prepare（约 600MB–1.5GB）
+  # workspace 内 pip 自动配置为此镜像（通过 SKILLHUB_ENABLED 环境变量）
+  pypi-mirror:
+    image: ${PYPISERVER_IMAGE_REF:-pypiserver/pypiserver:latest}
+    container_name: coder-pypi-mirror
+    hostname: pypi-mirror
+    profiles:
+      - skillhub
+    command: ["run", "-p", "8080", "/data/packages", "--fallback-url", ""]
+    volumes:
+      - ../configs/pypi/packages:/data/packages:ro
+    networks:
+      coderplatform:
+        aliases:
+          - pypi-mirror
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/simple/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
 networks:
   coderplatform:
     name: coderplatform
@@ -236,5 +300,5 @@ volumes:
   postgres-data:
   litellm-cache:
   mineru-models:
-  docconv-tmp:
+  gitea-data:
 

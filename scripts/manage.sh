@@ -23,13 +23,15 @@ USE_LLM=false
 USE_LDAP=false
 USE_MINERU=false
 USE_DOCTOOLS=false
+USE_SKILLHUB=false
 ARGS=()
 for arg in "$@"; do
     case "$arg" in
-        --llm)      USE_LLM=true      ;;
-        --ldap)     USE_LDAP=true     ;;
-        --mineru)   USE_MINERU=true   ;;
-        --doctools) USE_DOCTOOLS=true ;;
+        --llm)       USE_LLM=true       ;;
+        --ldap)      USE_LDAP=true      ;;
+        --mineru)    USE_MINERU=true     ;;
+        --doctools)  USE_DOCTOOLS=true   ;;
+        --skillhub)  USE_SKILLHUB=true   ;;
         *) ARGS+=("$arg") ;;
     esac
 done
@@ -51,11 +53,15 @@ Usage: bash scripts/manage.sh <command> [args] [--llm] [--ldap]
 Online preparation commands:
   refresh-versions [--apply]
                         Check upstream image/provider versions; --apply writes lock file
-  prepare [--llm] [--skip-images] [--skip-build]
+  prepare [--llm] [--skillhub] [--skip-images] [--skip-build]
                         Download VSIX + TF providers, pull/save platform images,
                         build/save workspace image, write offline-manifest.json
   verify [--require-llm]
                         Verify offline bundle completeness (reads offline-manifest.json)
+  skillhub-prepare      Pull pypiserver image, download scientific/engineering pip
+                        packages (x86_64 manylinux wheels), generate skills.json catalog
+  skillhub-refresh      Regenerate skills.json from configs/skillhub/skills/ (run after
+                        uploading custom skills via WebDAV)
 
 Platform lifecycle commands:
   init                  Create docker/.env
@@ -90,6 +96,9 @@ Flags:
              Requires nvidia-docker2 on host (runtime: nvidia, GPU 0)
   --doctools Enable Pandoc Markdown→Word/PDF conversion service (--profile doctools)
              Uses pandoc --server (port 3030), supports mathml + xelatex
+  --skillhub Enable Skill Hub marketplace + PyPI mirror (--profile skillhub)
+             Requires: manage.sh skillhub-prepare first (pypiserver image + pip packages)
+             Access: https://<SERVER>:<PORT>/skillhub/ (UI), /pypi/ (package index)
 
 Typical online preparation workflow:
   manage.sh init
@@ -140,7 +149,9 @@ init_dirs() {
         "$CONFIGS_DIR/ssl" \
         "$CONFIGS_DIR/vsix" \
         "$CONFIGS_DIR/terraform-providers" \
-        "$CONFIGS_DIR/provider-mirror/registry.terraform.io"
+        "$CONFIGS_DIR/provider-mirror/registry.terraform.io" \
+        "$CONFIGS_DIR/gitea/seeds" \
+        "$CONFIGS_DIR/pypi/packages"
 }
 
 load_config() {
@@ -308,6 +319,10 @@ pull_images() {
     if [ "$USE_DOCTOOLS" = true ]; then
         images+=("$DOCCONV_IMAGE_REF")
     fi
+    if [ "$USE_SKILLHUB" = true ]; then
+        images+=("${GITEA_IMAGE_REF:-gitea/gitea:latest}")
+        images+=("${PYPISERVER_IMAGE_REF:-pypiserver/pypiserver:latest}")
+    fi
 
     local image
     for image in "${images[@]}"; do
@@ -366,6 +381,10 @@ save_images() {
     if [ "$USE_DOCTOOLS" = true ]; then
         images+=("$DOCCONV_IMAGE_REF")
     fi
+    if [ "$USE_SKILLHUB" = true ]; then
+        images+=("${GITEA_IMAGE_REF:-gitea/gitea:latest}")
+        images+=("${PYPISERVER_IMAGE_REF:-pypiserver/pypiserver:latest}")
+    fi
 
     # If the digest ref is no longer in the local cache (e.g. after pulling a newer tag via
     # refresh-versions without --apply), fall back to name:tag so the save can still succeed.
@@ -378,7 +397,7 @@ save_images() {
         if [[ "$image" == *@sha256:* ]]; then
             if ! docker image inspect "$image" >/dev/null 2>&1; then
                 fallback=""
-                for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF; do
+                for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF GITEA_IMAGE_REF PYPISERVER_IMAGE_REF; do
                     ref="${!ref_key:-}"
                     [ "$ref" = "$image" ] || continue
                     tag_key="${ref_key/_REF/_TAG}"
@@ -431,7 +450,7 @@ load_images() {
         image_id="$(echo "$load_output" | awk '/Loaded image ID:/{print $NF}')"
         if [ -n "$image_id" ]; then
             local ref_key ref fn tag_key tag
-            for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF; do
+            for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF GITEA_IMAGE_REF PYPISERVER_IMAGE_REF; do
                 ref="${!ref_key:-}"
                 [[ "$ref" == *@sha256:* ]] || continue
                 fn="$(printf '%s' "$ref" | tr '/:@' '_').tar"
@@ -523,7 +542,7 @@ start_services() {
     # so compose resolves against the locally loaded (and retagged) images.
     local ref_key ref tag_key tag
     local -a required_images=()
-    for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF; do
+    for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF PYPISERVER_IMAGE_REF; do
         ref="${!ref_key:-}"
         [ -n "$ref" ] || continue
         if [[ "$ref" == *@sha256:* ]]; then
@@ -540,10 +559,12 @@ start_services() {
     # Pre-flight: verify every required image exists locally so compose never falls back to a pull
     local missing_images=()
     for img in "${required_images[@]}"; do
-        [ "$USE_LLM"      = false ] && [[ "$img" == *litellm*  ]] && continue
-        [ "$USE_LDAP"     = false ] && [[ "$img" == *dexidp*   ]] && continue
-        [ "$USE_MINERU"   = false ] && [[ "$img" == *mineru*   ]] && continue
-        [ "$USE_DOCTOOLS" = false ] && [[ "$img" == *pandoc*   ]] && continue
+        [ "$USE_LLM"      = false ] && [[ "$img" == *litellm*     ]] && continue
+        [ "$USE_LDAP"     = false ] && [[ "$img" == *dexidp*      ]] && continue
+        [ "$USE_MINERU"   = false ] && [[ "$img" == *mineru*      ]] && continue
+        [ "$USE_DOCTOOLS" = false ] && [[ "$img" == *pandoc*      ]] && continue
+        [ "$USE_SKILLHUB" = false ] && [[ "$img" == *gitea*       ]] && continue
+        [ "$USE_SKILLHUB" = false ] && [[ "$img" == *pypiserver*  ]] && continue
         if ! docker image inspect "$img" >/dev/null 2>&1; then
             missing_images+=("$img")
         fi
@@ -558,6 +579,7 @@ start_services() {
     [ "$USE_LDAP"     = true ] && compose_profiles+=(--profile ldap)
     [ "$USE_MINERU"   = true ] && compose_profiles+=(--profile mineru)
     [ "$USE_DOCTOOLS" = true ] && compose_profiles+=(--profile doctools)
+    [ "$USE_SKILLHUB" = true ] && compose_profiles+=(--profile skillhub)
     "${COMPOSE_CMD[@]}" "${compose_profiles[@]}" up -d
 
     ok "Platform started"
@@ -569,6 +591,14 @@ start_services() {
         run_setup_coder
     else
         show_access_info
+    fi
+
+    # Initialize Gitea on first start (if skillhub enabled)
+    if [ "$USE_SKILLHUB" = true ]; then
+        local gitea_done_file="$DOCKER_DIR/.gitea-setup-done"
+        if [ ! -f "$gitea_done_file" ]; then
+            setup_gitea
+        fi
     fi
 }
 
@@ -591,6 +621,10 @@ show_access_info() {
     if [ "$USE_DOCTOOLS" = true ]; then
         echo -e "  ${BLUE}https://${host}:${port}/docconv/${NC}  (Pandoc Markdown → Word/PDF)"
     fi
+    if [ "$USE_SKILLHUB" = true ]; then
+        echo -e "  ${BLUE}https://${host}:${port}/gitea/${NC}  (Gitea — Claude Code Skill/Command 市场)"
+        echo -e "  ${BLUE}https://${host}:${port}/pypi/${NC}   (PyPI Mirror — 离线 Python 包)"
+    fi
 }
 
 # ─── down ─────────────────────────────────────────────────────────────────────
@@ -603,6 +637,7 @@ stop_services() {
     [ "$USE_LDAP"     = true ] && compose_profiles+=(--profile ldap)
     [ "$USE_MINERU"   = true ] && compose_profiles+=(--profile mineru)
     [ "$USE_DOCTOOLS" = true ] && compose_profiles+=(--profile doctools)
+    [ "$USE_SKILLHUB" = true ] && compose_profiles+=(--profile skillhub)
     "${COMPOSE_CMD[@]}" "${compose_profiles[@]}" down
     ok "Platform stopped"
 }
@@ -710,7 +745,7 @@ _do_push_template() {
     docker exec coder-server sh -c 'rm -rf /tmp/template-push && mkdir -p /tmp/template-push' >/dev/null
     docker cp "$template_dir/." 'coder-server:/tmp/template-push/'
 
-    docker exec coder-server sh -c "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=${token} /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=${workspace_image} --var workspace_image_tag=${workspace_tag} --var anthropic_api_key='${anthropic_key}' --var anthropic_base_url='${anthropic_url}' --var server_host='${SERVER_HOST:-localhost}' --var gateway_port='${GATEWAY_PORT:-8443}' ; rm -rf /tmp/template-push"
+    docker exec coder-server sh -c "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=${token} /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=${workspace_image} --var workspace_image_tag=${workspace_tag} --var anthropic_api_key='${anthropic_key}' --var anthropic_base_url='${anthropic_url}' --var server_host='${SERVER_HOST:-localhost}' --var gateway_port='${GATEWAY_PORT:-8443}' --var skillhub_enabled='${USE_SKILLHUB}' ; rm -rf /tmp/template-push"
     ok "Workspace template pushed"
 }
 
@@ -1011,6 +1046,10 @@ _prepare_save_platform_images() {
     if [ "$USE_DOCTOOLS" = true ]; then
         images+=("$DOCCONV_IMAGE_REF")
     fi
+    if [ "$USE_SKILLHUB" = true ]; then
+        images+=("${GITEA_IMAGE_REF:-gitea/gitea:latest}")
+        images+=("${PYPISERVER_IMAGE_REF:-pypiserver/pypiserver:latest}")
+    fi
 
     local image filename filepath
     for image in "${images[@]}"; do
@@ -1091,6 +1130,16 @@ PY
         docconv_tar="$(printf '%s' "$DOCCONV_IMAGE_REF" | tr '/:@' '_').tar"
         docconv_entry=",\n    {\"ref\": \"${DOCCONV_IMAGE_REF}\", \"archive\": \"images/${docconv_tar}\"}"
     fi
+    local skillhub_entry=''
+    if [ "$USE_SKILLHUB" = true ]; then
+        local gitea_ref gitea_tar pypiserver_ref pypiserver_tar
+        gitea_ref="${GITEA_IMAGE_REF:-gitea/gitea:latest}"
+        gitea_tar="$(printf '%s' "$gitea_ref" | tr '/:@' '_').tar"
+        pypiserver_ref="${PYPISERVER_IMAGE_REF:-pypiserver/pypiserver:latest}"
+        pypiserver_tar="$(printf '%s' "$pypiserver_ref" | tr '/:@' '_').tar"
+        skillhub_entry=",\n    {\"ref\": \"${gitea_ref}\", \"archive\": \"images/${gitea_tar}\"}"
+        skillhub_entry+=",\n    {\"ref\": \"${pypiserver_ref}\", \"archive\": \"images/${pypiserver_tar}\"}"
+    fi
 
     cat > "$MANIFEST_PATH" <<EOF
 {
@@ -1102,13 +1151,14 @@ PY
   "include_llm": ${USE_LLM,,},
   "include_mineru": ${USE_MINERU,,},
   "include_doctools": ${USE_DOCTOOLS,,},
+  "include_skillhub": ${USE_SKILLHUB,,},
   "terraform_cli_config_mount_default": "../configs/terraform-offline.rc",
   "ca_sha256": "${ca_sha256}",
   "images": [
     {"ref": "${CODER_IMAGE_REF}", "archive": "images/${coder_tar}"},
     {"ref": "${POSTGRES_IMAGE_REF}", "archive": "images/${postgres_tar}"},
     {"ref": "${NGINX_IMAGE_REF}", "archive": "images/${nginx_tar}"},
-    {"ref": "${ws_image}:${ws_tag}", "archive": "images/${ws_tar}"}${llm_entry}${mineru_entry}${docconv_entry}
+    {"ref": "${ws_image}:${ws_tag}", "archive": "images/${ws_tar}"}${llm_entry}${mineru_entry}${docconv_entry}${skillhub_entry}
   ],
   "providers": [
     {"source": "registry.terraform.io/coder/coder", "version": "${TF_PROVIDER_CODER_VERSION}", "archive": "configs/provider-mirror/registry.terraform.io/coder/coder/${TF_PROVIDER_CODER_VERSION}/linux_amd64/terraform-provider-coder_${TF_PROVIDER_CODER_VERSION}_linux_amd64.zip"},
@@ -1296,6 +1346,8 @@ refresh_versions() {
     local OLD_TF_PROVIDER_DOCKER_VERSION="$TF_PROVIDER_DOCKER_VERSION"
     local OLD_MINERU_IMAGE_REF="${MINERU_IMAGE_REF:-}"
     local OLD_DOCCONV_IMAGE_REF="${DOCCONV_IMAGE_REF:-}"
+    local OLD_GITEA_IMAGE_REF="${GITEA_IMAGE_REF:-}"
+    local OLD_PYPISERVER_IMAGE_REF="${PYPISERVER_IMAGE_REF:-}"
 
     CODER_IMAGE_REF="$(_rv_resolve_digest "${CODER_IMAGE_REF%%@*}" "$CODER_IMAGE_TAG")"
     POSTGRES_IMAGE_REF="$(_rv_resolve_digest "${POSTGRES_IMAGE_REF%%@*}" "$POSTGRES_IMAGE_TAG")"
@@ -1311,11 +1363,19 @@ refresh_versions() {
     if [ -n "${DOCCONV_IMAGE_REF:-}" ]; then
         DOCCONV_IMAGE_REF="$(_rv_resolve_digest "${DOCCONV_IMAGE_REF%%@*}" "$DOCCONV_IMAGE_TAG")"
     fi
+    if [ -n "${GITEA_IMAGE_REF:-}" ]; then
+        GITEA_IMAGE_REF="$(_rv_resolve_digest "${GITEA_IMAGE_REF%%@*}" "$GITEA_IMAGE_TAG")"
+    fi
+    if [ -n "${PYPISERVER_IMAGE_REF:-}" ]; then
+        PYPISERVER_IMAGE_REF="$(_rv_resolve_digest "${PYPISERVER_IMAGE_REF%%@*}" "$PYPISERVER_IMAGE_TAG")"
+    fi
 
     echo
     local _rv_keys=(CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF TF_PROVIDER_CODER_VERSION TF_PROVIDER_DOCKER_VERSION)
-    [ -n "${MINERU_IMAGE_REF:-}"  ] && _rv_keys+=(MINERU_IMAGE_REF)
-    [ -n "${DOCCONV_IMAGE_REF:-}" ] && _rv_keys+=(DOCCONV_IMAGE_REF)
+    [ -n "${MINERU_IMAGE_REF:-}"     ] && _rv_keys+=(MINERU_IMAGE_REF)
+    [ -n "${DOCCONV_IMAGE_REF:-}"    ] && _rv_keys+=(DOCCONV_IMAGE_REF)
+    [ -n "${GITEA_IMAGE_REF:-}"      ] && _rv_keys+=(GITEA_IMAGE_REF)
+    [ -n "${PYPISERVER_IMAGE_REF:-}" ] && _rv_keys+=(PYPISERVER_IMAGE_REF)
     for key in "${_rv_keys[@]}"; do
         local old_var="OLD_${key}"
         local old_value="${!old_var}"
@@ -1332,7 +1392,7 @@ refresh_versions() {
     if [ "$apply" = true ]; then
         # Build optional image lines conditionally so the lock file only includes
         # entries for services that are already tracked (avoids orphan entries).
-        local _mineru_lines='' _docconv_lines=''
+        local _mineru_lines='' _docconv_lines='' _gitea_lines='' _pypiserver_lines=''
         if [ -n "${MINERU_IMAGE_REF:-}" ]; then
             _mineru_lines="# MinerU GPU 文档转 Markdown（--profile mineru，需 runtime: nvidia）
 MINERU_IMAGE_REF=${MINERU_IMAGE_REF}
@@ -1342,6 +1402,16 @@ MINERU_IMAGE_TAG=${MINERU_IMAGE_TAG}"
             _docconv_lines="# Pandoc Markdown→Word/PDF（--profile doctools）
 DOCCONV_IMAGE_REF=${DOCCONV_IMAGE_REF}
 DOCCONV_IMAGE_TAG=${DOCCONV_IMAGE_TAG}"
+        fi
+        if [ -n "${GITEA_IMAGE_REF:-}" ]; then
+            _gitea_lines="# Gitea 内网 Git 平台（Skill Hub，--profile skillhub）
+GITEA_IMAGE_REF=${GITEA_IMAGE_REF}
+GITEA_IMAGE_TAG=${GITEA_IMAGE_TAG}"
+        fi
+        if [ -n "${PYPISERVER_IMAGE_REF:-}" ]; then
+            _pypiserver_lines="# PyPI Mirror 离线 Python 包服务器（--profile skillhub）
+PYPISERVER_IMAGE_REF=${PYPISERVER_IMAGE_REF}
+PYPISERVER_IMAGE_TAG=${PYPISERVER_IMAGE_TAG}"
         fi
         cat > "$LOCK_FILE" <<EOF
 # Locked versions and digests for reproducible offline bundles.
@@ -1364,11 +1434,226 @@ TF_PROVIDER_CODER_VERSION=${TF_PROVIDER_CODER_VERSION}
 TF_PROVIDER_DOCKER_VERSION=${TF_PROVIDER_DOCKER_VERSION}
 ${_mineru_lines}
 ${_docconv_lines}
+${_gitea_lines}
+${_pypiserver_lines}
 EOF
         ok "Updated $LOCK_FILE"
     else
         warn "Dry run only. Re-run with --apply to rewrite configs/versions.lock.env."
     fi
+}
+
+# ─── skillhub-prepare / skillhub-refresh / setup-gitea ────────────────────────
+
+# Community skill repos to mirror at prepare time (url:dest-basename pairs)
+_SKILLHUB_REPOS=(
+    "https://github.com/wshobson/commands.git:wshobson-commands.git"
+)
+
+skillhub_prepare() {
+    check_deps
+    init_dirs
+    load_config
+
+    command -v git >/dev/null 2>&1 || fail "git not found — required for mirroring skill repos"
+
+    info "=== Skill Hub Preparation ==="
+    echo
+
+    # ── Step 1: Pull and save Gitea image ──────────────────────────────────────
+    local gitea_ref="${GITEA_IMAGE_REF:-gitea/gitea:latest}"
+    info "Pulling $gitea_ref"
+    docker pull "$gitea_ref"
+    mkdir -p "$IMAGES_DIR"
+    local gitea_tar="$IMAGES_DIR/$(printf '%s' "$gitea_ref" | tr '/:@' '_').tar"
+    info "Saving Gitea image -> $(basename "$gitea_tar")"
+    docker save -o "$gitea_tar" "$gitea_ref"
+    ok "Saved Gitea image"
+    echo
+
+    # ── Step 2: Pull and save pypiserver image ─────────────────────────────────
+    local pypiserver_ref="${PYPISERVER_IMAGE_REF:-pypiserver/pypiserver:latest}"
+    info "Pulling $pypiserver_ref"
+    docker pull "$pypiserver_ref"
+    local pypiserver_tar="$IMAGES_DIR/$(printf '%s' "$pypiserver_ref" | tr '/:@' '_').tar"
+    info "Saving pypiserver image -> $(basename "$pypiserver_tar")"
+    docker save -o "$pypiserver_tar" "$pypiserver_ref"
+    ok "Saved pypiserver image"
+    echo
+
+    # ── Step 3: Lock image digests in versions.lock.env ───────────────────────
+    if [ -f "$LOCK_FILE" ]; then
+        _lock_image_digest "$gitea_ref"      GITEA_IMAGE_REF      GITEA_IMAGE_TAG
+        _lock_image_digest "$pypiserver_ref" PYPISERVER_IMAGE_REF PYPISERVER_IMAGE_TAG
+    fi
+
+    # ── Step 4: Mirror community skill repos ──────────────────────────────────
+    skillhub_refresh
+    echo
+
+    # ── Step 5: Download pip packages (x86_64 manylinux wheels) ───────────────
+    local packages_dir="$CONFIGS_DIR/pypi/packages"
+    mkdir -p "$packages_dir"
+
+    if command -v pip3 >/dev/null 2>&1; then
+        info "Downloading scientific/engineering pip packages (x86_64 manylinux, Python 3.11)..."
+        info "This may take a while (~600MB–1.5GB)..."
+        pip3 download \
+            --dest "$packages_dir" \
+            --platform manylinux_2_17_x86_64 \
+            --python-version 3.11 \
+            --only-binary=:all: \
+            numpy pandas matplotlib scipy scikit-learn sympy \
+            pyserial pyelftools gcovr \
+            sphinx breathe \
+            pytest coverage \
+            requests httpx \
+            pydantic click rich tqdm \
+            || warn "Some packages failed to download (non-fatal; partial set will still be available offline)"
+        ok "Pip packages downloaded to $packages_dir"
+    else
+        warn "pip3 not found on host — skipping pip package download."
+        warn "Manually copy .whl files into configs/pypi/packages/ before deploying."
+    fi
+    echo
+
+    ok "Skill Hub preparation complete"
+    info "Transfer the project directory (including images/ and configs/pypi/packages/) to the offline server."
+    info "On the offline server: bash scripts/manage.sh load --skillhub && bash scripts/manage.sh up --skillhub"
+}
+
+# Helper: resolve and write image digest to versions.lock.env
+_lock_image_digest() {
+    local image_ref="$1" ref_key="$2" tag_key="$3"
+    local digest tag
+    digest="$(docker image inspect "$image_ref" --format '{{json .RepoDigests}}' | python3 - "${image_ref%%:*}" <<'PY'
+import json,sys
+repo = sys.argv[1]
+digests = json.load(sys.stdin)
+for d in digests:
+    if d.startswith(repo + '@'):
+        print(d); break
+else:
+    print(digests[0] if digests else '')
+PY
+)"
+    [ -n "$digest" ] || return 0
+    tag="${image_ref##*:}"
+    [ "$tag" = "$image_ref" ] && tag="latest"
+    if grep -q "^${ref_key}=" "$LOCK_FILE"; then
+        sed -i "s|^${ref_key}=.*|${ref_key}=${digest}|" "$LOCK_FILE"
+    else
+        printf '\n%s=%s\n%s=%s\n' "$ref_key" "$digest" "$tag_key" "$tag" >> "$LOCK_FILE"
+    fi
+    ok "Locked ${ref_key} in $(basename "$LOCK_FILE")"
+}
+
+skillhub_refresh() {
+    local seeds_dir="$CONFIGS_DIR/gitea/seeds"
+    mkdir -p "$seeds_dir"
+
+    command -v git >/dev/null 2>&1 || fail "git not found"
+
+    info "Syncing community skill repo mirrors..."
+    local entry url dest
+    for entry in "${_SKILLHUB_REPOS[@]}"; do
+        url="${entry%%:*}"
+        dest="$seeds_dir/${entry##*:}"
+        if [ -d "$dest" ]; then
+            info "Updating mirror: $(basename "$dest")"
+            git -C "$dest" remote update --prune \
+                && ok "Updated $(basename "$dest")" \
+                || warn "Update failed for $(basename "$dest") — will use existing mirror"
+        else
+            info "Cloning mirror: $url -> $(basename "$dest")"
+            git clone --mirror "$url" "$dest" \
+                && ok "Cloned $(basename "$dest")" \
+                || fail "Failed to clone $url"
+        fi
+    done
+    ok "Skill repo mirrors ready in $seeds_dir"
+}
+
+# Wait for Gitea API to respond, then initialize admin user and import seed repos
+setup_gitea() {
+    local gitea_done_file="$DOCKER_DIR/.gitea-setup-done"
+    [ -f "$gitea_done_file" ] && return 0
+
+    load_config
+    local gitea_url="http://localhost:3000"
+    local admin_pass="${GITEA_ADMIN_PASSWORD:-$(openssl rand -hex 12 2>/dev/null || echo "ChangeMe$(date +%s)")}"
+
+    info "Waiting for Gitea to become ready..."
+    local attempt
+    for attempt in $(seq 1 30); do
+        if curl -sf "${gitea_url}/-/ready" >/dev/null 2>&1; then
+            ok "Gitea is ready"
+            break
+        fi
+        sleep 3
+    done
+    curl -sf "${gitea_url}/-/ready" >/dev/null 2>&1 \
+        || { warn "Gitea did not become ready in time — skipping initialization"; return 0; }
+
+    # Create admin user (ignore error if already exists)
+    info "Creating Gitea admin user..."
+    docker exec coder-gitea gitea admin user create \
+        --admin \
+        --username admin \
+        --password "$admin_pass" \
+        --email "gitea-admin@internal" \
+        --must-change-password=false \
+        2>&1 | grep -v "already exists" || true
+
+    # Get admin token via API basic auth
+    local token_name="manage-sh-$(date +%s)"
+    local token_json
+    token_json="$(curl -sf -X POST "${gitea_url}/api/v1/users/admin/tokens" \
+        -u "admin:${admin_pass}" \
+        -H 'Content-Type: application/json' \
+        -d "{\"name\":\"${token_name}\"}" 2>/dev/null || echo '')"
+    local token
+    token="$(echo "$token_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('sha1',''))" 2>/dev/null || echo '')"
+    if [ -z "$token" ]; then
+        warn "Could not obtain Gitea API token — seed repos will not be imported automatically."
+        warn "Import manually via: https://<SERVER>:<PORT>/gitea  (admin / $admin_pass)"
+        return 0
+    fi
+
+    # Import each seed repo into Gitea (migrate from local path)
+    local entry dest repo_name
+    for entry in "${_SKILLHUB_REPOS[@]}"; do
+        dest="$CONFIGS_DIR/gitea/seeds/${entry##*:}"
+        repo_name="${entry##*:}"
+        repo_name="${repo_name%.git}"
+        # Strip username prefix (e.g. wshobson-commands -> commands)
+        repo_name="${repo_name#*-}"
+        [ -d "$dest" ] || continue
+        info "Importing seed repo: $repo_name"
+        local http_code
+        http_code="$(curl -sf -o /dev/null -w '%{http_code}' \
+            -X POST "${gitea_url}/api/v1/repos/migrate" \
+            -H "Authorization: token ${token}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clone_addr\":\"/repos-seed/${entry##*:}\",\"repo_name\":\"${repo_name}\",\"uid\":1,\"private\":false,\"description\":\"Mirrored from ${entry%%:*}\"}" \
+            2>/dev/null || echo '000')"
+        if [ "$http_code" = "201" ]; then
+            ok "Imported ${repo_name} into Gitea"
+        elif [ "$http_code" = "409" ]; then
+            info "${repo_name} already exists in Gitea"
+        else
+            warn "Import of ${repo_name} returned HTTP ${http_code} (non-fatal)"
+        fi
+    done
+
+    # Save admin password for operator reference
+    echo "$admin_pass" > "$DOCKER_DIR/.gitea-admin-password"
+    chmod 600 "$DOCKER_DIR/.gitea-admin-password"
+    date > "$gitea_done_file"
+
+    ok "Gitea initialized"
+    info "Gitea admin credentials saved to docker/.gitea-admin-password"
+    warn "Change the Gitea admin password after first login: https://<SERVER>:<PORT>/gitea"
 }
 
 # ─── test / clean ─────────────────────────────────────────────────────────────
@@ -1447,6 +1732,12 @@ main() {
             ;;
         verify)
             verify_offline "${@:2}"
+            ;;
+        skillhub-prepare)
+            skillhub_prepare
+            ;;
+        skillhub-refresh)
+            skillhub_refresh
             ;;
         # Platform lifecycle
         init)
