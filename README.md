@@ -317,6 +317,38 @@ Linux:
 bash scripts/manage.sh push-template
 ```
 
+## In-Place Upgrade (Preserve Users and Workspaces)
+
+If you have an existing deployment that is several commits behind this repository and you want to move to the latest code without losing user accounts, workspace metadata, or home-directory data, use the in-place upgrade workflow.
+
+The platform stores all user identity and workspace state in the PostgreSQL database and each workspace's home volume. As long as the `docker_postgres-data` volume and every `coder-<id>-home` volume are preserved, a full code and image upgrade is safe.
+
+For a detailed step-by-step runbook covering:
+
+- Pre-upgrade snapshot (`upgrade-backup`)
+- Switching to new code and restoring config (`upgrade-restore-config`)
+- Verifying the migration before users restart workspaces
+- Rolling back if something goes wrong
+- Adding LDAP/OIDC after the platform is already running
+
+See **[docs/upgrade-in-place.md](docs/upgrade-in-place.md)** (written in Chinese for the primary audience, with English summaries for key commands).
+
+Quick commands:
+
+```bash
+# Before switching code — take a snapshot while Postgres is still running
+bash scripts/manage.sh upgrade-backup [--dest <dir>]
+
+# After git checkout <new-ref> — restore .env and ssl from snapshot
+bash scripts/manage.sh upgrade-restore-config <snapshot-dir>
+```
+
+**Critical reminders:**
+
+- Never run `docker compose down -v` during an upgrade — the `-v` flag deletes named volumes.
+- Always preserve `POSTGRES_PASSWORD` and `configs/ssl/ca.key`.
+- Existing workspaces will keep running on their old image until users explicitly stop and restart them in the UI.
+
 ## Version Locking
 
 Deployment reads pinned refs from `configs/versions.lock.env`.
@@ -598,6 +630,10 @@ The Coder login page will show a "Sign in with 企业 LDAP" button alongside the
 .\scripts\manage.ps1 update-workspace [-Tag v20240324]
 .\scripts\manage.ps1 load-workspace images\workspace-embedded_v20240324.tar
 
+# In-place upgrade (preserve users and workspaces across code changes)
+.\scripts\manage.ps1 upgrade-backup [-Dest dir] [-Force]
+.\scripts\manage.ps1 upgrade-restore-config <snapshot-dir> [-Force]
+
 # Offline bundle preparation (connected machine)
 .\scripts\manage.ps1 prepare [-SkipImages] [-SkipBuild] [-Llm] [-Mineru] [-Doctools]
 .\scripts\manage.ps1 verify [-RequireLlm]
@@ -613,6 +649,10 @@ bash scripts/manage.sh <command> [--llm] [--ldap] [--mineru] [--doctools]
 # Workspace image versioning
 bash scripts/manage.sh update-workspace [--tag v20240324]
 bash scripts/manage.sh load-workspace images/workspace-embedded_v20240324.tar
+
+# In-place upgrade (preserve users and workspaces across code changes)
+bash scripts/manage.sh upgrade-backup [--dest <dir>] [--force]
+bash scripts/manage.sh upgrade-restore-config <snapshot-dir> [--force]
 
 # Offline bundle preparation (connected machine)
 bash scripts/manage.sh prepare [--skip-images] [--skip-build] [--llm] [--mineru] [--doctools]
@@ -632,6 +672,7 @@ bash scripts/manage.sh refresh-versions [--apply]
 - `configs/dex/config.yaml`: Dex OIDC + LDAP connector config (--ldap mode)
 - `configs/postgres/init-dex.sql`: auto-creates `dex` database on first postgres start
 - `workspace-template/main.tf`: Coder template that provisions workspace containers
+- `docs/upgrade-in-place.md`: runbook for upgrading an existing deployment without losing users or workspace data
 - `scripts/manage.ps1`: **Windows entry point** — all commands
 - `scripts/manage.sh`: **Linux entry point** — all commands
 - `scripts/prepare-offline.ps1`: shim → `manage.ps1 prepare`

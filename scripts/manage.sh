@@ -88,6 +88,16 @@ Workspace image version management:
   load-workspace <tar>  Load a workspace image tar, update lock, push template
                         (for applying updates on an already-deployed offline server)
 
+In-place upgrade (preserve users + workspaces across code/image changes):
+  upgrade-backup [--dest <dir>] [--force]
+                        Snapshot the running platform: pg_dumpall, every named volume
+                        (postgres-data + each coder-*-home), docker/.env, configs/ssl/,
+                        versions.lock.env. Default destination: backups/snapshot-<ts>/
+  upgrade-restore-config <snapshot-dir> [--force]
+                        After 'git checkout <new-ref>', restore docker/.env and
+                        configs/ssl/ from a snapshot so the new code reuses the same
+                        POSTGRES_PASSWORD and root CA. See docs/upgrade-in-place.md.
+
 Flags:
   --llm      Enable LiteLLM AI gateway (--profile llm)
   --ldap     Enable Dex OIDC + LDAP authentication (--profile ldap)
@@ -927,6 +937,252 @@ load_workspace() {
     echo
     ok "Workspace image ${image_name}:${tag} is now active."
     warn "Users must stop and restart their workspaces in the Coder UI to pick up the new image."
+}
+
+# ─── upgrade-backup / upgrade-restore-config ──────────────────────────────────
+#
+# 用于"原地升级"流程：旧部署的代码版本落后于当前仓库，但 Postgres 中的用户/
+# workspace 元数据和每个 workspace 的 home volume 必须保留。具体步骤见
+# docs/upgrade-in-place.md。
+#
+#   upgrade-backup [--dest <dir>] [--force]
+#       在仍在运行的旧平台上拍快照（pg_dumpall + 所有 named volume + .env + ssl）。
+#       不接触运行中的服务；pg_dumpall 是热备份，volume 备份直接读取磁盘。
+#
+#   upgrade-restore-config <snapshot-dir> [--force]
+#       在切到新代码之后、bash scripts/manage.sh up 之前，把快照里的 .env 与
+#       configs/ssl 还原回工作目录。这样新部署沿用同一 POSTGRES_PASSWORD 和
+#       同一根 CA，否则 coder 连不上老 DB / workspace 拒绝信任内网证书。
+
+_pick_backup_image_ref() {
+    # 用一个本地已存在的镜像启动临时容器执行 tar。优先复用 coder-postgres 的镜像（一定在线/离线都可用）。
+    local img
+    img="$(docker inspect coder-postgres --format '{{.Image}}' 2>/dev/null || true)"
+    if [ -n "$img" ]; then
+        printf '%s\n' "$img"
+        return 0
+    fi
+    # 退化路径：使用 .env / lock 中固定的 postgres 镜像引用
+    load_config
+    if [ -n "${POSTGRES_IMAGE_REF:-}" ]; then
+        printf '%s\n' "${POSTGRES_IMAGE_REF}"
+        return 0
+    fi
+    printf 'postgres:16-alpine\n'
+}
+
+upgrade_backup() {
+    local dest="" force=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dest)  shift; dest="${1:-}" ;;
+            --force) force=true ;;
+            *) warn "Ignoring unrecognized argument: $1" ;;
+        esac
+        shift || true
+    done
+
+    check_deps
+    [ -f "$ENV_FILE" ] || fail "docker/.env not found — nothing to back up"
+    load_config
+
+    docker ps --format '{{.Names}}' | grep -q '^coder-postgres$' \
+        || fail "coder-postgres is not running. pg_dumpall needs the database online; start the platform with 'manage.sh up' before running upgrade-backup."
+
+    local timestamp
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    [ -n "$dest" ] || dest="$PROJECT_ROOT/backups/snapshot-$timestamp"
+
+    if [ -e "$dest" ]; then
+        if [ "$force" = true ]; then
+            warn "Overwriting existing snapshot at $dest"
+            rm -rf "$dest"
+        else
+            fail "Snapshot directory already exists: $dest (re-run with --force to overwrite)"
+        fi
+    fi
+    mkdir -p "$dest/volumes" "$dest/ssl"
+
+    info "[1/5] pg_dumpall coder → $dest/coder.sql"
+    if ! docker exec -i coder-postgres pg_dumpall -U coder > "$dest/coder.sql"; then
+        fail "pg_dumpall failed; check 'docker logs coder-postgres'"
+    fi
+    local sql_bytes
+    sql_bytes="$(stat -c%s "$dest/coder.sql" 2>/dev/null || stat -f%z "$dest/coder.sql" 2>/dev/null || echo 0)"
+    [ "$sql_bytes" -gt 1024 ] || fail "coder.sql is suspiciously small (${sql_bytes} bytes); aborting"
+    ok "      coder.sql ($(( sql_bytes / 1024 )) KB)"
+
+    local backup_image pg_volume
+    backup_image="$(_pick_backup_image_ref)"
+
+    info "[2/5] Tarring postgres-data volume"
+    pg_volume="$(docker inspect coder-postgres --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}' 2>/dev/null || true)"
+    [ -n "$pg_volume" ] || fail "Could not locate postgres-data volume on coder-postgres"
+    docker run --rm \
+        -v "$pg_volume":/data:ro \
+        -v "$(cd "$dest/volumes" && pwd)":/backup \
+        --entrypoint /bin/sh \
+        "$backup_image" \
+        -c 'cd /data && tar czf /backup/postgres-data.tgz .' \
+        || fail "Failed to archive postgres-data volume ($pg_volume)"
+    ok "      volumes/postgres-data.tgz (volume: $pg_volume)"
+
+    info "[3/5] Tarring workspace home volumes (coder-*-home)"
+    local home_count=0 vol
+    while IFS= read -r vol; do
+        [ -n "$vol" ] || continue
+        info "      - $vol"
+        if docker run --rm \
+            -v "$vol":/data:ro \
+            -v "$(cd "$dest/volumes" && pwd)":/backup \
+            --entrypoint /bin/sh \
+            "$backup_image" \
+            -c "cd /data && tar czf /backup/${vol}.tgz ." 2>/dev/null
+        then
+            home_count=$(( home_count + 1 ))
+        else
+            warn "        archive failed for $vol (continuing — re-run after stopping the affected workspace if needed)"
+        fi
+    done < <(docker volume ls --format '{{.Name}}' | grep -E '^coder-.*-home$' || true)
+    ok "      $home_count workspace home volume(s) archived"
+
+    info "[4/5] Copying configuration"
+    cp "$ENV_FILE" "$dest/env.bak"
+    cp -r "$CONFIGS_DIR/ssl/." "$dest/ssl/"
+    [ -f "$LOCK_FILE" ] && cp "$LOCK_FILE" "$dest/versions.lock.env.bak"
+    if [ -f "$DOCKER_DIR/.setup-done" ]; then
+        cp "$DOCKER_DIR/.setup-done" "$dest/setup-done.bak"
+    fi
+    ok "      env.bak, ssl/, versions.lock.env.bak"
+
+    info "[5/5] Writing meta.json"
+    local git_sha git_branch
+    git_sha="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    git_branch="$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+    local created_iso
+    created_iso="$(python3 - <<'PY' 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ
+from datetime import datetime, timezone
+print(datetime.now(timezone.utc).isoformat())
+PY
+)"
+    cat > "$dest/meta.json" <<EOF
+{
+  "snapshot_kind": "upgrade-in-place",
+  "created_at_utc": "${created_iso}",
+  "git_branch": "${git_branch}",
+  "git_commit": "${git_sha}",
+  "server_host": "${SERVER_HOST:-}",
+  "gateway_port": "${GATEWAY_PORT:-}",
+  "workspace_image": "${WORKSPACE_IMAGE:-}:${WORKSPACE_IMAGE_TAG:-}",
+  "postgres_volume": "${pg_volume}",
+  "workspace_home_volumes": ${home_count}
+}
+EOF
+    ok "      meta.json"
+
+    local total
+    total="$(du -sh "$dest" 2>/dev/null | awk '{print $1}')"
+    echo
+    ok "Backup complete: $dest  (total ${total:-unknown})"
+    echo
+    info "Next steps (see docs/upgrade-in-place.md for the full runbook):"
+    echo -e "  1) Move/copy ${BLUE}$dest${NC} to durable storage outside this directory"
+    echo -e "  2) ${BLUE}bash scripts/manage.sh down${NC}        # stop the old platform (NEVER pass -v)"
+    echo -e "  3) ${BLUE}git fetch && git checkout <new-ref>${NC}"
+    echo -e "  4) ${BLUE}bash scripts/manage.sh upgrade-restore-config $dest${NC}"
+    echo -e "  5) ${BLUE}bash scripts/manage.sh load${NC}        # plus any --ldap/--skillhub flags you want to enable"
+    echo -e "  6) ${BLUE}bash scripts/manage.sh up${NC}          # postgres schema migrates forward, users keep their accounts"
+    echo -e "  7) ${BLUE}bash scripts/manage.sh update-workspace --tag v\$(date +%Y%m%d)${NC}   # bake new tools into a tagged image"
+}
+
+upgrade_restore_config() {
+    local snapshot="" force=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force) force=true ;;
+            -*)      warn "Ignoring unknown flag: $1" ;;
+            *)       [ -z "$snapshot" ] && snapshot="$1" || warn "Extra positional arg ignored: $1" ;;
+        esac
+        shift || true
+    done
+    [ -n "$snapshot" ] || fail "Usage: manage.sh upgrade-restore-config <snapshot-dir> [--force]"
+    [ -d "$snapshot" ] || fail "Snapshot directory not found: $snapshot"
+    [ -f "$snapshot/env.bak" ] || fail "$snapshot/env.bak not found — is this a snapshot from upgrade-backup?"
+    [ -d "$snapshot/ssl" ]     || fail "$snapshot/ssl/ not found — incomplete snapshot"
+
+    init_dirs
+
+    # ── docker/.env ────────────────────────────────────────────────────────────
+    if [ -f "$ENV_FILE" ]; then
+        if [ "$force" != true ]; then
+            fail "$ENV_FILE already exists. Pass --force to overwrite (the existing file will be saved as $ENV_FILE.before-restore)."
+        fi
+        cp "$ENV_FILE" "$ENV_FILE.before-restore"
+        warn "Existing docker/.env saved to $ENV_FILE.before-restore"
+    fi
+    cp "$snapshot/env.bak" "$ENV_FILE"
+    ok "Restored docker/.env"
+
+    # 把缺失的新增 lock 默认值（如新版本添加的 *_IMAGE_REF）追加进来
+    ensure_env_defaults "$ENV_FILE" "$CONFIGS_DIR"
+
+    # ── configs/ssl ────────────────────────────────────────────────────────────
+    if [ -d "$CONFIGS_DIR/ssl" ] && [ -n "$(ls -A "$CONFIGS_DIR/ssl" 2>/dev/null)" ]; then
+        local existing_ca="$CONFIGS_DIR/ssl/ca.crt"
+        local snap_ca="$snapshot/ssl/ca.crt"
+        if [ -f "$existing_ca" ] && [ -f "$snap_ca" ] && ! cmp -s "$existing_ca" "$snap_ca"; then
+            if [ "$force" != true ]; then
+                fail "configs/ssl/ca.crt differs from snapshot. Pass --force to overwrite. WARNING: workspaces built against the current CA will need to be rebuilt to trust the restored CA."
+            fi
+            warn "Overwriting different ca.crt; existing tree saved to configs/ssl.before-restore"
+        fi
+        rm -rf "$CONFIGS_DIR/ssl.before-restore"
+        mv "$CONFIGS_DIR/ssl" "$CONFIGS_DIR/ssl.before-restore"
+    fi
+    mkdir -p "$CONFIGS_DIR/ssl"
+    cp -r "$snapshot/ssl/." "$CONFIGS_DIR/ssl/"
+    ok "Restored configs/ssl/ (CA + leaf certificate)"
+
+    # ── versions.lock.env (optional) ───────────────────────────────────────────
+    # 不强制覆盖 lock 文件——新仓库自带的 lock 通常更新更全；但记录工作区镜像 tag 以便后续 update-workspace。
+    if [ -f "$snapshot/versions.lock.env.bak" ] && [ -f "$LOCK_FILE" ]; then
+        local snap_ws_tag
+        snap_ws_tag="$(grep -E '^WORKSPACE_IMAGE_TAG=' "$snapshot/versions.lock.env.bak" | head -n1 | cut -d= -f2 || true)"
+        if [ -n "$snap_ws_tag" ]; then
+            info "Snapshot workspace image tag was: ${snap_ws_tag}"
+            info "Current versions.lock.env tag:    ${WORKSPACE_IMAGE_TAG:-unset}"
+            info "Build a fresh tagged image after upgrade with: manage.sh update-workspace --tag v\$(date +%Y%m%d)"
+        fi
+    fi
+
+    # ── .setup-done (skip first-run admin creation) ────────────────────────────
+    # 保留旧的 .setup-done 标记，让 manage.sh up 跳过首启动逻辑——admin 已经在 DB 里了。
+    if [ -f "$snapshot/setup-done.bak" ] && [ ! -f "$DOCKER_DIR/.setup-done" ]; then
+        cp "$snapshot/setup-done.bak" "$DOCKER_DIR/.setup-done"
+        ok "Restored docker/.setup-done (skips first-run admin creation)"
+    fi
+
+    # ── Sanity ─────────────────────────────────────────────────────────────────
+    load_config
+    [ -n "${POSTGRES_PASSWORD:-}" ] || warn "POSTGRES_PASSWORD is empty in restored env — coder will fail to connect to postgres"
+    [ -n "${SERVER_HOST:-}" ]       || warn "SERVER_HOST is empty in restored env"
+
+    if [ -f "$snapshot/meta.json" ]; then
+        echo
+        info "Snapshot metadata:"
+        sed 's/^/      /' "$snapshot/meta.json"
+    fi
+
+    echo
+    ok "Configuration restored from $snapshot"
+    echo
+    info "Next steps:"
+    echo -e "  1) Sanity-check ${BLUE}docker/.env${NC} — review any new keys appended from versions.lock.env"
+    echo -e "  2) ${BLUE}bash scripts/manage.sh load${NC} [--ldap --skillhub …]"
+    echo -e "  3) ${BLUE}bash scripts/manage.sh up${NC}        # new coder migrates the DB schema in-place"
+    echo -e "  4) Verify a real user can log in, then build a tagged workspace image:"
+    echo -e "     ${BLUE}bash scripts/manage.sh update-workspace --tag v\$(date +%Y%m%d)${NC}"
+    echo -e "  5) Have users restart their workspaces in the UI to pick up the new image"
 }
 
 # ─── prepare (migrated from prepare-offline.sh) ───────────────────────────────
@@ -1796,6 +2052,12 @@ main() {
             ;;
         load-workspace)
             load_workspace "${2:-}"
+            ;;
+        upgrade-backup)
+            upgrade_backup "${@:2}"
+            ;;
+        upgrade-restore-config)
+            upgrade_restore_config "${@:2}"
             ;;
         help|--help|-h)
             usage

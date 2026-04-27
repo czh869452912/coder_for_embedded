@@ -13,7 +13,9 @@ param(
     [switch]$Apply,
     [switch]$RequireLlm,
     [switch]$SkipImages,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [string]$Dest = "",
+    [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
@@ -829,6 +831,289 @@ function Invoke-Clean {
     Write-OK 'Cleanup complete.'
 }
 
+# ─── upgrade-backup / upgrade-restore-config ──────────────────────────────────
+
+function Invoke-UpgradeBackup {
+    Assert-Docker
+    if (-not (Test-Path $EnvFile)) {
+        Write-Fail 'docker/.env not found — nothing to back up.'
+        exit 1
+    }
+    $cfg = Get-Config
+
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $pgNames = docker ps --format '{{.Names}}' 2>$null
+    $pgRunning = ($pgNames -match '^coder-postgres$')
+    $ErrorActionPreference = $eap
+    if (-not $pgRunning) {
+        Write-Fail 'coder-postgres is not running. Start the platform before running upgrade-backup.'
+        exit 1
+    }
+
+    $timestamp = (Get-Date -Format 'yyyyMMdd-HHmmss')
+    if (-not $Dest) {
+        $Dest = Join-Path $ProjectRoot "backups\snapshot-$timestamp"
+    }
+    $Dest = [System.IO.Path]::GetFullPath($Dest)
+
+    if (Test-Path $Dest) {
+        if ($Force) {
+            Write-Warn "Overwriting existing snapshot at $Dest"
+            Remove-Item -Recurse -Force $Dest
+        } else {
+            Write-Fail "Snapshot directory already exists: $Dest (re-run with -Force to overwrite)"
+            exit 1
+        }
+    }
+    New-Item -ItemType Directory -Path (Join-Path $Dest 'volumes') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $Dest 'ssl') -Force | Out-Null
+
+    # Step 1: pg_dumpall
+    Write-Info '[1/5] pg_dumpall coder -> coder.sql'
+    $sqlPath = Join-Path $Dest 'coder.sql'
+    $eap2 = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $stdout = docker exec coder-postgres pg_dumpall -U coder 2>$null
+    $pgExit = $LASTEXITCODE
+    $ErrorActionPreference = $eap2
+    if ($pgExit -ne 0) {
+        Write-Fail 'pg_dumpall failed; check docker logs coder-postgres'
+        exit 1
+    }
+    [System.IO.File]::WriteAllText($sqlPath, $stdout, [System.Text.UTF8Encoding]::new($false))
+    $sqlBytes = (Get-Item $sqlPath).Length
+    if ($sqlBytes -lt 1024) {
+        Write-Fail "coder.sql is suspiciously small ($sqlBytes bytes); aborting"
+        exit 1
+    }
+    Write-OK "      coder.sql ($([math]::Round($sqlBytes / 1024)) KB)"
+
+    # Pick backup image
+    $backupImage = $null
+    try {
+        $backupImage = (docker inspect coder-postgres --format '{{.Image}}' 2>$null)
+    } catch {}
+    if (-not $backupImage) {
+        $backupImage = if ($cfg['POSTGRES_IMAGE_REF']) { $cfg['POSTGRES_IMAGE_REF'] } else { 'postgres:16-alpine' }
+    }
+
+    # Step 2: postgres-data volume
+    Write-Info '[2/5] Tarring postgres-data volume'
+    $eap3 = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $pgVolume = (docker inspect coder-postgres --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}' 2>$null)
+    $ErrorActionPreference = $eap3
+    if (-not $pgVolume) {
+        Write-Fail 'Could not locate postgres-data volume on coder-postgres'
+        exit 1
+    }
+    $volDir = Join-Path $Dest 'volumes'
+    docker run --rm `
+        -v "${pgVolume}:/data:ro" `
+        -v "$($volDir):/backup" `
+        --entrypoint /bin/sh `
+        $backupImage `
+        -c 'cd /data && tar czf /backup/postgres-data.tgz .'
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "Failed to archive postgres-data volume ($pgVolume)"
+        exit 1
+    }
+    Write-OK "      volumes\postgres-data.tgz (volume: $pgVolume)"
+
+    # Step 3: workspace home volumes
+    Write-Info '[3/5] Tarring workspace home volumes (coder-*-home)'
+    $eap4 = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $allVolumes = docker volume ls --format '{{.Name}}' 2>$null
+    $ErrorActionPreference = $eap4
+    $homeVolumes = $allVolumes | Where-Object { $_ -match '^coder-.*-home$' }
+    $homeCount = 0
+    foreach ($vol in $homeVolumes) {
+        Write-Info "      - $vol"
+        docker run --rm `
+            -v "${vol}:/data:ro" `
+            -v "$($volDir):/backup" `
+            --entrypoint /bin/sh `
+            $backupImage `
+            -c "cd /data && tar czf /backup/${vol}.tgz ."
+        if ($LASTEXITCODE -eq 0) {
+            $homeCount++
+        } else {
+            Write-Warn "        archive failed for $vol (continuing)"
+        }
+    }
+    Write-OK "      $homeCount workspace home volume(s) archived"
+
+    # Step 4: configuration
+    Write-Info '[4/5] Copying configuration'
+    Copy-Item $EnvFile (Join-Path $Dest 'env.bak')
+    $sslSrc = Join-Path $ConfigsDir 'ssl'
+    $sslDst = Join-Path $Dest 'ssl'
+    if (Test-Path $sslSrc) {
+        foreach ($item in (Get-ChildItem $sslSrc -ErrorAction SilentlyContinue)) {
+            Copy-Item $item.FullName $sslDst -Recurse -Force
+        }
+    }
+    if (Test-Path $LockFile) {
+        Copy-Item $LockFile (Join-Path $Dest 'versions.lock.env.bak')
+    }
+    if (Test-Path $SetupDone) {
+        Copy-Item $SetupDone (Join-Path $Dest 'setup-done.bak')
+    }
+    Write-OK "      env.bak, ssl\, versions.lock.env.bak"
+
+    # Step 5: metadata
+    Write-Info '[5/5] Writing meta.json'
+    $gitSha = 'unknown'
+    $gitBranch = 'unknown'
+    try {
+        Push-Location $ProjectRoot
+        $gitSha = (git rev-parse HEAD 2>$null)
+        $gitBranch = (git rev-parse --abbrev-ref HEAD 2>$null)
+        Pop-Location
+    } catch {}
+
+    $meta = [ordered]@{
+        snapshot_kind = 'upgrade-in-place'
+        created_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        git_branch = $gitBranch
+        git_commit = $gitSha
+        server_host = $cfg['SERVER_HOST']
+        gateway_port = $cfg['GATEWAY_PORT']
+        workspace_image = "$($cfg['WORKSPACE_IMAGE']):$($cfg['WORKSPACE_IMAGE_TAG'])"
+        postgres_volume = $pgVolume
+        workspace_home_volumes = $homeCount
+    }
+    $metaJson = $meta | ConvertTo-Json -Depth 4
+    [System.IO.File]::WriteAllText((Join-Path $Dest 'meta.json'), $metaJson + "`r`n", [System.Text.UTF8Encoding]::new($false))
+    Write-OK "      meta.json"
+
+    $total = (Get-ChildItem $Dest -Recurse -File | Measure-Object -Property Length -Sum).Sum
+    $totalMb = [math]::Round($total / 1MB)
+    Write-Host ''
+    Write-OK "Backup complete: $Dest (total ${totalMb} MB)"
+    Write-Host ''
+    Write-Info 'Next steps (see docs/upgrade-in-place.md for the full runbook):'
+    Write-Host '  1) Move/copy snapshot to durable storage outside this directory'
+    Write-Host '  2) .\scripts\manage.ps1 down           # stop the old platform (never pass -v)'
+    Write-Host '  3) git fetch && git checkout <new-ref>'
+    Write-Host '  4) .\scripts\manage.ps1 upgrade-restore-config <snapshot-dir>'
+    Write-Host '  5) .\scripts\manage.ps1 load          # plus -Ldap -SkillHub etc as needed'
+    Write-Host '  6) .\scripts\manage.ps1 up            # new coder migrates DB in-place'
+    Write-Host '  7) .\scripts\manage.ps1 update-workspace -Tag v$(Get-Date -Format yyyyMMdd)'
+}
+
+function Invoke-UpgradeRestoreConfig {
+    param([string]$SnapshotDir)
+    if (-not $SnapshotDir) {
+        Write-Fail 'Usage: manage.ps1 upgrade-restore-config <snapshot-dir> [-Force]'
+        exit 1
+    }
+    $SnapshotDir = [System.IO.Path]::GetFullPath($SnapshotDir)
+    if (-not (Test-Path $SnapshotDir)) {
+        Write-Fail "Snapshot directory not found: $SnapshotDir"
+        exit 1
+    }
+    $envBak = Join-Path $SnapshotDir 'env.bak'
+    $sslBak = Join-Path $SnapshotDir 'ssl'
+    if (-not (Test-Path $envBak)) {
+        Write-Fail "$envBak not found — is this a snapshot from upgrade-backup?"
+        exit 1
+    }
+    if (-not (Test-Path $sslBak)) {
+        Write-Fail "$sslBak not found — incomplete snapshot"
+        exit 1
+    }
+
+    Initialize-Dirs
+
+    # .env
+    if (Test-Path $EnvFile) {
+        if (-not $Force) {
+            Write-Fail "$EnvFile already exists. Pass -Force to overwrite (the existing file will be saved as .env.before-restore)."
+            exit 1
+        }
+        Copy-Item $EnvFile "$EnvFile.before-restore"
+        Write-Warn "Existing docker/.env saved to $EnvFile.before-restore"
+    }
+    Copy-Item $envBak $EnvFile
+    Write-OK 'Restored docker/.env'
+    Ensure-EnvDefaults -EnvFile $EnvFile -ConfigsDir $ConfigsDir
+
+    # SSL
+    $sslTarget = Join-Path $ConfigsDir 'ssl'
+    $caExisting = Join-Path $sslTarget 'ca.crt'
+    $caSnapshot = Join-Path $sslBak 'ca.crt'
+    if ((Test-Path $caExisting) -and (Test-Path $caSnapshot)) {
+        $existingHash = (Get-FileHash $caExisting -Algorithm SHA256).Hash
+        $snapshotHash = (Get-FileHash $caSnapshot -Algorithm SHA256).Hash
+        if ($existingHash -ne $snapshotHash) {
+            if (-not $Force) {
+                Write-Fail 'configs/ssl/ca.crt differs from snapshot. Pass -Force to overwrite. WARNING: workspaces built against the current CA will need to be rebuilt.'
+                exit 1
+            }
+        }
+    }
+    if (Test-Path $sslTarget) {
+        $backupSsl = Join-Path $ConfigsDir 'ssl.before-restore'
+        Remove-Item -Recurse -Force $backupSsl -ErrorAction SilentlyContinue
+        Move-Item $sslTarget $backupSsl
+        Write-Warn 'Existing configs/ssl saved to configs/ssl.before-restore'
+    }
+    New-Item -ItemType Directory -Path $sslTarget -Force | Out-Null
+    foreach ($item in (Get-ChildItem $sslBak -ErrorAction SilentlyContinue)) {
+        Copy-Item $item.FullName $sslTarget -Recurse -Force
+    }
+    Write-OK 'Restored configs/ssl/ (CA + leaf certificate)'
+
+    # versions.lock.env reference
+    $lockBak = Join-Path $SnapshotDir 'versions.lock.env.bak'
+    if ((Test-Path $lockBak) -and (Test-Path $LockFile)) {
+        $match = Select-String -Path $lockBak -Pattern '^WORKSPACE_IMAGE_TAG=(.*)$' -ErrorAction SilentlyContinue
+        if ($match) {
+            $bakTag = $match.Matches.Groups[1].Value.Trim()
+            Write-Info "Snapshot workspace image tag was: $bakTag"
+            Write-Info "Current versions.lock.env tag:    $($cfg['WORKSPACE_IMAGE_TAG'])"
+            Write-Info "Build a fresh tagged image after upgrade with: manage.ps1 update-workspace -Tag v$(Get-Date -Format yyyyMMdd)"
+        }
+    }
+
+    # setup-done
+    $setupDoneBak = Join-Path $SnapshotDir 'setup-done.bak'
+    if ((Test-Path $setupDoneBak) -and (-not (Test-Path $SetupDone))) {
+        Copy-Item $setupDoneBak $SetupDone
+        Write-OK 'Restored docker/.setup-done (skips first-run admin creation)'
+    }
+
+    # Sanity
+    $cfg = Get-Config
+    if (-not $cfg['POSTGRES_PASSWORD']) {
+        Write-Warn 'POSTGRES_PASSWORD is empty in restored env — coder will fail to connect to postgres'
+    }
+    if (-not $cfg['SERVER_HOST']) {
+        Write-Warn 'SERVER_HOST is empty in restored env'
+    }
+
+    $metaPath = Join-Path $SnapshotDir 'meta.json'
+    if (Test-Path $metaPath) {
+        Write-Host ''
+        Write-Info 'Snapshot metadata:'
+        (Get-Content $metaPath) | ForEach-Object { Write-Host "      $_" }
+    }
+
+    Write-Host ''
+    Write-OK "Configuration restored from $SnapshotDir"
+    Write-Host ''
+    Write-Info 'Next steps:'
+    Write-Host '  1) Sanity-check docker/.env — review any new keys appended from versions.lock.env'
+    Write-Host '  2) .\scripts\manage.ps1 load [-Ldap -SkillHub …]'
+    Write-Host '  3) .\scripts\manage.ps1 up       # new coder migrates the DB schema in-place'
+    Write-Host '  4) Verify a real user can log in, then build a tagged workspace image:'
+    Write-Host '     .\scripts\manage.ps1 update-workspace -Tag v$(Get-Date -Format yyyyMMdd)'
+    Write-Host '  5) Have users restart their workspaces in the UI to pick up the new image'
+}
+
 # ─── push-template ────────────────────────────────────────────────────────────
 
 function Invoke-CmdPushTemplate {
@@ -1365,6 +1650,16 @@ function Show-Help {
         '                              Auto-generates tag v<YYYYMMDD> when -Tag is omitted',
         '  load-workspace <tar>        (Offline server) Load workspace tar, update lock, push template',
         '',
+        'In-place upgrade (preserve users + workspaces across code/image changes):',
+        '  upgrade-backup [-Dest dir] [-Force]',
+        '                              Snapshot the running platform: pg_dumpall, every named volume',
+        '                              (postgres-data + each coder-*-home), docker/.env, configs/ssl/.',
+        '                              Default destination: backups\snapshot-<timestamp>',
+        '  upgrade-restore-config <dir> [-Force]',
+        '                              After ''git checkout <new-ref>'', restore docker/.env and',
+        '                              configs/ssl/ from a snapshot so the new code reuses the same',
+        '                              POSTGRES_PASSWORD and root CA. See docs/upgrade-in-place.md.',
+        '',
         'Offline bundle preparation (online machine):',
         '  prepare [-SkipImages] [-SkipBuild] [-Llm]',
         '                              Download VSIX + TF providers, pull/save images,',
@@ -1437,9 +1732,11 @@ switch ($Command.ToLower()) {
     'shell'            { Invoke-Shell; break }
     'setup-coder'      { Invoke-SetupCoder; break }
     'push-template'    { Invoke-CmdPushTemplate; break }
-    'update-workspace' { Invoke-UpdateWorkspace -Tag $Tag; break }
-    'load-workspace'   { Invoke-LoadWorkspace -TarFile $Arg1; break }
-    'prepare'          { Invoke-Prepare; break }
+    'update-workspace'      { Invoke-UpdateWorkspace -Tag $Tag; break }
+    'load-workspace'        { Invoke-LoadWorkspace -TarFile $Arg1; break }
+    'upgrade-backup'        { Invoke-UpgradeBackup; break }
+    'upgrade-restore-config'{ Invoke-UpgradeRestoreConfig -SnapshotDir $Arg1; break }
+    'prepare'               { Invoke-Prepare; break }
     'verify'           { Invoke-Verify; break }
     'refresh-versions' { Invoke-RefreshVersions; break }
     'test-api'         { Invoke-TestApi; break }
