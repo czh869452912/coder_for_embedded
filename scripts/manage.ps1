@@ -806,6 +806,8 @@ function Invoke-PushTemplate {
     $workspaceImageTag  = if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
     $anthropicKey = if ($cfg['ANTHROPIC_API_KEY']) { $cfg['ANTHROPIC_API_KEY'] } else { '' }
     $anthropicUrl = if ($cfg['ANTHROPIC_BASE_URL']) { $cfg['ANTHROPIC_BASE_URL'] } else { '' }
+    $openaiKey = if ($cfg['OPENAI_API_KEY']) { $cfg['OPENAI_API_KEY'] } else { '' }
+    $openaiUrl = if ($cfg['OPENAI_BASE_URL']) { $cfg['OPENAI_BASE_URL'] } else { '' }
 
     if ($script:UseLlm) {
         if (-not $anthropicKey -and $cfg['LITELLM_MASTER_KEY']) {
@@ -813,6 +815,12 @@ function Invoke-PushTemplate {
         }
         if (-not $anthropicUrl) {
             $anthropicUrl = Get-LlmGatewayUrl -Config $cfg
+        }
+        if (-not $openaiKey -and $cfg['LITELLM_MASTER_KEY']) {
+            $openaiKey = $cfg['LITELLM_MASTER_KEY']
+        }
+        if (-not $openaiUrl) {
+            $openaiUrl = "$(Get-LlmGatewayUrl -Config $cfg)/v1"
         }
     }
 
@@ -827,7 +835,7 @@ function Invoke-PushTemplate {
     $serverHost  = if ($cfg['SERVER_HOST'])  { $cfg['SERVER_HOST'] }  else { 'localhost' }
     $gatewayPort = if ($cfg['GATEWAY_PORT']) { $cfg['GATEWAY_PORT'] } else { '8443' }
     $skillHubEnabled = if ($script:UseSkillHub) { 'true' } else { 'false' }
-    $pushCmd = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$SessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' --var server_host='$serverHost' --var gateway_port='$gatewayPort' --var skillhub_enabled='$skillHubEnabled' ; rm -rf /tmp/template-push"
+    $pushCmd = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$SessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' --var openai_api_key='$openaiKey' --var openai_base_url='$openaiUrl' --var server_host='$serverHost' --var gateway_port='$gatewayPort' --var skillhub_enabled='$skillHubEnabled' ; rm -rf /tmp/template-push"
     docker exec coder-server sh -c $pushCmd
     if ($LASTEXITCODE -ne 0) {
         Write-Fail 'Template push failed.'

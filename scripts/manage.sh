@@ -746,6 +746,8 @@ _do_push_template() {
     local workspace_tag="${WORKSPACE_IMAGE_TAG:-latest}"
     local anthropic_key="${ANTHROPIC_API_KEY:-}"
     local anthropic_url="${ANTHROPIC_BASE_URL:-}"
+    local openai_key="${OPENAI_API_KEY:-}"
+    local openai_url="${OPENAI_BASE_URL:-}"
 
     if [ "$USE_LLM" = true ]; then
         if [ -z "$anthropic_key" ]; then
@@ -754,13 +756,19 @@ _do_push_template() {
         if [ -z "$anthropic_url" ]; then
             anthropic_url="$(llm_gateway_url)"
         fi
+        if [ -z "$openai_key" ]; then
+            openai_key="${LITELLM_MASTER_KEY:-}"
+        fi
+        if [ -z "$openai_url" ]; then
+            openai_url="$(llm_gateway_url)/v1"
+        fi
     fi
 
     info "Pushing workspace template (image=${workspace_image}:${workspace_tag})"
     docker exec coder-server sh -c 'rm -rf /tmp/template-push && mkdir -p /tmp/template-push' >/dev/null
     docker cp "$template_dir/." 'coder-server:/tmp/template-push/'
 
-    docker exec coder-server sh -c "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=${token} /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=${workspace_image} --var workspace_image_tag=${workspace_tag} --var anthropic_api_key='${anthropic_key}' --var anthropic_base_url='${anthropic_url}' --var server_host='${SERVER_HOST:-localhost}' --var gateway_port='${GATEWAY_PORT:-8443}' --var skillhub_enabled='${USE_SKILLHUB}' ; rm -rf /tmp/template-push"
+    docker exec coder-server sh -c "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=${token} /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=${workspace_image} --var workspace_image_tag=${workspace_tag} --var anthropic_api_key='${anthropic_key}' --var anthropic_base_url='${anthropic_url}' --var openai_api_key='${openai_key}' --var openai_base_url='${openai_url}' --var server_host='${SERVER_HOST:-localhost}' --var gateway_port='${GATEWAY_PORT:-8443}' --var skillhub_enabled='${USE_SKILLHUB}' ; rm -rf /tmp/template-push"
     ok "Workspace template pushed"
 }
 

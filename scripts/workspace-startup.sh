@@ -51,6 +51,24 @@ else
     echo "[startup] WARNING: claude CLI not found in PATH"
 fi
 
+if [ -n "${OPENAI_API_KEY:-}" ] || [ -n "${OPENAI_BASE_URL:-}" ]; then
+    echo "[startup] OpenAI-compatible config present: OPENAI_BASE_URL=${OPENAI_BASE_URL:-<default OpenAI>}"
+else
+    echo "[startup] INFO: OPENAI_* not configured; Codex and Kilo can be configured interactively."
+fi
+
+if command -v codex >/dev/null 2>&1; then
+    echo "[startup] codex CLI found at: $(which codex)"
+else
+    echo "[startup] WARNING: codex CLI not found in PATH"
+fi
+
+if command -v kilo >/dev/null 2>&1; then
+    echo "[startup] kilo CLI found at: $(which kilo)"
+else
+    echo "[startup] WARNING: kilo CLI not found in PATH"
+fi
+
 # ---- 2. 合并内置扩展 seed 到 extensions 目录 ----
 # seed 目录随镜像构建，volume 挂载不会覆盖它
 # -n (no-clobber) 保证不覆盖用户手动安装的同名扩展

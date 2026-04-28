@@ -1,6 +1,6 @@
 # Coder for Embedded Development
 
-A single-port Coder deployment for embedded software teams. The platform provides browser-based VS Code workspaces, a full embedded C/C++ toolchain, an optional LiteLLM gateway that adapts existing internal model infrastructure for Claude Code and other editor tools, optional LDAP authentication via Dex OIDC, GPU-accelerated document-to-Markdown conversion via MinerU, and Markdown-to-Word/PDF conversion via Pandoc.
+A single-port Coder deployment for embedded software teams. The platform provides browser-based VS Code workspaces, a full embedded C/C++ toolchain, preinstalled Claude Code / Codex / Kilo Code tooling, an optional LiteLLM gateway that adapts existing internal model infrastructure for editor agents, optional LDAP authentication via Dex OIDC, GPU-accelerated document-to-Markdown conversion via MinerU, and Markdown-to-Word/PDF conversion via Pandoc.
 
 ## What This Repository Guarantees
 
@@ -21,6 +21,26 @@ That means:
 - The Coder platform itself can run fully inside an offline intranet.
 - AI features still depend on an internal model API that LiteLLM can reach.
 - If no internal model backend exists, Coder, workspaces, terminal, and code-server still work; only AI features are unavailable.
+
+## Workspace AI Tools
+
+The workspace image preinstalls:
+
+- Claude Code CLI plus the Claude Code code-server extension seed
+- OpenAI Codex CLI (`@openai/codex`) plus the official `openai.chatgpt` extension seed when available
+- Kilo Code CLI (`@kilocode/cli`) plus the `kilocode.kilo-code` extension seed when available
+- Cline, Roo Code, opencode, and embedded/C++ helper extensions already provided by the image
+
+For LiteLLM-backed deployments, set both Anthropic-compatible and OpenAI-compatible variables in `docker/.env` before pushing the template:
+
+```env
+ANTHROPIC_API_KEY=sk-devenv
+ANTHROPIC_BASE_URL=http://llm-gateway:4000
+OPENAI_API_KEY=sk-devenv
+OPENAI_BASE_URL=http://llm-gateway:4000/v1
+```
+
+The OpenAI-compatible settings are passed into workspaces for Codex CLI, Kilo Code, and other OpenAI-format tools. Codex currently relies on OpenAI-compatible `/v1` endpoints; confirm your LiteLLM version and internal backend support the model/API surface you expose.
 
 ## Architecture
 
@@ -199,6 +219,7 @@ Optional flags:
 - `-Llm` / `--llm` also saves the LiteLLM image
 - `-Mineru` / `--mineru` also saves the MinerU image (large: ~20 GB compressed)
 - `-Doctools` / `--doctools` also saves the Pandoc image (~2 GB compressed)
+- `-SkillHub` / `--skillhub` also saves Gitea and PyPI mirror images and enables the internal skill/command hub
 
 ### Step 2: Transfer to the Offline Server
 
@@ -604,6 +625,18 @@ The Coder login page will show a "Sign in with 企业 LDAP" button alongside the
 > # Windows: .\scripts\manage.ps1 prepare -Ldap
 > ```
 
+## Skill Hub Direction
+
+The current Skill Hub profile runs Gitea for mirrored command/skill repositories and pypiserver for offline Python packages. Workspaces sync Claude Code slash commands from `http://gitea:3000/admin/commands` into `~/.claude/commands`.
+
+For Codex and Kilo Code, a better next step is to treat Skill Hub as a tool-neutral catalog rather than only a Claude commands repo. Keep Gitea as the authoring/mirroring backend, but generate a small catalog during `skillhub-refresh` and materialize tool-specific outputs at workspace startup:
+
+- Claude Code: slash commands into `~/.claude/commands`
+- Codex: Agent Skills into `.agents/skills` for repo/user scopes or `/etc/codex/skills` for container-wide admin defaults
+- Kilo Code: Agent Skills or Kilo marketplace entries into the workspace/user Kilo skills path
+
+That keeps the existing offline Git workflow while allowing one curated skill source to serve multiple agent tools.
+
 ## Common Commands
 
 ### Windows
@@ -612,12 +645,12 @@ The Coder login page will show a "Sign in with 企业 LDAP" button alongside the
 # Platform lifecycle
 .\scripts\manage.ps1 init
 .\scripts\manage.ps1 ssl [host]
-.\scripts\manage.ps1 pull [-Llm] [-Ldap] [-Mineru] [-Doctools]
+.\scripts\manage.ps1 pull [-Llm] [-Ldap] [-Mineru] [-Doctools] [-SkillHub]
 .\scripts\manage.ps1 build
-.\scripts\manage.ps1 save [-Llm] [-Ldap] [-Mineru] [-Doctools]
+.\scripts\manage.ps1 save [-Llm] [-Ldap] [-Mineru] [-Doctools] [-SkillHub]
 .\scripts\manage.ps1 load
-.\scripts\manage.ps1 up [-Llm] [-Ldap] [-Mineru] [-Doctools]
-.\scripts\manage.ps1 down [-Llm] [-Ldap] [-Mineru] [-Doctools]
+.\scripts\manage.ps1 up [-Llm] [-Ldap] [-Mineru] [-Doctools] [-SkillHub]
+.\scripts\manage.ps1 down [-Llm] [-Ldap] [-Mineru] [-Doctools] [-SkillHub]
 .\scripts\manage.ps1 status
 .\scripts\manage.ps1 logs [service]
 .\scripts\manage.ps1 shell <service>
@@ -644,7 +677,7 @@ The Coder login page will show a "Sign in with 企业 LDAP" button alongside the
 
 ```bash
 # Platform lifecycle
-bash scripts/manage.sh <command> [--llm] [--ldap] [--mineru] [--doctools]
+bash scripts/manage.sh <command> [--llm] [--ldap] [--mineru] [--doctools] [--skillhub]
 
 # Workspace image versioning
 bash scripts/manage.sh update-workspace [--tag v20240324]

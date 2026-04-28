@@ -148,9 +148,33 @@ function Test-ManageBashAndDocsStaticContracts {
     Assert-True 'docs clarify restore-config does not restore volumes' ($docs -match 'does not restore Docker volumes')
 }
 
+function Test-WorkspaceAiToolingStaticContracts {
+    $dockerfile = Get-Content (Join-Path $RepoRoot 'docker/Dockerfile.workspace') -Raw
+    $startup = Get-Content (Join-Path $RepoRoot 'scripts/workspace-startup.sh') -Raw
+    $manageSh = Get-Content (Join-Path $RepoRoot 'scripts/manage.sh') -Raw
+    $managePs1 = Get-Content (Join-Path $RepoRoot 'scripts/manage.ps1') -Raw
+    $template = Get-Content (Join-Path $RepoRoot 'workspace-template/main.tf') -Raw
+    $envExample = Get-Content (Join-Path $RepoRoot '.env.example') -Raw
+    $vsixReadme = Get-Content (Join-Path $RepoRoot 'configs/vsix/README.md') -Raw
+
+    Assert-True 'workspace image installs Codex CLI' ($dockerfile -match '@openai/codex')
+    Assert-True 'workspace image installs Kilo Code CLI' ($dockerfile -match '@kilocode/cli')
+    Assert-True 'workspace image seeds OpenAI Codex extension' ($dockerfile -match 'openai\.chatgpt')
+    Assert-True 'workspace image seeds Kilo Code extension' ($dockerfile -match 'kilocode\.kilo-code')
+    Assert-True 'workspace startup verifies codex CLI' ($startup -match 'command -v codex')
+    Assert-True 'workspace startup verifies kilo CLI' ($startup -match 'command -v kilo')
+    Assert-True 'workspace template exposes OpenAI API key' ($template -match 'OPENAI_API_KEY\s*=\s*var\.openai_api_key')
+    Assert-True 'workspace template exposes OpenAI base URL' ($template -match 'OPENAI_BASE_URL\s*=\s*var\.openai_base_url')
+    Assert-True 'manage.sh passes OpenAI vars into template push' ($manageSh.Contains("--var openai_api_key='`${openai_key}'") -and $manageSh.Contains("--var openai_base_url='`${openai_url}'"))
+    Assert-True 'manage.ps1 passes OpenAI vars into template push' ($managePs1.Contains("--var openai_api_key='`$openaiKey'") -and $managePs1.Contains("--var openai_base_url='`$openaiUrl'"))
+    Assert-True '.env.example documents OpenAI-compatible config for Codex/Kilo' ($envExample -match 'OPENAI_BASE_URL' -and $envExample -match 'Codex / Kilo')
+    Assert-True 'VSIX README documents Codex and Kilo offline extension fallbacks' ($vsixReadme -match 'openai\.chatgpt' -and $vsixReadme -match 'kilocode\.kilo-code')
+}
+
 Test-PowerShellEffectiveConfig
 Test-BashEffectiveConfig
 Test-ManagePowerShellStaticContracts
 Test-ManageBashAndDocsStaticContracts
+Test-WorkspaceAiToolingStaticContracts
 
 Write-Host 'upgrade script regression tests passed'
