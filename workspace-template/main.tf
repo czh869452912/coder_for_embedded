@@ -192,6 +192,7 @@ resource "coder_app" "code_server" {
 # 需要 manage.sh up --mineru 启用，否则链接返回 502
 # ============================================================
 resource "coder_app" "mineru" {
+  count        = var.mineru_enabled == "true" ? 1 : 0
   agent_id     = coder_agent.main.id
   slug         = "mineru"
   display_name = "MinerU 文档转 Markdown"
@@ -205,6 +206,7 @@ resource "coder_app" "mineru" {
 # 需要 manage.sh up --doctools 启用，否则链接返回 502
 # ============================================================
 resource "coder_app" "docconv" {
+  count        = var.doctools_enabled == "true" ? 1 : 0
   agent_id     = coder_agent.main.id
   slug         = "docconv"
   display_name = "Pandoc Markdown→Word"
@@ -218,6 +220,7 @@ resource "coder_app" "docconv" {
 # 需要 manage.sh up --skillhub 启用，否则链接返回 502
 # ============================================================
 resource "coder_app" "skill_hub" {
+  count        = var.skillhub_enabled == "true" ? 1 : 0
   agent_id     = coder_agent.main.id
   slug         = "skill-hub"
   display_name = "Gitea (Skills)"
@@ -364,6 +367,16 @@ variable "server_host" {
 variable "gateway_port" {
   description = "HTTPS 网关端口（与 docker/.env GATEWAY_PORT 一致）"
   default     = "8443"
+}
+
+variable "mineru_enabled" {
+  description = "是否启用 MinerU 文档转 Markdown 服务（manage.sh up --mineru 时设为 true）"
+  default     = "false"
+}
+
+variable "doctools_enabled" {
+  description = "是否启用 Pandoc Markdown→Word/PDF 服务（manage.sh up --doctools 时设为 true）"
+  default     = "false"
 }
 
 variable "skillhub_enabled" {

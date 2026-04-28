@@ -49,12 +49,12 @@ fail() { echo -e "${RED}[FAIL]${NC} $*" >&2; exit 1; }
 
 usage() {
     cat <<'EOF'
-Usage: bash scripts/manage.sh <command> [args] [--llm] [--ldap] [--skillhub]
+Usage: bash scripts/manage.sh <command> [args] [--llm] [--ldap] [--mineru] [--doctools] [--skillhub]
 
 Online preparation commands:
   refresh-versions [--apply]
                         Check upstream image/provider versions; --apply writes lock file
-  prepare [--llm] [--skillhub] [--skip-images] [--skip-build]
+  prepare [--llm] [--ldap] [--mineru] [--doctools] [--skillhub] [--skip-images] [--skip-build]
                         Download VSIX + TF providers, pull/save platform images,
                         build/save workspace image, write offline-manifest.json
   verify [--require-llm]
@@ -115,15 +115,16 @@ Typical online preparation workflow:
   manage.sh init
   manage.sh ssl <offline-server-ip>
   manage.sh refresh-versions [--apply]   # optional: update to latest upstream
-  manage.sh prepare [--llm]
+  manage.sh prepare [--llm] [--ldap] [--mineru] [--doctools] [--skillhub]
   manage.sh verify [--require-llm]
   # transfer entire project directory to offline server
 
 Typical offline deployment workflow:
   manage.sh init
   manage.sh ssl <this-server-ip>
-  manage.sh load [--llm] [--ldap]
-  manage.sh up [--llm] [--ldap]          # auto-runs setup-coder on first start
+  manage.sh load
+  manage.sh up [--llm] [--ldap] [--mineru] [--doctools] [--skillhub]
+                        # auto-runs setup-coder on first start
 
 Workspace image update workflow (online -> offline):
   manage.sh update-workspace --tag v20240324   # on online machine
@@ -175,6 +176,50 @@ load_config() {
 workspace_image_ref() {
     load_config
     echo "${WORKSPACE_IMAGE:-workspace-embedded}:${WORKSPACE_IMAGE_TAG:-latest}"
+}
+
+image_archive_name() {
+    printf '%s.tar\n' "$(printf '%s' "$1" | tr '/:@' '_')"
+}
+
+_selected_image_refs() {
+    local include_workspace=false include_code_server_base=false
+    for arg in "$@"; do
+        case "$arg" in
+            --include-workspace) include_workspace=true ;;
+            --include-code-server-base) include_code_server_base=true ;;
+        esac
+    done
+
+    [ -n "${CODER_IMAGE_REF:-}" ] && printf '%s\n' "$CODER_IMAGE_REF"
+    [ -n "${POSTGRES_IMAGE_REF:-}" ] && printf '%s\n' "$POSTGRES_IMAGE_REF"
+    [ -n "${NGINX_IMAGE_REF:-}" ] && printf '%s\n' "$NGINX_IMAGE_REF"
+    if [ "$include_code_server_base" = true ] && [ -n "${CODE_SERVER_BASE_IMAGE_REF:-}" ]; then
+        printf '%s\n' "$CODE_SERVER_BASE_IMAGE_REF"
+    fi
+    if [ "$include_workspace" = true ]; then
+        printf '%s\n' "${WORKSPACE_IMAGE:-workspace-embedded}:${WORKSPACE_IMAGE_TAG:-latest}"
+    fi
+    [ "$USE_LLM" = true ] && [ -n "${LITELLM_IMAGE_REF:-}" ] && printf '%s\n' "$LITELLM_IMAGE_REF"
+    [ "$USE_LDAP" = true ] && [ -n "${DEX_IMAGE_REF:-}" ] && printf '%s\n' "$DEX_IMAGE_REF"
+    [ "$USE_MINERU" = true ] && [ -n "${MINERU_IMAGE_REF:-}" ] && printf '%s\n' "$MINERU_IMAGE_REF"
+    [ "$USE_DOCTOOLS" = true ] && [ -n "${DOCCONV_IMAGE_REF:-}" ] && printf '%s\n' "$DOCCONV_IMAGE_REF"
+    if [ "$USE_SKILLHUB" = true ]; then
+        printf '%s\n' "${GITEA_IMAGE_REF:-gitea/gitea:latest}"
+        printf '%s\n' "${PYPISERVER_IMAGE_REF:-pypiserver/pypiserver:latest}"
+    fi
+}
+
+_image_name_tag_for_ref() {
+    local image="$1" ref_key ref tag_key tag
+    for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF GITEA_IMAGE_REF PYPISERVER_IMAGE_REF; do
+        ref="${!ref_key:-}"
+        [ "$ref" = "$image" ] || continue
+        tag_key="${ref_key/_REF/_TAG}"
+        tag="${!tag_key:-}"
+        [ -n "$tag" ] && printf '%s:%s\n' "${ref%%@sha256:*}" "$tag"
+        return 0
+    done
 }
 
 llm_gateway_url() {
@@ -312,28 +357,8 @@ pull_images() {
     check_deps
     load_config
 
-    local images=(
-        "$CODER_IMAGE_REF"
-        "$POSTGRES_IMAGE_REF"
-        "$NGINX_IMAGE_REF"
-        "$CODE_SERVER_BASE_IMAGE_REF"
-    )
-    if [ "$USE_LLM" = true ]; then
-        images+=("$LITELLM_IMAGE_REF")
-    fi
-    if [ "$USE_LDAP" = true ]; then
-        images+=("$DEX_IMAGE_REF")
-    fi
-    if [ "$USE_MINERU" = true ]; then
-        images+=("$MINERU_IMAGE_REF")
-    fi
-    if [ "$USE_DOCTOOLS" = true ]; then
-        images+=("$DOCCONV_IMAGE_REF")
-    fi
-    if [ "$USE_SKILLHUB" = true ]; then
-        images+=("${GITEA_IMAGE_REF:-gitea/gitea:latest}")
-        images+=("${PYPISERVER_IMAGE_REF:-pypiserver/pypiserver:latest}")
-    fi
+    local images=()
+    mapfile -t images < <(_selected_image_refs --include-code-server-base)
 
     local image
     for image in "${images[@]}"; do
@@ -374,28 +399,8 @@ save_images() {
     load_config
     mkdir -p "$PROJECT_ROOT/images"
 
-    local images=(
-        "$CODER_IMAGE_REF"
-        "$POSTGRES_IMAGE_REF"
-        "$NGINX_IMAGE_REF"
-        "${WORKSPACE_IMAGE:-workspace-embedded}:${WORKSPACE_IMAGE_TAG:-latest}"
-    )
-    if [ "$USE_LLM" = true ]; then
-        images+=("$LITELLM_IMAGE_REF")
-    fi
-    if [ "$USE_LDAP" = true ]; then
-        images+=("$DEX_IMAGE_REF")
-    fi
-    if [ "$USE_MINERU" = true ]; then
-        images+=("$MINERU_IMAGE_REF")
-    fi
-    if [ "$USE_DOCTOOLS" = true ]; then
-        images+=("$DOCCONV_IMAGE_REF")
-    fi
-    if [ "$USE_SKILLHUB" = true ]; then
-        images+=("${GITEA_IMAGE_REF:-gitea/gitea:latest}")
-        images+=("${PYPISERVER_IMAGE_REF:-pypiserver/pypiserver:latest}")
-    fi
+    local images=()
+    mapfile -t images < <(_selected_image_refs --include-workspace)
 
     # If the digest ref is no longer in the local cache (e.g. after pulling a newer tag via
     # refresh-versions without --apply), fall back to name:tag so the save can still succeed.
@@ -442,37 +447,73 @@ load_images() {
     check_deps
     load_config
     [ -d "$PROJECT_ROOT/images" ] || fail "images directory not found"
-    shopt -s nullglob
-    local tar_files=("$PROJECT_ROOT/images"/*.tar)
-    shopt -u nullglob
-    [ ${#tar_files[@]} -gt 0 ] || fail "No image tarballs found in images"
+
+    local -A manifest_archives=()
+    if [ -f "$MANIFEST_PATH" ] && command -v python3 >/dev/null 2>&1; then
+        while IFS=$'\t' read -r ref archive; do
+            [ -n "$ref" ] || continue
+            manifest_archives["$ref"]="$archive"
+        done < <(python3 - "$MANIFEST_PATH" <<'PY'
+import json,sys
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as fh:
+        manifest = json.load(fh)
+except Exception:
+    manifest = {}
+for image in manifest.get('images', []):
+    ref = image.get('ref', '')
+    archive = image.get('archive', '')
+    if ref and archive:
+        print(f"{ref}\t{archive}")
+PY
+)
+    fi
 
     # When an image is saved by digest ref (e.g. ghcr.io/coder/coder@sha256:...), the tar has
     # no RepoTag and docker load reports "Loaded image ID: sha256:..." with no usable name.
     # Retagging to name:tag lets docker compose find the image without hitting the registry.
-    local tar_file base load_output image_id
-    for tar_file in "${tar_files[@]}"; do
-        base="$(basename "$tar_file")"
+    local selected_refs=()
+    mapfile -t selected_refs < <(_selected_image_refs --include-workspace)
+
+    local -a selected_tars=() missing_archives=()
+    local -A retag_by_file=()
+    local image archive path target_tag
+    for image in "${selected_refs[@]}"; do
+        archive="${manifest_archives[$image]:-images/$(image_archive_name "$image")}"
+        if [[ "$archive" = /* ]]; then
+            path="$archive"
+        else
+            path="$PROJECT_ROOT/$archive"
+        fi
+        if [ ! -f "$path" ]; then
+            missing_archives+=("$image ($archive)")
+            continue
+        fi
+        selected_tars+=("$path")
+        if [[ "$image" == *@sha256:* ]]; then
+            target_tag="$(_image_name_tag_for_ref "$image")"
+            [ -n "$target_tag" ] && retag_by_file["$(basename "$path")"]="$target_tag"
+        fi
+    done
+
+    if [ ${#missing_archives[@]} -gt 0 ]; then
+        fail "The selected image archives were not found. Re-run prepare/save with matching optional service flags:$(printf '\n  - %s' "${missing_archives[@]}")"
+    fi
+    [ ${#selected_tars[@]} -gt 0 ] || fail "No selected image tarballs found in images"
+
+    local selected_tar base load_output image_id
+    for selected_tar in "${selected_tars[@]}"; do
+        base="$(basename "$selected_tar")"
         info "Loading $base"
-        load_output="$(docker load -i "$tar_file" 2>&1)"
+        load_output="$(docker load -i "$selected_tar" 2>&1)"
         echo "$load_output"
 
         # If loaded without a repo tag, retag with name:tag so compose can resolve it offline
         image_id="$(echo "$load_output" | awk '/Loaded image ID:/{print $NF}')"
-        if [ -n "$image_id" ]; then
-            local ref_key ref fn tag_key tag
-            for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF GITEA_IMAGE_REF PYPISERVER_IMAGE_REF; do
-                ref="${!ref_key:-}"
-                [[ "$ref" == *@sha256:* ]] || continue
-                fn="$(printf '%s' "$ref" | tr '/:@' '_').tar"
-                [ "$fn" = "$base" ] || continue
-                tag_key="${ref_key/_REF/_TAG}"
-                tag="${!tag_key:-}"
-                [ -n "$tag" ] || continue
-                info "Tagging $image_id -> ${ref%%@sha256:*}:${tag}"
-                docker tag "$image_id" "${ref%%@sha256:*}:${tag}"
-                break
-            done
+        target_tag="${retag_by_file[$base]:-}"
+        if [ -n "$image_id" ] && [ -n "$target_tag" ]; then
+            info "Tagging $image_id -> $target_tag"
+            docker tag "$image_id" "$target_tag"
         fi
     done
 
@@ -551,17 +592,24 @@ start_services() {
     # In offline/loaded mode Docker cannot resolve digest refs against the registry.
     # Override image ref env vars to use name:tag format before invoking compose,
     # so compose resolves against the locally loaded (and retagged) images.
-    local ref_key ref tag_key tag
     local -a required_images=()
-    for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF GITEA_IMAGE_REF PYPISERVER_IMAGE_REF; do
-        ref="${!ref_key:-}"
-        [ -n "$ref" ] || continue
+    local selected_refs=()
+    mapfile -t selected_refs < <(_selected_image_refs)
+    local ref ref_key tag_key tag
+    for ref in "${selected_refs[@]}"; do
         if [[ "$ref" == *@sha256:* ]]; then
-            tag_key="${ref_key/_REF/_TAG}"
-            tag="${!tag_key:-}"
-            [ -n "$tag" ] || continue
-            export "$ref_key"="${ref%%@sha256:*}:${tag}"
-            required_images+=("${ref%%@sha256:*}:${tag}")
+            local added=false
+            for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF GITEA_IMAGE_REF PYPISERVER_IMAGE_REF; do
+                [ "${!ref_key:-}" = "$ref" ] || continue
+                tag_key="${ref_key/_REF/_TAG}"
+                tag="${!tag_key:-}"
+                [ -n "$tag" ] || continue
+                export "$ref_key"="${ref%%@sha256:*}:${tag}"
+                required_images+=("${ref%%@sha256:*}:${tag}")
+                added=true
+                break
+            done
+            [ "$added" = true ] || required_images+=("$ref")
         else
             required_images+=("$ref")
         fi
@@ -570,12 +618,6 @@ start_services() {
     # Pre-flight: verify every required image exists locally so compose never falls back to a pull
     local missing_images=()
     for img in "${required_images[@]}"; do
-        [ "$USE_LLM"      = false ] && [[ "$img" == *litellm*     ]] && continue
-        [ "$USE_LDAP"     = false ] && [[ "$img" == *dexidp*      ]] && continue
-        [ "$USE_MINERU"   = false ] && [[ "$img" == *mineru*      ]] && continue
-        [ "$USE_DOCTOOLS" = false ] && [[ "$img" == *pandoc*      ]] && continue
-        [ "$USE_SKILLHUB" = false ] && [[ "$img" == *gitea*       ]] && continue
-        [ "$USE_SKILLHUB" = false ] && [[ "$img" == *pypiserver*  ]] && continue
         if ! docker image inspect "$img" >/dev/null 2>&1; then
             missing_images+=("$img")
         fi
@@ -768,7 +810,7 @@ _do_push_template() {
     docker exec coder-server sh -c 'rm -rf /tmp/template-push && mkdir -p /tmp/template-push' >/dev/null
     docker cp "$template_dir/." 'coder-server:/tmp/template-push/'
 
-    docker exec coder-server sh -c "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=${token} /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=${workspace_image} --var workspace_image_tag=${workspace_tag} --var anthropic_api_key='${anthropic_key}' --var anthropic_base_url='${anthropic_url}' --var openai_api_key='${openai_key}' --var openai_base_url='${openai_url}' --var server_host='${SERVER_HOST:-localhost}' --var gateway_port='${GATEWAY_PORT:-8443}' --var skillhub_enabled='${USE_SKILLHUB}' ; rm -rf /tmp/template-push"
+    docker exec coder-server sh -c "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=${token} /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=${workspace_image} --var workspace_image_tag=${workspace_tag} --var anthropic_api_key='${anthropic_key}' --var anthropic_base_url='${anthropic_url}' --var openai_api_key='${openai_key}' --var openai_base_url='${openai_url}' --var server_host='${SERVER_HOST:-localhost}' --var gateway_port='${GATEWAY_PORT:-8443}' --var mineru_enabled='${USE_MINERU}' --var doctools_enabled='${USE_DOCTOOLS}' --var skillhub_enabled='${USE_SKILLHUB}' ; rm -rf /tmp/template-push"
     ok "Workspace template pushed"
 }
 
@@ -1122,8 +1164,8 @@ EOF
     echo -e "  2) ${BLUE}bash scripts/manage.sh down${NC}        # stop the old platform (NEVER pass -v)"
     echo -e "  3) ${BLUE}git fetch && git checkout <new-ref>${NC}"
     echo -e "  4) ${BLUE}bash scripts/manage.sh upgrade-restore-config $dest${NC}"
-    echo -e "  5) ${BLUE}bash scripts/manage.sh load${NC}        # plus any --ldap/--skillhub flags you want to enable"
-    echo -e "  6) ${BLUE}bash scripts/manage.sh up${NC} [--ldap --skillhub …]  # postgres schema migrates forward, users keep their accounts"
+    echo -e "  5) ${BLUE}bash scripts/manage.sh load${NC}        # add the same optional flags you will enable on up"
+    echo -e "  6) ${BLUE}bash scripts/manage.sh up${NC} [--ldap --mineru --doctools --skillhub …]  # postgres schema migrates forward, users keep their accounts"
     echo -e "  7) ${BLUE}bash scripts/manage.sh update-workspace --tag v\$(date +%Y%m%d)${NC}   # bake new tools into a tagged image"
 }
 
@@ -1251,8 +1293,8 @@ upgrade_restore_config() {
     echo
     info "Next steps:"
     echo -e "  1) Sanity-check ${BLUE}docker/.env${NC} and ${BLUE}configs/versions.lock.env${NC}"
-    echo -e "  2) ${BLUE}bash scripts/manage.sh load${NC} [--ldap --skillhub …]"
-    echo -e "  3) ${BLUE}bash scripts/manage.sh up${NC} [--ldap --skillhub …]  # new coder migrates the DB schema in-place"
+    echo -e "  2) ${BLUE}bash scripts/manage.sh load${NC}        # add optional flags only for services you will enable"
+    echo -e "  3) ${BLUE}bash scripts/manage.sh up${NC} [--ldap --mineru --doctools --skillhub …]  # new coder migrates the DB schema in-place"
     echo -e "  4) Verify a real user can log in, then build a tagged workspace image:"
     echo -e "     ${BLUE}bash scripts/manage.sh update-workspace --tag v\$(date +%Y%m%d)${NC}"
     echo -e "  5) Have users restart their workspaces in the UI to pick up the new image"
@@ -1361,30 +1403,14 @@ _prepare_save_platform_images() {
     load_config
     mkdir -p "$IMAGES_DIR"
 
-    local images=(
-        "$CODER_IMAGE_REF"
-        "$POSTGRES_IMAGE_REF"
-        "$NGINX_IMAGE_REF"
-    )
-    if [ "$USE_LLM" = true ]; then
-        images+=("$LITELLM_IMAGE_REF")
-    fi
-    if [ "$USE_MINERU" = true ]; then
-        images+=("$MINERU_IMAGE_REF")
-    fi
-    if [ "$USE_DOCTOOLS" = true ]; then
-        images+=("$DOCCONV_IMAGE_REF")
-    fi
-    if [ "$USE_SKILLHUB" = true ]; then
-        images+=("${GITEA_IMAGE_REF:-gitea/gitea:latest}")
-        images+=("${PYPISERVER_IMAGE_REF:-pypiserver/pypiserver:latest}")
-    fi
+    local images=()
+    mapfile -t images < <(_selected_image_refs)
 
     local image filename filepath
     for image in "${images[@]}"; do
         info "Pulling $image"
         docker pull "$image"
-        filename="$(printf '%s' "$image" | tr '/:@' '_').tar"
+        filename="$(image_archive_name "$image")"
         filepath="$IMAGES_DIR/$filename"
         info "Saving $image -> $filename"
         docker save -o "$filepath" "$image"
@@ -1447,6 +1473,12 @@ PY
         litellm_tar="$(printf '%s' "$LITELLM_IMAGE_REF" | tr '/:@' '_').tar"
         llm_entry=",\n    {\"ref\": \"${LITELLM_IMAGE_REF}\", \"archive\": \"images/${litellm_tar}\"}"
     fi
+    local dex_entry=''
+    if [ "$USE_LDAP" = true ]; then
+        local dex_tar
+        dex_tar="$(printf '%s' "$DEX_IMAGE_REF" | tr '/:@' '_').tar"
+        dex_entry=",\n    {\"ref\": \"${DEX_IMAGE_REF}\", \"archive\": \"images/${dex_tar}\"}"
+    fi
     local mineru_entry=''
     if [ "$USE_MINERU" = true ]; then
         local mineru_tar
@@ -1478,6 +1510,7 @@ print(datetime.now(timezone.utc).isoformat())
 PY
 )",
   "include_llm": ${USE_LLM,,},
+  "include_ldap": ${USE_LDAP,,},
   "include_mineru": ${USE_MINERU,,},
   "include_doctools": ${USE_DOCTOOLS,,},
   "include_skillhub": ${USE_SKILLHUB,,},
@@ -1487,7 +1520,7 @@ PY
     {"ref": "${CODER_IMAGE_REF}", "archive": "images/${coder_tar}"},
     {"ref": "${POSTGRES_IMAGE_REF}", "archive": "images/${postgres_tar}"},
     {"ref": "${NGINX_IMAGE_REF}", "archive": "images/${nginx_tar}"},
-    {"ref": "${ws_image}:${ws_tag}", "archive": "images/${ws_tar}"}${llm_entry}${mineru_entry}${docconv_entry}${skillhub_entry}
+    {"ref": "${ws_image}:${ws_tag}", "archive": "images/${ws_tar}"}${llm_entry}${dex_entry}${mineru_entry}${docconv_entry}${skillhub_entry}
   ],
   "providers": [
     {"source": "registry.terraform.io/coder/coder", "version": "${TF_PROVIDER_CODER_VERSION}", "archive": "configs/provider-mirror/registry.terraform.io/coder/coder/${TF_PROVIDER_CODER_VERSION}/linux_amd64/terraform-provider-coder_${TF_PROVIDER_CODER_VERSION}_linux_amd64.zip"},
@@ -1679,6 +1712,7 @@ refresh_versions() {
     local OLD_POSTGRES_IMAGE_REF="$POSTGRES_IMAGE_REF"
     local OLD_NGINX_IMAGE_REF="$NGINX_IMAGE_REF"
     local OLD_LITELLM_IMAGE_REF="$LITELLM_IMAGE_REF"
+    local OLD_DEX_IMAGE_REF="${DEX_IMAGE_REF:-}"
     local OLD_CODE_SERVER_BASE_IMAGE_REF="$CODE_SERVER_BASE_IMAGE_REF"
     local OLD_TF_PROVIDER_CODER_VERSION="$TF_PROVIDER_CODER_VERSION"
     local OLD_TF_PROVIDER_DOCKER_VERSION="$TF_PROVIDER_DOCKER_VERSION"
@@ -1691,6 +1725,9 @@ refresh_versions() {
     POSTGRES_IMAGE_REF="$(_rv_resolve_digest "$(_rv_repository_from_ref "$POSTGRES_IMAGE_REF")" "$POSTGRES_IMAGE_TAG")"
     NGINX_IMAGE_REF="$(_rv_resolve_digest "$(_rv_repository_from_ref "$NGINX_IMAGE_REF")" "$NGINX_IMAGE_TAG")"
     LITELLM_IMAGE_REF="$(_rv_resolve_digest "$(_rv_repository_from_ref "$LITELLM_IMAGE_REF")" "$LITELLM_IMAGE_TAG")"
+    if [ -n "${DEX_IMAGE_REF:-}" ]; then
+        DEX_IMAGE_REF="$(_rv_resolve_digest "$(_rv_repository_from_ref "$DEX_IMAGE_REF")" "$DEX_IMAGE_TAG")"
+    fi
     CODE_SERVER_BASE_IMAGE_REF="$(_rv_resolve_digest "$(_rv_repository_from_ref "$CODE_SERVER_BASE_IMAGE_REF")" "$CODE_SERVER_BASE_IMAGE_TAG")"
     TF_PROVIDER_CODER_VERSION="$(_rv_latest_provider_version coder coder "$TF_PROVIDER_CODER_VERSION")"
     TF_PROVIDER_DOCKER_VERSION="$(_rv_latest_provider_version kreuzwerker docker "$TF_PROVIDER_DOCKER_VERSION")"
@@ -1710,6 +1747,7 @@ refresh_versions() {
 
     echo
     local _rv_keys=(CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF CODE_SERVER_BASE_IMAGE_REF TF_PROVIDER_CODER_VERSION TF_PROVIDER_DOCKER_VERSION)
+    [ -n "${DEX_IMAGE_REF:-}"        ] && _rv_keys+=(DEX_IMAGE_REF)
     [ -n "${MINERU_IMAGE_REF:-}"     ] && _rv_keys+=(MINERU_IMAGE_REF)
     [ -n "${DOCCONV_IMAGE_REF:-}"    ] && _rv_keys+=(DOCCONV_IMAGE_REF)
     [ -n "${GITEA_IMAGE_REF:-}"      ] && _rv_keys+=(GITEA_IMAGE_REF)
@@ -1899,7 +1937,7 @@ skillhub_refresh() {
     info "Syncing community skill repo mirrors..."
     local entry url dest
     for entry in "${_SKILLHUB_REPOS[@]}"; do
-        url="${entry%%:*}"
+        url="${entry%:*}"
         dest="$seeds_dir/${entry##*:}"
         if [ -d "$dest" ]; then
             info "Updating mirror: $(basename "$dest")"
@@ -1928,13 +1966,13 @@ setup_gitea() {
     info "Waiting for Gitea to become ready..."
     local attempt
     for attempt in $(seq 1 30); do
-        if curl -sf "${gitea_url}/-/ready" >/dev/null 2>&1; then
+        if docker exec coder-gitea curl -sf "${gitea_url}/-/ready" >/dev/null 2>&1; then
             ok "Gitea is ready"
             break
         fi
         sleep 3
     done
-    curl -sf "${gitea_url}/-/ready" >/dev/null 2>&1 \
+    docker exec coder-gitea curl -sf "${gitea_url}/-/ready" >/dev/null 2>&1 \
         || { warn "Gitea did not become ready in time — skipping initialization"; return 0; }
 
     # Create admin user (ignore error if already exists)
@@ -1950,7 +1988,7 @@ setup_gitea() {
     # Get admin token via API basic auth
     local token_name="manage-sh-$(date +%s)"
     local token_json
-    token_json="$(curl -sf -X POST "${gitea_url}/api/v1/users/admin/tokens" \
+    token_json="$(docker exec coder-gitea curl -sf -X POST "${gitea_url}/api/v1/users/admin/tokens" \
         -u "admin:${admin_pass}" \
         -H 'Content-Type: application/json' \
         -d "{\"name\":\"${token_name}\"}" 2>/dev/null || echo '')"
@@ -1973,11 +2011,11 @@ setup_gitea() {
         [ -d "$dest" ] || continue
         info "Importing seed repo: $repo_name"
         local http_code
-        http_code="$(curl -sf -o /dev/null -w '%{http_code}' \
+        http_code="$(docker exec coder-gitea curl -sf -o /dev/null -w '%{http_code}' \
             -X POST "${gitea_url}/api/v1/repos/migrate" \
             -H "Authorization: token ${token}" \
             -H 'Content-Type: application/json' \
-            -d "{\"clone_addr\":\"/repos-seed/${entry##*:}\",\"repo_name\":\"${repo_name}\",\"uid\":1,\"private\":false,\"description\":\"Mirrored from ${entry%%:*}\"}" \
+            -d "{\"clone_addr\":\"/repos-seed/${entry##*:}\",\"repo_name\":\"${repo_name}\",\"uid\":1,\"private\":false,\"description\":\"Mirrored from ${entry%:*}\"}" \
             2>/dev/null || echo '000')"
         if [ "$http_code" = "201" ]; then
             ok "Imported ${repo_name} into Gitea"

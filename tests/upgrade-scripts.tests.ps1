@@ -185,7 +185,7 @@ function Test-WorkspaceAiToolingStaticContracts {
     Assert-True 'workspace template gates docconv app' ($template -match 'variable "doctools_enabled"' -and $template -match 'resource "coder_app" "docconv"[\s\S]*count\s*=')
     Assert-True 'workspace template gates SkillHub app' ($template -match 'resource "coder_app" "skill_hub"[\s\S]*count\s*=')
     Assert-True 'manage.sh passes optional app flags into template push' ($manageSh -match "--var mineru_enabled='\$\{USE_MINERU\}'" -and $manageSh -match "--var doctools_enabled='\$\{USE_DOCTOOLS\}'")
-    Assert-True 'manage.ps1 passes optional app flags into template push' ($managePs1 -match "--var mineru_enabled='\$mineruEnabled'" -and $managePs1 -match "--var doctools_enabled='\$doctoolsEnabled'")
+    Assert-True 'manage.ps1 passes optional app flags into template push' ($managePs1.Contains("--var mineru_enabled='`$mineruEnabled'") -and $managePs1.Contains("--var doctools_enabled='`$doctoolsEnabled'"))
 }
 
 Test-PowerShellEffectiveConfig

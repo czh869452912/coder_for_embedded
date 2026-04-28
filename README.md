@@ -217,9 +217,12 @@ Skip flags: `-SkipImages` / `--skip-images` skips pulling runtime images; `-Skip
 Optional flags:
 
 - `-Llm` / `--llm` also saves the LiteLLM image
+- `-Ldap` / `--ldap` also saves the Dex OIDC image
 - `-Mineru` / `--mineru` also saves the MinerU image (large: ~20 GB compressed)
 - `-Doctools` / `--doctools` also saves the Pandoc image (~2 GB compressed)
 - `-SkillHub` / `--skillhub` also saves Gitea and PyPI mirror images and enables the internal skill/command hub
+
+Use the same optional service flags on `load` that you plan to use on `up`; `load` skips unselected optional services by design.
 
 ### Step 2: Transfer to the Offline Server
 
@@ -257,6 +260,8 @@ bash scripts/manage.sh up
 ```
 
 Notes:
+
+- For optional services, use matching flags during prepare/load/up, for example `prepare --ldap --skillhub`, `load --ldap --skillhub`, then `up --ldap --skillhub`.
 
 - `up` will auto-run first-time Coder initialization if `docker/.setup-done` does not exist.
 - If the offline target accidentally generates a new CA instead of reusing the transferred CA, rebuild the workspace image once.
@@ -668,9 +673,11 @@ That keeps the existing offline Git workflow while allowing one curated skill so
 .\scripts\manage.ps1 upgrade-restore-config <snapshot-dir> [-Force]
 
 # Offline bundle preparation (connected machine)
-.\scripts\manage.ps1 prepare [-SkipImages] [-SkipBuild] [-Llm] [-Mineru] [-Doctools]
+.\scripts\manage.ps1 prepare [-SkipImages] [-SkipBuild] [-Llm] [-Ldap] [-Mineru] [-Doctools] [-SkillHub]
 .\scripts\manage.ps1 verify [-RequireLlm]
 .\scripts\manage.ps1 refresh-versions [-Apply]
+.\scripts\manage.ps1 skillhub-prepare
+.\scripts\manage.ps1 skillhub-refresh
 ```
 
 ### Linux
@@ -688,9 +695,11 @@ bash scripts/manage.sh upgrade-backup [--dest <dir>] [--force]
 bash scripts/manage.sh upgrade-restore-config <snapshot-dir> [--force]
 
 # Offline bundle preparation (connected machine)
-bash scripts/manage.sh prepare [--skip-images] [--skip-build] [--llm] [--mineru] [--doctools]
+bash scripts/manage.sh prepare [--skip-images] [--skip-build] [--llm] [--ldap] [--mineru] [--doctools] [--skillhub]
 bash scripts/manage.sh verify [--require-llm]
 bash scripts/manage.sh refresh-versions [--apply]
+bash scripts/manage.sh skillhub-prepare
+bash scripts/manage.sh skillhub-refresh
 ```
 
 ## Key Files

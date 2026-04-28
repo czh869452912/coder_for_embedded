@@ -157,13 +157,13 @@ bash scripts/manage.sh upgrade-restore-config backups/snapshot-20240427-143052 -
 
 ### Step 4：加载新镜像
 
-新代码可能带有新的服务组件（Dex、MinerU、Gitea 等）。先加载所有基础镜像：
+新代码可能带有新的服务组件（Dex、MinerU、Gitea 等）。先加载基础镜像：
 
 ```bash
 bash scripts/manage.sh load
 ```
 
-如果你计划在新平台启用 `--ldap`、 `--skillhub`、 `--mineru` 等，也要在 `load` 时带上对应标志，确保这些镜像被加载：
+`load` 现在只加载基础镜像以及你显式选择的 selected optional service 镜像。也就是说：准备启用哪些可选服务，就在 `load` 和后面的 `up` 中使用同一组可选标志：
 
 ```bash
 bash scripts/manage.sh load --ldap --skillhub
@@ -351,6 +351,6 @@ bash scripts/manage.sh push-template
 | 拍快照 | `manage.sh upgrade-backup` | `manage.ps1 upgrade-backup` |
 | 还原配置 | `manage.sh upgrade-restore-config <dir>` | `manage.ps1 upgrade-restore-config <dir>` |
 | 停止平台 | `manage.sh down` | `manage.ps1 down` |
-| 加载镜像 | `manage.sh load [--ldap …]` | `manage.ps1 load [-Ldap …]` |
-| 启动平台 | `manage.sh up [--ldap …]` | `manage.ps1 up [-Ldap …]` |
+| 加载镜像 | `manage.sh load` / `manage.sh load --ldap --skillhub` | `manage.ps1 load` / `manage.ps1 load -Ldap -SkillHub` |
+| 启动平台 | `manage.sh up --ldap --skillhub` | `manage.ps1 up -Ldap -SkillHub` |
 | 构建新 workspace 镜像 | `manage.sh update-workspace --tag v20260427` | `manage.ps1 update-workspace -Tag v20260427` |

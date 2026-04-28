@@ -116,6 +116,68 @@ function Get-ImageRepositoryFromRef {
     return $withoutDigest
 }
 
+function Get-OptionalServiceDefinitions {
+    return @(
+        [ordered]@{ Key = 'llm';      Enabled = [bool]$script:UseLlm;      Profile = 'llm';      Images = @(@{ Ref = 'LITELLM_IMAGE_REF'; Tag = 'LITELLM_IMAGE_TAG'; Match = 'litellm' }) },
+        [ordered]@{ Key = 'ldap';     Enabled = [bool]$script:UseLdap;     Profile = 'ldap';     Images = @(@{ Ref = 'DEX_IMAGE_REF';     Tag = 'DEX_IMAGE_TAG';     Match = 'dexidp' }) },
+        [ordered]@{ Key = 'mineru';   Enabled = [bool]$script:UseMineru;   Profile = 'mineru';   Images = @(@{ Ref = 'MINERU_IMAGE_REF';  Tag = 'MINERU_IMAGE_TAG';  Match = 'mineru' }) },
+        [ordered]@{ Key = 'doctools'; Enabled = [bool]$script:UseDoctools; Profile = 'doctools'; Images = @(@{ Ref = 'DOCCONV_IMAGE_REF'; Tag = 'DOCCONV_IMAGE_TAG'; Match = 'pandoc' }) },
+        [ordered]@{ Key = 'skillhub'; Enabled = [bool]$script:UseSkillHub; Profile = 'skillhub'; Images = @(
+            @{ Ref = 'GITEA_IMAGE_REF';      Tag = 'GITEA_IMAGE_TAG';      Match = 'gitea';      Default = 'gitea/gitea:latest' },
+            @{ Ref = 'PYPISERVER_IMAGE_REF'; Tag = 'PYPISERVER_IMAGE_TAG'; Match = 'pypiserver'; Default = 'pypiserver/pypiserver:latest' }
+        ) }
+    )
+}
+
+function Get-ImageArchiveName {
+    param([string]$ImageRef)
+    return ($ImageRef -replace '[:/@]', '_') + '.tar'
+}
+
+function Get-SelectedImageSpecs {
+    param(
+        [hashtable]$Config,
+        [switch]$IncludeWorkspace,
+        [switch]$IncludeCodeServerBase
+    )
+    $specs = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in @(
+        @{ Ref = 'CODER_IMAGE_REF';    Tag = 'CODER_IMAGE_TAG';    Required = $true },
+        @{ Ref = 'POSTGRES_IMAGE_REF'; Tag = 'POSTGRES_IMAGE_TAG'; Required = $true },
+        @{ Ref = 'NGINX_IMAGE_REF';    Tag = 'NGINX_IMAGE_TAG';    Required = $true }
+    )) {
+        if ($Config[$entry.Ref]) { $specs.Add($entry) }
+    }
+    if ($IncludeCodeServerBase -and $Config['CODE_SERVER_BASE_IMAGE_REF']) {
+        $specs.Add(@{ Ref = 'CODE_SERVER_BASE_IMAGE_REF'; Tag = 'CODE_SERVER_BASE_IMAGE_TAG'; Required = $true })
+    }
+    if ($IncludeWorkspace) {
+        $workspaceImage = if ($Config['WORKSPACE_IMAGE']) { $Config['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
+        $workspaceTag = if ($Config['WORKSPACE_IMAGE_TAG']) { $Config['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
+        $specs.Add(@{ LiteralRef = "${workspaceImage}:${workspaceTag}"; Required = $true })
+    }
+    foreach ($svc in Get-OptionalServiceDefinitions) {
+        if (-not $svc.Enabled) { continue }
+        foreach ($img in $svc.Images) {
+            $ref = if ($Config[$img.Ref]) { $Config[$img.Ref] } else { $img.Default }
+            if ($ref) {
+                $specs.Add(@{ Ref = $img.Ref; Tag = $img.Tag; LiteralRef = $ref; OptionalService = $svc.Key; Match = $img.Match })
+            }
+        }
+    }
+    return $specs
+}
+
+function Get-ImageRefFromSpec {
+    param(
+        [hashtable]$Config,
+        [object]$Spec
+    )
+    if ($Spec.LiteralRef) { return $Spec.LiteralRef }
+    if ($Spec.Ref) { return $Config[$Spec.Ref] }
+    return ''
+}
+
 function Set-ProcessEnvFromConfig {
     param([hashtable]$Config)
     foreach ($entry in $Config.GetEnumerator()) {
@@ -290,19 +352,10 @@ function Invoke-Pull {
     Assert-Docker
     $cfg = Get-Config
 
-    $images = [System.Collections.Generic.List[string]]@(
-        $cfg['CODER_IMAGE_REF'],
-        $cfg['POSTGRES_IMAGE_REF'],
-        $cfg['NGINX_IMAGE_REF'],
-        $cfg['CODE_SERVER_BASE_IMAGE_REF']
-    )
-    if ($script:UseLlm)      { $images.Add($cfg['LITELLM_IMAGE_REF']) }
-    if ($script:UseLdap)     { $images.Add($cfg['DEX_IMAGE_REF']) }
-    if ($script:UseMineru)   { $images.Add($cfg['MINERU_IMAGE_REF']) }
-    if ($script:UseDoctools) { $images.Add($cfg['DOCCONV_IMAGE_REF']) }
-    if ($script:UseSkillHub) {
-        $images.Add((Get-ConfigValueOrDefault -Config $cfg -Key 'GITEA_IMAGE_REF' -Default 'gitea/gitea:latest'))
-        $images.Add((Get-ConfigValueOrDefault -Config $cfg -Key 'PYPISERVER_IMAGE_REF' -Default 'pypiserver/pypiserver:latest'))
+    $images = [System.Collections.Generic.List[string]]::new()
+    foreach ($spec in (Get-SelectedImageSpecs -Config $cfg -IncludeCodeServerBase)) {
+        $imageRef = Get-ImageRefFromSpec -Config $cfg -Spec $spec
+        if ($imageRef) { $images.Add($imageRef) }
     }
 
     foreach ($image in $images) {
@@ -353,20 +406,10 @@ function Invoke-Save {
     $imagesDir = Join-Path $ProjectRoot 'images'
     New-Item -ItemType Directory -Path $imagesDir -Force | Out-Null
 
-    $workspaceImage = Get-WorkspaceImageRef
-    $images = [System.Collections.Generic.List[string]]@(
-        $cfg['CODER_IMAGE_REF'],
-        $cfg['POSTGRES_IMAGE_REF'],
-        $cfg['NGINX_IMAGE_REF'],
-        $workspaceImage
-    )
-    if ($script:UseLlm)      { $images.Add($cfg['LITELLM_IMAGE_REF']) }
-    if ($script:UseLdap)     { $images.Add($cfg['DEX_IMAGE_REF']) }
-    if ($script:UseMineru)   { $images.Add($cfg['MINERU_IMAGE_REF']) }
-    if ($script:UseDoctools) { $images.Add($cfg['DOCCONV_IMAGE_REF']) }
-    if ($script:UseSkillHub) {
-        $images.Add((Get-ConfigValueOrDefault -Config $cfg -Key 'GITEA_IMAGE_REF' -Default 'gitea/gitea:latest'))
-        $images.Add((Get-ConfigValueOrDefault -Config $cfg -Key 'PYPISERVER_IMAGE_REF' -Default 'pypiserver/pypiserver:latest'))
+    $images = [System.Collections.Generic.List[string]]::new()
+    foreach ($spec in (Get-SelectedImageSpecs -Config $cfg -IncludeWorkspace)) {
+        $imageRef = Get-ImageRefFromSpec -Config $cfg -Spec $spec
+        if ($imageRef) { $images.Add($imageRef) }
     }
 
     # Build a digest-ref -> name:tag fallback map in case the digest ref is no longer cached
@@ -433,46 +476,76 @@ function Invoke-Load {
         exit 1
     }
 
-    $tarFiles = Get-ChildItem "$imagesDir\*.tar" -ErrorAction SilentlyContinue
-    if (-not $tarFiles) {
-        Write-Fail 'No image tarballs found in images.'
-        exit 1
-    }
-
     # Build filename -> name:tag map so digest-referenced images can be retagged after load.
     # When an image is saved by digest ref (e.g. ghcr.io/coder/coder@sha256:...), the tar has
     # no RepoTag and docker load reports "Loaded image ID: sha256:..." with no usable name.
     # Retagging to name:tag lets docker compose find the image without hitting the registry.
     $cfg = Get-Config
-    $fileTagMap = @{}
-    foreach ($entry in @(
-        @{ Ref = 'CODER_IMAGE_REF';           Tag = 'CODER_IMAGE_TAG' },
-        @{ Ref = 'POSTGRES_IMAGE_REF';         Tag = 'POSTGRES_IMAGE_TAG' },
-        @{ Ref = 'NGINX_IMAGE_REF';            Tag = 'NGINX_IMAGE_TAG' },
-        @{ Ref = 'LITELLM_IMAGE_REF';          Tag = 'LITELLM_IMAGE_TAG' },
-        @{ Ref = 'CODE_SERVER_BASE_IMAGE_REF'; Tag = 'CODE_SERVER_BASE_IMAGE_TAG' },
-        @{ Ref = 'DEX_IMAGE_REF';              Tag = 'DEX_IMAGE_TAG' },
-        @{ Ref = 'MINERU_IMAGE_REF';           Tag = 'MINERU_IMAGE_TAG' },
-        @{ Ref = 'DOCCONV_IMAGE_REF';          Tag = 'DOCCONV_IMAGE_TAG' },
-        @{ Ref = 'GITEA_IMAGE_REF';            Tag = 'GITEA_IMAGE_TAG' },
-        @{ Ref = 'PYPISERVER_IMAGE_REF';       Tag = 'PYPISERVER_IMAGE_TAG' }
-    )) {
-        $ref = $cfg[$entry.Ref]
-        $tag = $cfg[$entry.Tag]
-        if ($ref -and $tag -and ($ref -match '@sha256:')) {
-            $fn = ($ref -replace '[:/@]', '_') + '.tar'
-            $imageName = ($ref -split '@')[0]
-            $fileTagMap[$fn] = "${imageName}:${tag}"
+    $manifestArchives = @{}
+    $manifestPath = Join-Path $ProjectRoot 'offline-manifest.json'
+    if (Test-Path $manifestPath) {
+        try {
+            $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+            foreach ($image in @($manifest.images)) {
+                if ($image.ref -and $image.archive) {
+                    $manifestArchives[$image.ref] = $image.archive
+                }
+            }
+        } catch {
+            Write-Warn "Could not parse offline-manifest.json; falling back to images/<ref>.tar naming."
         }
     }
 
-    foreach ($tarFile in $tarFiles) {
-        $sizeMb = [math]::Round($tarFile.Length / 1MB)
-        Write-Info "Loading $($tarFile.Name) (${sizeMb} MB)"
-        $loadOutput = docker load -i $tarFile.FullName 2>&1
+    $fileTagMap = @{}
+    $selectedTarFiles = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+    $missingArchives = [System.Collections.Generic.List[string]]::new()
+    foreach ($spec in (Get-SelectedImageSpecs -Config $cfg -IncludeWorkspace)) {
+        $ref = Get-ImageRefFromSpec -Config $cfg -Spec $spec
+        if (-not $ref) { continue }
+
+        $archive = if ($manifestArchives.ContainsKey($ref)) {
+            $manifestArchives[$ref]
+        } else {
+            "images/$(Get-ImageArchiveName -ImageRef $ref)"
+        }
+        $archivePath = if ([System.IO.Path]::IsPathRooted($archive)) {
+            $archive
+        } else {
+            Join-Path $ProjectRoot $archive
+        }
+        if (-not (Test-Path $archivePath)) {
+            $missingArchives.Add("$ref ($archive)")
+            continue
+        }
+
+        $tarInfo = Get-Item $archivePath
+        $selectedTarFiles.Add($tarInfo)
+        if ($spec.Ref -and $spec.Tag -and $ref -match '@sha256:') {
+            $tag = $cfg[$spec.Tag]
+            if ($tag) {
+                $imageName = ($ref -split '@')[0]
+                $fileTagMap[$tarInfo.Name] = "${imageName}:${tag}"
+            }
+        }
+    }
+
+    if ($missingArchives.Count -gt 0) {
+        Write-Fail 'The selected image archives were not found. Re-run prepare/save with matching optional service flags:'
+        $missingArchives | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+        exit 1
+    }
+    if ($selectedTarFiles.Count -eq 0) {
+        Write-Fail 'No selected image tarballs found in images.'
+        exit 1
+    }
+
+    foreach ($imageTar in $selectedTarFiles) {
+        $sizeMb = [math]::Round($imageTar.Length / 1MB)
+        Write-Info "Loading $($imageTar.Name) (${sizeMb} MB)"
+        $loadOutput = docker load -i $imageTar.FullName 2>&1
         $loadOutput | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -ne 0) {
-            Write-Fail "Failed to load $($tarFile.Name)"
+            Write-Fail "Failed to load $($imageTar.Name)"
             exit 1
         }
 
@@ -480,7 +553,7 @@ function Invoke-Load {
         $outputStr = $loadOutput | Out-String
         if ($outputStr -match 'Loaded image ID:\s*(sha256:\S+)') {
             $imageId = $Matches[1]
-            $targetTag = $fileTagMap[$tarFile.Name]
+            $targetTag = $fileTagMap[$imageTar.Name]
             if ($targetTag) {
                 Write-Info "Tagging $imageId -> $targetTag"
                 docker tag $imageId $targetTag
@@ -550,24 +623,16 @@ function Invoke-Up {
     # In offline/loaded mode Docker cannot resolve digest refs against the registry.
     # Override image ref env vars to use name:tag format before invoking compose,
     # so compose resolves against the locally loaded (and retagged) images.
-    $requiredImages = [System.Collections.Generic.List[string]]@()
-    foreach ($mapping in @(
-        @{ Ref = 'CODER_IMAGE_REF';    Tag = 'CODER_IMAGE_TAG'    },
-        @{ Ref = 'POSTGRES_IMAGE_REF'; Tag = 'POSTGRES_IMAGE_TAG' },
-        @{ Ref = 'NGINX_IMAGE_REF';    Tag = 'NGINX_IMAGE_TAG'    },
-        @{ Ref = 'LITELLM_IMAGE_REF';  Tag = 'LITELLM_IMAGE_TAG'  },
-        @{ Ref = 'DEX_IMAGE_REF';      Tag = 'DEX_IMAGE_TAG'      },
-        @{ Ref = 'MINERU_IMAGE_REF';   Tag = 'MINERU_IMAGE_TAG'   },
-        @{ Ref = 'DOCCONV_IMAGE_REF';  Tag = 'DOCCONV_IMAGE_TAG'  },
-        @{ Ref = 'GITEA_IMAGE_REF';    Tag = 'GITEA_IMAGE_TAG'    },
-        @{ Ref = 'PYPISERVER_IMAGE_REF'; Tag = 'PYPISERVER_IMAGE_TAG' }
-    )) {
-        $ref = $cfg[$mapping.Ref]
-        $tag = $cfg[$mapping.Tag]
+    $requiredImages = [System.Collections.Generic.List[string]]::new()
+    foreach ($mapping in (Get-SelectedImageSpecs -Config $cfg)) {
+        $ref = Get-ImageRefFromSpec -Config $cfg -Spec $mapping
+        $tag = if ($mapping.Tag) { $cfg[$mapping.Tag] } else { '' }
         if (-not $ref) { continue }
         if ($ref -match '@sha256:' -and $tag) {
             $nameTag = "$(($ref -split '@')[0]):${tag}"
-            [System.Environment]::SetEnvironmentVariable($mapping.Ref, $nameTag, 'Process')
+            if ($mapping.Ref) {
+                [System.Environment]::SetEnvironmentVariable($mapping.Ref, $nameTag, 'Process')
+            }
             $requiredImages.Add($nameTag)
         } else {
             $requiredImages.Add($ref)
@@ -579,12 +644,6 @@ function Invoke-Up {
     $eapPf = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     foreach ($img in $requiredImages) {
-        if (-not $script:UseLlm      -and $img -match 'litellm') { continue }
-        if (-not $script:UseLdap     -and $img -match 'dexidp')  { continue }
-        if (-not $script:UseMineru   -and $img -match 'mineru')   { continue }
-        if (-not $script:UseDoctools -and $img -match 'pandoc')   { continue }
-        if (-not $script:UseSkillHub -and $img -match 'gitea')    { continue }
-        if (-not $script:UseSkillHub -and $img -match 'pypiserver') { continue }
         docker image inspect $img 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { $missingImages.Add($img) }
     }
@@ -623,6 +682,10 @@ function Invoke-Up {
         Invoke-UpgradeTemplateRefresh
     } else {
         Show-AccessInfo
+    }
+
+    if ($script:UseSkillHub -and -not (Test-Path (Join-Path $DockerDir '.gitea-setup-done'))) {
+        Invoke-SetupGitea
     }
 }
 
@@ -835,7 +898,9 @@ function Invoke-PushTemplate {
     $serverHost  = if ($cfg['SERVER_HOST'])  { $cfg['SERVER_HOST'] }  else { 'localhost' }
     $gatewayPort = if ($cfg['GATEWAY_PORT']) { $cfg['GATEWAY_PORT'] } else { '8443' }
     $skillHubEnabled = if ($script:UseSkillHub) { 'true' } else { 'false' }
-    $pushCmd = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$SessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' --var openai_api_key='$openaiKey' --var openai_base_url='$openaiUrl' --var server_host='$serverHost' --var gateway_port='$gatewayPort' --var skillhub_enabled='$skillHubEnabled' ; rm -rf /tmp/template-push"
+    $mineruEnabled = if ($script:UseMineru) { 'true' } else { 'false' }
+    $doctoolsEnabled = if ($script:UseDoctools) { 'true' } else { 'false' }
+    $pushCmd = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$SessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' --var openai_api_key='$openaiKey' --var openai_base_url='$openaiUrl' --var server_host='$serverHost' --var gateway_port='$gatewayPort' --var mineru_enabled='$mineruEnabled' --var doctools_enabled='$doctoolsEnabled' --var skillhub_enabled='$skillHubEnabled' ; rm -rf /tmp/template-push"
     docker exec coder-server sh -c $pushCmd
     if ($LASTEXITCODE -ne 0) {
         Write-Fail 'Template push failed.'
@@ -868,6 +933,221 @@ function Show-AccessInfo {
         Write-Host "  Skill Hub:       https://${serverHost}:${gatewayPort}/gitea/" -ForegroundColor White
         Write-Host "  PyPI Mirror:     https://${serverHost}:${gatewayPort}/pypi/" -ForegroundColor White
     }
+}
+
+function Get-SkillHubRepos {
+    return @(
+        [ordered]@{ Url = 'https://github.com/wshobson/commands.git'; Dest = 'wshobson-commands.git' }
+    )
+}
+
+function Invoke-LockImageDigest {
+    param(
+        [string]$ImageRef,
+        [string]$RefKey,
+        [string]$TagKey
+    )
+    if (-not (Test-Path $LockFile)) { return }
+
+    $repository = Get-ImageRepositoryFromRef -ImageRef $ImageRef
+    $repoDigests = @(docker image inspect $ImageRef --format '{{json .RepoDigests}}' | ConvertFrom-Json)
+    $digest = $repoDigests | Where-Object { $_ -like "$repository@*" } | Select-Object -First 1
+    if (-not $digest) { $digest = $repoDigests | Select-Object -First 1 }
+    if (-not $digest) { return }
+
+    $tagCandidate = ($ImageRef -split '@', 2)[0]
+    $tag = 'latest'
+    if ($tagCandidate -match ':(?<tag>[^/:]+)$') { $tag = $Matches.tag }
+
+    $lock = Read-KeyValueFile $LockFile
+    $lock[$RefKey] = $digest
+    $lock[$TagKey] = $tag
+
+    $existingKeys = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in (Get-Content $LockFile -ErrorAction SilentlyContinue)) {
+        if ($line -match '^\s*([^#=\s]+)=') {
+            $key = $Matches[1]
+            if (-not $existingKeys.Contains($key)) { $existingKeys.Add($key) }
+        }
+    }
+    foreach ($key in @($RefKey, $TagKey)) {
+        if (-not $existingKeys.Contains($key)) { $existingKeys.Add($key) }
+    }
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('# Locked versions and digests for reproducible offline bundles.')
+    foreach ($key in $existingKeys) {
+        if ($lock.ContainsKey($key)) { $lines.Add("$key=$($lock[$key])") }
+    }
+    [System.IO.File]::WriteAllText($LockFile, ($lines -join "`r`n") + "`r`n", [System.Text.UTF8Encoding]::new($false))
+    Write-OK "Locked $RefKey in $(Split-Path $LockFile -Leaf)"
+}
+
+function Invoke-SkillHubRefresh {
+    Initialize-Dirs
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Write-Fail 'git not found - required for mirroring skill repos.'
+        exit 1
+    }
+
+    $seedsDir = Join-Path $ConfigsDir 'gitea\seeds'
+    New-Item -ItemType Directory -Path $seedsDir -Force | Out-Null
+
+    Write-Info 'Syncing community skill repo mirrors...'
+    foreach ($repo in (Get-SkillHubRepos)) {
+        $dest = Join-Path $seedsDir $repo.Dest
+        if (Test-Path $dest) {
+            Write-Info "Updating mirror: $($repo.Dest)"
+            git -C $dest remote update --prune
+            if ($LASTEXITCODE -eq 0) {
+                Write-OK "Updated $($repo.Dest)"
+            } else {
+                Write-Warn "Update failed for $($repo.Dest); existing mirror will be used."
+            }
+        } else {
+            Write-Info "Cloning mirror: $($repo.Url) -> $($repo.Dest)"
+            git clone --mirror $repo.Url $dest
+            if ($LASTEXITCODE -ne 0) {
+                Write-Fail "Failed to clone $($repo.Url)"
+                exit 1
+            }
+            Write-OK "Cloned $($repo.Dest)"
+        }
+    }
+    Write-OK "Skill repo mirrors ready in $seedsDir"
+}
+
+function Invoke-SkillHubPrepare {
+    Assert-Docker
+    Initialize-Dirs
+    $cfg = Get-Config
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Write-Fail 'git not found - required for mirroring skill repos.'
+        exit 1
+    }
+
+    Write-Info '=== Skill Hub Preparation ==='
+    foreach ($image in @(
+        @{ Ref = (Get-ConfigValueOrDefault -Config $cfg -Key 'GITEA_IMAGE_REF' -Default 'gitea/gitea:latest'); RefKey = 'GITEA_IMAGE_REF'; TagKey = 'GITEA_IMAGE_TAG'; Name = 'Gitea' },
+        @{ Ref = (Get-ConfigValueOrDefault -Config $cfg -Key 'PYPISERVER_IMAGE_REF' -Default 'pypiserver/pypiserver:latest'); RefKey = 'PYPISERVER_IMAGE_REF'; TagKey = 'PYPISERVER_IMAGE_TAG'; Name = 'pypiserver' }
+    )) {
+        Write-Info "Pulling $($image.Ref)"
+        docker pull $image.Ref
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to pull $($image.Ref)"; exit 1 }
+        $tarFile = Join-Path $ImagesDir (Get-ImageArchiveName -ImageRef $image.Ref)
+        Write-Info "Saving $($image.Name) image -> $(Split-Path $tarFile -Leaf)"
+        docker save $image.Ref -o $tarFile
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to save $($image.Ref)"; exit 1 }
+        Write-OK "Saved $(Split-Path $tarFile -Leaf)"
+        Invoke-LockImageDigest -ImageRef $image.Ref -RefKey $image.RefKey -TagKey $image.TagKey
+    }
+
+    Invoke-SkillHubRefresh
+
+    $packagesDir = Join-Path $ConfigsDir 'pypi\packages'
+    New-Item -ItemType Directory -Path $packagesDir -Force | Out-Null
+    $pip = Get-Command pip3 -ErrorAction SilentlyContinue
+    if ($pip) {
+        Write-Info 'Downloading scientific/engineering pip packages (x86_64 manylinux, Python 3.11)...'
+        & $pip.Source download `
+            --dest $packagesDir `
+            --platform manylinux_2_17_x86_64 `
+            --python-version 3.11 `
+            --only-binary=:all: `
+            numpy pandas matplotlib scipy scikit-learn sympy `
+            pyserial pyelftools gcovr `
+            sphinx breathe `
+            pytest coverage `
+            requests httpx `
+            pydantic click rich tqdm
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn 'Some packages failed to download; partial set will still be available offline.'
+        } else {
+            Write-OK "Pip packages downloaded to $packagesDir"
+        }
+    } else {
+        Write-Warn 'pip3 not found on host - skipping pip package download.'
+        Write-Warn 'Manually copy .whl files into configs\pypi\packages\ before deploying.'
+    }
+
+    Write-OK 'Skill Hub preparation complete.'
+    Write-Info 'Transfer the project directory (including images\ and configs\pypi\packages\) to the offline server.'
+    Write-Info 'On the offline server: .\scripts\manage.ps1 load -SkillHub; .\scripts\manage.ps1 up -SkillHub'
+}
+
+function Invoke-SetupGitea {
+    $giteaDoneFile = Join-Path $DockerDir '.gitea-setup-done'
+    if (Test-Path $giteaDoneFile) { return }
+
+    $cfg = Get-Config
+    $adminPassword = if ($cfg['GITEA_ADMIN_PASSWORD']) {
+        $cfg['GITEA_ADMIN_PASSWORD']
+    } else {
+        $bytes = New-Object byte[] 12
+        [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+        ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+    }
+    $giteaUrl = 'http://localhost:3000'
+
+    Write-Info 'Waiting for Gitea to become ready...'
+    $ready = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        docker exec coder-gitea curl -sf "$giteaUrl/-/ready" 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $ready = $true
+            break
+        }
+        Start-Sleep -Seconds 3
+    }
+    if (-not $ready) {
+        Write-Warn 'Gitea did not become ready in time - skipping initialization.'
+        return
+    }
+    Write-OK 'Gitea is ready.'
+
+    Write-Info 'Creating Gitea admin user...'
+    $createOutput = docker exec coder-gitea gitea admin user create --admin --username admin --password $adminPassword --email 'gitea-admin@internal' --must-change-password=false 2>&1
+    if ($LASTEXITCODE -ne 0 -and (($createOutput | Out-String) -notmatch 'already exists')) {
+        Write-Warn 'Could not create Gitea admin user; it may already exist.'
+    }
+
+    $tokenName = "manage-ps1-$(Get-Date -Format yyyyMMddHHmmss)"
+    $tokenBody = "{`"name`":`"$tokenName`"}"
+    $tokenJson = docker exec coder-gitea curl -sf -X POST "$giteaUrl/api/v1/users/admin/tokens" -u "admin:${adminPassword}" -H 'Content-Type: application/json' -d $tokenBody 2>$null
+    $token = ''
+    if ($LASTEXITCODE -eq 0 -and $tokenJson) {
+        try { $token = (($tokenJson | Out-String) | ConvertFrom-Json).sha1 } catch {}
+    }
+    if (-not $token) {
+        Write-Warn 'Could not obtain Gitea API token; seed repos will not be imported automatically.'
+        Write-Warn "Import manually via https://<SERVER>:<PORT>/gitea  (admin / $adminPassword)"
+        return
+    }
+
+    foreach ($repo in (Get-SkillHubRepos)) {
+        $dest = Join-Path $ConfigsDir "gitea\seeds\$($repo.Dest)"
+        if (-not (Test-Path $dest)) { continue }
+        $repoName = [System.IO.Path]::GetFileNameWithoutExtension($repo.Dest)
+        if ($repoName -match '^[^-]+-(.+)$') { $repoName = $Matches[1] }
+        Write-Info "Importing seed repo: $repoName"
+        $body = "{`"clone_addr`":`"/repos-seed/$($repo.Dest)`",`"repo_name`":`"$repoName`",`"uid`":1,`"private`":false,`"description`":`"Mirrored from $($repo.Url)`"}"
+        $httpCode = docker exec coder-gitea curl -sf -o /dev/null -w '%{http_code}' -X POST "$giteaUrl/api/v1/repos/migrate" -H "Authorization: token $token" -H 'Content-Type: application/json' -d $body 2>$null
+        if ($httpCode -eq '201') {
+            Write-OK "Imported $repoName into Gitea"
+        } elseif ($httpCode -eq '409') {
+            Write-Info "$repoName already exists in Gitea"
+        } else {
+            Write-Warn "Import of $repoName returned HTTP $httpCode (non-fatal)"
+        }
+    }
+
+    $passwordPath = Join-Path $DockerDir '.gitea-admin-password'
+    [System.IO.File]::WriteAllText($passwordPath, $adminPassword + "`r`n", [System.Text.UTF8Encoding]::new($false))
+    Get-Date | Set-Content $giteaDoneFile
+
+    Write-OK 'Gitea initialized.'
+    Write-Info 'Gitea admin credentials saved to docker\.gitea-admin-password'
+    Write-Warn 'Change the Gitea admin password after first login: https://<SERVER>:<PORT>/gitea'
 }
 
 function Invoke-TestApi {
@@ -1120,8 +1400,8 @@ function Invoke-UpgradeBackup {
     Write-Host '  2) .\scripts\manage.ps1 down           # stop the old platform (never pass -v)'
     Write-Host '  3) git fetch && git checkout <new-ref>'
     Write-Host '  4) .\scripts\manage.ps1 upgrade-restore-config <snapshot-dir>'
-    Write-Host '  5) .\scripts\manage.ps1 load          # plus -Ldap -SkillHub etc as needed'
-    Write-Host '  6) .\scripts\manage.ps1 up [-Ldap -SkillHub ...]  # new coder migrates DB in-place'
+    Write-Host '  5) .\scripts\manage.ps1 load          # add the same optional flags you will enable on up'
+    Write-Host '  6) .\scripts\manage.ps1 up [-Ldap -Mineru -Doctools -SkillHub ...]  # new coder migrates DB in-place'
     Write-Host '  7) .\scripts\manage.ps1 update-workspace -Tag v$(Get-Date -Format yyyyMMdd)'
 }
 
@@ -1277,8 +1557,8 @@ function Invoke-UpgradeRestoreConfig {
     Write-Host ''
     Write-Info 'Next steps:'
     Write-Host '  1) Sanity-check docker/.env and configs\versions.lock.env'
-    Write-Host '  2) .\scripts\manage.ps1 load [-Ldap -SkillHub …]'
-    Write-Host '  3) .\scripts\manage.ps1 up [-Ldap -SkillHub ...]  # new coder migrates the DB schema in-place'
+    Write-Host '  2) .\scripts\manage.ps1 load          # add optional flags only for services you will enable'
+    Write-Host '  3) .\scripts\manage.ps1 up [-Ldap -Mineru -Doctools -SkillHub ...]  # new coder migrates the DB schema in-place'
     Write-Host '  4) Verify a real user can log in, then build a tagged workspace image:'
     Write-Host '     .\scripts\manage.ps1 update-workspace -Tag v$(Get-Date -Format yyyyMMdd)'
     Write-Host '  5) Have users restart their workspaces in the UI to pick up the new image'
@@ -1543,6 +1823,7 @@ function Invoke-PrepareSavePlatformImages {
         $cfg['NGINX_IMAGE_REF']
     )
     if ($script:UseLlm)      { $images.Add($cfg['LITELLM_IMAGE_REF']) }
+    if ($script:UseLdap)     { $images.Add($cfg['DEX_IMAGE_REF']) }
     if ($script:UseMineru)   { $images.Add($cfg['MINERU_IMAGE_REF']) }
     if ($script:UseDoctools) { $images.Add($cfg['DOCCONV_IMAGE_REF']) }
     if ($script:UseSkillHub) {
@@ -1606,6 +1887,7 @@ function Invoke-PrepareWriteManifest {
         [ordered]@{ ref = "${wsImage}:${wsTag}"; archive = "images/${wsImage}_${wsTag}.tar" }
     )
     if ($script:UseLlm)      { $images += (& $imageEntry $cfg['LITELLM_IMAGE_REF']) }
+    if ($script:UseLdap)     { $images += (& $imageEntry $cfg['DEX_IMAGE_REF']) }
     if ($script:UseMineru)   { $images += (& $imageEntry $cfg['MINERU_IMAGE_REF']) }
     if ($script:UseDoctools) { $images += (& $imageEntry $cfg['DOCCONV_IMAGE_REF']) }
     if ($script:UseSkillHub) {
@@ -1616,6 +1898,7 @@ function Invoke-PrepareWriteManifest {
     $manifest = [ordered]@{
         generated_at_utc = (Get-Date).ToUniversalTime().ToString('o')
         include_llm      = [bool]$script:UseLlm
+        include_ldap     = [bool]$script:UseLdap
         include_mineru   = [bool]$script:UseMineru
         include_doctools = [bool]$script:UseDoctools
         include_skillhub = [bool]$script:UseSkillHub
@@ -1753,6 +2036,7 @@ function Invoke-RefreshVersions {
         @{ RefKey = 'POSTGRES_IMAGE_REF';         TagKey = 'POSTGRES_IMAGE_TAG' },
         @{ RefKey = 'NGINX_IMAGE_REF';            TagKey = 'NGINX_IMAGE_TAG' },
         @{ RefKey = 'LITELLM_IMAGE_REF';          TagKey = 'LITELLM_IMAGE_TAG' },
+        @{ RefKey = 'DEX_IMAGE_REF';              TagKey = 'DEX_IMAGE_TAG' },
         @{ RefKey = 'CODE_SERVER_BASE_IMAGE_REF'; TagKey = 'CODE_SERVER_BASE_IMAGE_TAG' }
     )
     foreach ($prefix in @('MINERU', 'DOCCONV', 'GITEA', 'PYPISERVER')) {
@@ -1787,7 +2071,7 @@ function Invoke-RefreshVersions {
 
     Write-Host ''
     Write-Host 'Proposed version lock updates:' -ForegroundColor Cyan
-    $displayKeys = @('CODER_IMAGE_REF','POSTGRES_IMAGE_REF','NGINX_IMAGE_REF','LITELLM_IMAGE_REF','CODE_SERVER_BASE_IMAGE_REF','TF_PROVIDER_CODER_VERSION','TF_PROVIDER_DOCKER_VERSION')
+    $displayKeys = @('CODER_IMAGE_REF','POSTGRES_IMAGE_REF','NGINX_IMAGE_REF','LITELLM_IMAGE_REF','DEX_IMAGE_REF','CODE_SERVER_BASE_IMAGE_REF','TF_PROVIDER_CODER_VERSION','TF_PROVIDER_DOCKER_VERSION')
     foreach ($prefix in @('MINERU', 'DOCCONV', 'GITEA', 'PYPISERVER')) {
         $refKey = "$($prefix)_IMAGE_REF"
         if ($updated.ContainsKey($refKey)) { $displayKeys += $refKey }
@@ -1838,7 +2122,7 @@ function Invoke-RefreshVersions {
 function Show-Help {
     $text = @(
         '',
-        'Usage: .\scripts\manage.ps1 <command> [arg] [-Llm] [-Ldap] [-SkillHub] [flags]',
+        'Usage: .\scripts\manage.ps1 <command> [arg] [-Llm] [-Ldap] [-Mineru] [-Doctools] [-SkillHub] [flags]',
         '',
         'Platform lifecycle:',
         '  init                        Create docker/.env from defaults',
@@ -1874,12 +2158,14 @@ function Show-Help {
         '                              POSTGRES_PASSWORD and root CA. See docs/upgrade-in-place.md.',
         '',
         'Offline bundle preparation (online machine):',
-        '  prepare [-SkipImages] [-SkipBuild] [-Llm]',
+        '  prepare [-SkipImages] [-SkipBuild] [-Llm] [-Ldap] [-Mineru] [-Doctools] [-SkillHub]',
         '                              Download VSIX + TF providers, pull/save images,',
         '                              build workspace image, write offline-manifest.json',
         '  verify [-RequireLlm]        Verify offline-manifest.json and all referenced files',
         '  refresh-versions [-Apply]   Check upstream for newer image digests / provider versions',
         '                              Add -Apply to rewrite configs/versions.lock.env',
+        '  skillhub-prepare            Prepare Skill Hub images, repo mirrors, and PyPI packages',
+        '  skillhub-refresh            Refresh mirrored skill repositories under configs\gitea\seeds',
         '',
         'Flags:',
         '  -Llm          Enable LiteLLM AI gateway (--profile llm)',
@@ -1900,7 +2186,7 @@ function Show-Help {
         'Online preparation workflow:',
         '  .\scripts\manage.ps1 init',
         '  .\scripts\manage.ps1 ssl <offline-server-ip>',
-        '  .\scripts\manage.ps1 prepare',
+        '  .\scripts\manage.ps1 prepare [-Llm] [-Ldap] [-Mineru] [-Doctools] [-SkillHub]',
         '  .\scripts\manage.ps1 verify',
         '  # Transfer project directory to offline server',
         '',
@@ -1908,7 +2194,7 @@ function Show-Help {
         '  .\scripts\manage.ps1 init',
         '  .\scripts\manage.ps1 ssl <this-server-ip>',
         '  .\scripts\manage.ps1 load',
-        '  .\scripts\manage.ps1 up',
+        '  .\scripts\manage.ps1 up [-Llm] [-Ldap] [-Mineru] [-Doctools] [-SkillHub]',
         '',
         'Workspace update workflow:',
         '  # [Online] build and save new version',
@@ -1954,6 +2240,8 @@ switch ($Command.ToLower()) {
     'prepare'               { Invoke-Prepare; break }
     'verify'           { Invoke-Verify; break }
     'refresh-versions' { Invoke-RefreshVersions; break }
+    'skillhub-prepare' { Invoke-SkillHubPrepare; break }
+    'skillhub-refresh' { Invoke-SkillHubRefresh; break }
     'test-api'         { Invoke-TestApi; break }
     'test-llm-backend' { Invoke-TestLlmBackend; break }
     'clean'            { Invoke-Clean; break }
