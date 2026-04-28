@@ -132,6 +132,12 @@ function Test-ManagePowerShellStaticContracts {
     Assert-True 'manage.ps1 handles SkillHub images' ($text -match 'GITEA_IMAGE_REF' -and $text -match 'PYPISERVER_IMAGE_REF')
     Assert-True 'manage.ps1 saves SkillHub images' ($text -match 'function Invoke-Save[\s\S]*UseSkillHub[\s\S]*GITEA_IMAGE_REF')
     Assert-True 'manage.ps1 refresh preserves SkillHub image locks' ($text -match "foreach \(\`$prefix in @\('MINERU', 'DOCCONV', 'GITEA', 'PYPISERVER'\)")
+    Assert-True 'manage.ps1 prepare includes LDAP Dex image' ($text -match 'function Invoke-PrepareSavePlatformImages[\s\S]*UseLdap[\s\S]*DEX_IMAGE_REF')
+    Assert-True 'manage.ps1 manifest includes LDAP flag' ($text -match 'include_ldap\s*=\s*\[bool\]\$script:UseLdap')
+    Assert-True 'manage.ps1 manifest includes LDAP Dex image' ($text -match 'function Invoke-PrepareWriteManifest[\s\S]*UseLdap[\s\S]*DEX_IMAGE_REF')
+    Assert-True 'manage.ps1 load uses selected image specs' ($text -match 'Get-SelectedImageSpecs' -and $text -notmatch 'foreach \(\$tarFile in \$tarFiles\)\s*\{[\s\S]*docker load -i \$tarFile\.FullName')
+    Assert-True 'manage.ps1 exposes SkillHub preparation commands' ($text -match "'skillhub-prepare'" -and $text -match "'skillhub-refresh'")
+    Assert-True 'manage.ps1 refresh includes Dex digest target' ($text -match "RefKey = 'DEX_IMAGE_REF'")
     Assert-True 'update-workspace passes Tag to NewTag parameter' ($text -match '''update-workspace''\s*\{\s*Invoke-UpdateWorkspace\s+-NewTag\s+\$Tag')
     Assert-True 'upgrade restore writes pending marker' ($text -match '\.upgrade-restore-pending')
     Assert-True 'backup includes LiteLLM runtime config' ($text -match 'litellm_config\.yaml\.bak')
@@ -145,6 +151,12 @@ function Test-ManageBashAndDocsStaticContracts {
     Assert-True 'manage.sh refreshes template after pending upgrade restore' ($manage -match 'run_upgrade_template_refresh')
     Assert-True 'manage.sh backs up LiteLLM runtime config' ($manage -match 'litellm_config\.yaml\.bak')
     Assert-True 'manage.sh preflights Gitea SkillHub image' ($manage -match 'DOCCONV_IMAGE_REF GITEA_IMAGE_REF PYPISERVER_IMAGE_REF')
+    Assert-True 'manage.sh prepare includes LDAP Dex image' ($manage -match '_prepare_save_platform_images\(\)[\s\S]*USE_LDAP[\s\S]*DEX_IMAGE_REF')
+    Assert-True 'manage.sh manifest includes LDAP flag' ($manage -match '"include_ldap": \$\{USE_LDAP,,\}')
+    Assert-True 'manage.sh manifest includes LDAP Dex image' ($manage -match '_prepare_write_manifest\(\)[\s\S]*USE_LDAP[\s\S]*DEX_IMAGE_REF')
+    Assert-True 'manage.sh load uses selected image refs' ($manage -match '_selected_image_refs' -and $manage -notmatch 'for tar_file in "\$\{tar_files\[@\]\}"')
+    Assert-True 'manage.sh refresh includes Dex digest target' ($manage -match 'DEX_IMAGE_REF="\$\(_rv_resolve_digest')
+    Assert-True 'upgrade docs describe selected load semantics' ($docs -match 'selected optional service' -and $docs -notmatch 'load \[--ldap')
     Assert-True 'docs clarify restore-config does not restore volumes' ($docs -match 'does not restore Docker volumes')
 }
 
@@ -169,6 +181,11 @@ function Test-WorkspaceAiToolingStaticContracts {
     Assert-True 'manage.ps1 passes OpenAI vars into template push' ($managePs1.Contains("--var openai_api_key='`$openaiKey'") -and $managePs1.Contains("--var openai_base_url='`$openaiUrl'"))
     Assert-True '.env.example documents OpenAI-compatible config for Codex/Kilo' ($envExample -match 'OPENAI_BASE_URL' -and $envExample -match 'Codex / Kilo')
     Assert-True 'VSIX README documents Codex and Kilo offline extension fallbacks' ($vsixReadme -match 'openai\.chatgpt' -and $vsixReadme -match 'kilocode\.kilo-code')
+    Assert-True 'workspace template gates MinerU app' ($template -match 'variable "mineru_enabled"' -and $template -match 'resource "coder_app" "mineru"[\s\S]*count\s*=')
+    Assert-True 'workspace template gates docconv app' ($template -match 'variable "doctools_enabled"' -and $template -match 'resource "coder_app" "docconv"[\s\S]*count\s*=')
+    Assert-True 'workspace template gates SkillHub app' ($template -match 'resource "coder_app" "skill_hub"[\s\S]*count\s*=')
+    Assert-True 'manage.sh passes optional app flags into template push' ($manageSh -match "--var mineru_enabled='\$\{USE_MINERU\}'" -and $manageSh -match "--var doctools_enabled='\$\{USE_DOCTOOLS\}'")
+    Assert-True 'manage.ps1 passes optional app flags into template push' ($managePs1 -match "--var mineru_enabled='\$mineruEnabled'" -and $managePs1 -match "--var doctools_enabled='\$doctoolsEnabled'")
 }
 
 Test-PowerShellEffectiveConfig
