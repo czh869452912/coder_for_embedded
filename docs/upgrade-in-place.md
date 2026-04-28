@@ -71,6 +71,7 @@ bash scripts/manage.sh upgrade-backup
 backups/snapshot-20240427-143052/
 ├── coder.sql                     # pg_dumpall（完整热备份）
 ├── env.bak                       # docker/.env
+├── litellm_config.yaml.bak        # LiteLLM 运行时配置（如存在）
 ├── ssl/
 │   ├── ca.crt
 │   ├── ca.key
@@ -131,7 +132,7 @@ git checkout <new-branch-or-tag>
 # 或者 git pull origin master
 ```
 
-> `docker/.env` 和 `configs/ssl/` 在 `.gitignore` 中，git checkout **不会**覆盖它们。但如果你是从一台全新机器上 clone 的，这些文件就不存在，需要 Step 3 还原。
+> `docker/.env` 和 `configs/ssl/` 在 `.gitignore` 中，git checkout **不会**覆盖它们。同目录原地升级时 Step 3 会校验它们是否与快照一致；如果你是从一台全新机器上 clone 的，这些文件就不存在，需要 Step 3 还原。
 
 ### Step 3：还原配置（关键）
 
@@ -142,10 +143,13 @@ bash scripts/manage.sh upgrade-restore-config backups/snapshot-YYYYMMDD-HHMMSS
 这个命令会：
 1. 把快照中的 `env.bak` 复制为 `docker/.env`（保留旧密码）。
 2. 把快照中的 `ssl/` 复制为 `configs/ssl/`（保留旧 CA）。
-3. 自动追加 `versions.lock.env` 中缺失的新默认值（如 `MINERU_IMAGE_REF` 等）。
+3. 把快照中的 `litellm_config.yaml.bak` 复制为 `configs/litellm_config.yaml`（如果快照里存在）。
 4. 保留旧的 `.setup-done` 标记，避免重复创建 admin。
+5. 标记下一次 `up` 自动刷新 workspace template，让新代码中的 template 变量生效。
 
-如果当前目录已经存在 `docker/.env` 或 `configs/ssl/`，命令会**拒绝覆盖**以保护现有配置。你可以加 `--force`，旧文件会被重命名为 `.env.before-restore` 和 `ssl.before-restore`：
+> Scope note: `upgrade-restore-config` does not restore Docker volumes. 原地升级依赖旧的 `docker_postgres-data` 和 `coder-*-home` volumes 仍然存在；快照里的 `volumes/*.tgz` 是灾备/手动回滚材料，不会在这个命令里自动写回 Docker。
+
+如果当前目录已经存在 `docker/.env` 或 `configs/ssl/` 且内容与快照不同，命令会**拒绝覆盖**以保护现有配置。你可以加 `--force`，旧文件会被重命名为 `.env.before-restore` 和 `ssl.before-restore`：
 
 ```bash
 bash scripts/manage.sh upgrade-restore-config backups/snapshot-20240427-143052 --force
@@ -178,7 +182,7 @@ bash scripts/manage.sh up
 1. Postgres 容器启动，复用旧的 `postgres-data` volume。
 2. 新的 Coder 容器启动，连接到同一个 Postgres。
 3. Coder 自动运行 schema migration，把旧数据库结构升级到当前版本。**这是安全的向前迁移，Coder 会保证兼容性。**
-4. `setup-coder` 逻辑检测到已有用户（`/api/v2/users/first` 返回非 404），**不会**重复创建 admin，而是直接拿 session token 并 push 新的 workspace template。
+4. 如果 Step 3 写入了升级 pending 标记，`up` 会登录旧 admin 并 push 当前 workspace template；已有用户不会被重复创建。
 
 ### Step 6：验证核心功能
 

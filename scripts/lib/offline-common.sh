@@ -52,38 +52,19 @@ get_version_lock_file() {
 load_effective_config() {
     local configs_dir="$1"
     local env_file="$2"
-    load_key_value_into_env "$(get_version_lock_file "$configs_dir")"
     load_key_value_into_env "$env_file"
+    load_key_value_into_env "$(get_version_lock_file "$configs_dir")"
 }
 
 ensure_env_defaults() {
     local env_file="$1"
     local configs_dir="$2"
     [ -f "$env_file" ] || return 0
-
-    declare -A defaults=()
-    declare -A existing=()
-    local missing=()
-
-    __collect_defaults() { defaults["$1"]="$2"; }
-    __collect_existing() { existing["$1"]="$2"; }
-
-    read_key_value_file "$(get_version_lock_file "$configs_dir")" __collect_defaults
-    read_key_value_file "$env_file" __collect_existing
-
-    while IFS= read -r key; do
-        [ -z "$key" ] && continue
-        if [[ -z ${existing[$key]+x} ]]; then
-            missing+=("$key=${defaults[$key]}")
-        fi
-    done < <(printf '%s\n' "${!defaults[@]}" | sort)
-
-    if [ ${#missing[@]} -gt 0 ]; then
-        {
-            printf '\n# ---- Locked versions ----\n'
-            printf '%s\n' "${missing[@]}"
-        } >> "$env_file"
-    fi
+    # Version/image lock values live in configs/versions.lock.env and are loaded
+    # after docker/.env so stale keys in an old .env cannot override them.
+    # Keep this hook for backwards-compatible callers, but do not copy lock keys
+    # into .env anymore.
+    :
 }
 
 get_openssl_command() {

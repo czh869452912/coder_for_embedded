@@ -7,6 +7,7 @@ DOCKER_DIR="$PROJECT_ROOT/docker"
 CONFIGS_DIR="$PROJECT_ROOT/configs"
 ENV_FILE="$DOCKER_DIR/.env"
 SETUP_DONE_FILE="$DOCKER_DIR/.setup-done"
+UPGRADE_PENDING_FILE="$DOCKER_DIR/.upgrade-restore-pending"
 MANIFEST_PATH="$PROJECT_ROOT/offline-manifest.json"
 IMAGES_DIR="$PROJECT_ROOT/images"
 LOCK_FILE="$CONFIGS_DIR/versions.lock.env"
@@ -48,7 +49,7 @@ fail() { echo -e "${RED}[FAIL]${NC} $*" >&2; exit 1; }
 
 usage() {
     cat <<'EOF'
-Usage: bash scripts/manage.sh <command> [args] [--llm] [--ldap]
+Usage: bash scripts/manage.sh <command> [args] [--llm] [--ldap] [--skillhub]
 
 Online preparation commands:
   refresh-versions [--apply]
@@ -552,7 +553,7 @@ start_services() {
     # so compose resolves against the locally loaded (and retagged) images.
     local ref_key ref tag_key tag
     local -a required_images=()
-    for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF PYPISERVER_IMAGE_REF; do
+    for ref_key in CODER_IMAGE_REF POSTGRES_IMAGE_REF NGINX_IMAGE_REF LITELLM_IMAGE_REF DEX_IMAGE_REF MINERU_IMAGE_REF DOCCONV_IMAGE_REF GITEA_IMAGE_REF PYPISERVER_IMAGE_REF; do
         ref="${!ref_key:-}"
         [ -n "$ref" ] || continue
         if [[ "$ref" == *@sha256:* ]]; then
@@ -599,6 +600,10 @@ start_services() {
         warn "First startup detected. Running setup-coder after a short delay."
         sleep 8
         run_setup_coder
+    elif [ -f "$UPGRADE_PENDING_FILE" ]; then
+        warn "Upgrade restore detected. Refreshing workspace template after startup."
+        sleep 8
+        run_upgrade_template_refresh
     else
         show_access_info
     fi
@@ -794,6 +799,24 @@ run_setup_coder() {
     date > "$SETUP_DONE_FILE"
     echo
     ok "Coder initialization complete"
+    show_access_info
+}
+
+run_upgrade_template_refresh() {
+    [ -f "$ENV_FILE" ] || fail "Run init first."
+    load_config
+
+    _wait_for_coder
+
+    local session_token
+    session_token="$(_get_session_token)"
+    [ -n "$session_token" ] || fail "Failed to get Coder session token. Check admin credentials in docker/.env."
+    ok "Logged in and obtained session token"
+
+    _do_push_template "$session_token"
+    rm -f "$UPGRADE_PENDING_FILE"
+
+    ok "Upgrade template refresh complete"
     show_access_info
 }
 
@@ -1050,10 +1073,11 @@ upgrade_backup() {
     cp "$ENV_FILE" "$dest/env.bak"
     cp -r "$CONFIGS_DIR/ssl/." "$dest/ssl/"
     [ -f "$LOCK_FILE" ] && cp "$LOCK_FILE" "$dest/versions.lock.env.bak"
+    [ -f "$CONFIGS_DIR/litellm_config.yaml" ] && cp "$CONFIGS_DIR/litellm_config.yaml" "$dest/litellm_config.yaml.bak"
     if [ -f "$DOCKER_DIR/.setup-done" ]; then
         cp "$DOCKER_DIR/.setup-done" "$dest/setup-done.bak"
     fi
-    ok "      env.bak, ssl/, versions.lock.env.bak"
+    ok "      env.bak, ssl/, versions.lock.env.bak, litellm_config.yaml.bak (if present)"
 
     info "[5/5] Writing meta.json"
     local git_sha git_branch
@@ -1091,7 +1115,7 @@ EOF
     echo -e "  3) ${BLUE}git fetch && git checkout <new-ref>${NC}"
     echo -e "  4) ${BLUE}bash scripts/manage.sh upgrade-restore-config $dest${NC}"
     echo -e "  5) ${BLUE}bash scripts/manage.sh load${NC}        # plus any --ldap/--skillhub flags you want to enable"
-    echo -e "  6) ${BLUE}bash scripts/manage.sh up${NC}          # postgres schema migrates forward, users keep their accounts"
+    echo -e "  6) ${BLUE}bash scripts/manage.sh up${NC} [--ldap --skillhub …]  # postgres schema migrates forward, users keep their accounts"
     echo -e "  7) ${BLUE}bash scripts/manage.sh update-workspace --tag v\$(date +%Y%m%d)${NC}   # bake new tools into a tagged image"
 }
 
@@ -1114,38 +1138,75 @@ upgrade_restore_config() {
 
     # ── docker/.env ────────────────────────────────────────────────────────────
     if [ -f "$ENV_FILE" ]; then
-        if [ "$force" != true ]; then
-            fail "$ENV_FILE already exists. Pass --force to overwrite (the existing file will be saved as $ENV_FILE.before-restore)."
+        if cmp -s "$ENV_FILE" "$snapshot/env.bak"; then
+            info "Existing docker/.env already matches snapshot"
+        else
+            if [ "$force" != true ]; then
+                fail "$ENV_FILE already exists and differs from snapshot. Pass --force to overwrite (the existing file will be saved as $ENV_FILE.before-restore)."
+            fi
+            cp "$ENV_FILE" "$ENV_FILE.before-restore"
+            warn "Existing docker/.env saved to $ENV_FILE.before-restore"
         fi
-        cp "$ENV_FILE" "$ENV_FILE.before-restore"
-        warn "Existing docker/.env saved to $ENV_FILE.before-restore"
     fi
-    cp "$snapshot/env.bak" "$ENV_FILE"
+    if [ ! -f "$ENV_FILE" ] || ! cmp -s "$ENV_FILE" "$snapshot/env.bak"; then
+        cp "$snapshot/env.bak" "$ENV_FILE"
+    fi
     ok "Restored docker/.env"
 
-    # 把缺失的新增 lock 默认值（如新版本添加的 *_IMAGE_REF）追加进来
+    # Backwards-compatible no-op: lock values stay in versions.lock.env.
     ensure_env_defaults "$ENV_FILE" "$CONFIGS_DIR"
 
     # ── configs/ssl ────────────────────────────────────────────────────────────
+    local ssl_same=false
     if [ -d "$CONFIGS_DIR/ssl" ] && [ -n "$(ls -A "$CONFIGS_DIR/ssl" 2>/dev/null)" ]; then
         local existing_ca="$CONFIGS_DIR/ssl/ca.crt"
         local snap_ca="$snapshot/ssl/ca.crt"
-        if [ -f "$existing_ca" ] && [ -f "$snap_ca" ] && ! cmp -s "$existing_ca" "$snap_ca"; then
+        if diff -qr "$CONFIGS_DIR/ssl" "$snapshot/ssl" >/dev/null 2>&1; then
+            ssl_same=true
+            info "Existing configs/ssl already matches snapshot"
+        elif [ -f "$existing_ca" ] && [ -f "$snap_ca" ] && ! cmp -s "$existing_ca" "$snap_ca"; then
             if [ "$force" != true ]; then
                 fail "configs/ssl/ca.crt differs from snapshot. Pass --force to overwrite. WARNING: workspaces built against the current CA will need to be rebuilt to trust the restored CA."
             fi
             warn "Overwriting different ca.crt; existing tree saved to configs/ssl.before-restore"
+            rm -rf "$CONFIGS_DIR/ssl.before-restore"
+            mv "$CONFIGS_DIR/ssl" "$CONFIGS_DIR/ssl.before-restore"
+        else
+            if [ "$force" != true ]; then
+                fail "configs/ssl already exists and differs from snapshot. Pass --force to overwrite (the existing tree will be saved as configs/ssl.before-restore)."
+            fi
+            rm -rf "$CONFIGS_DIR/ssl.before-restore"
+            mv "$CONFIGS_DIR/ssl" "$CONFIGS_DIR/ssl.before-restore"
+            warn "Existing configs/ssl saved to configs/ssl.before-restore"
         fi
-        rm -rf "$CONFIGS_DIR/ssl.before-restore"
-        mv "$CONFIGS_DIR/ssl" "$CONFIGS_DIR/ssl.before-restore"
     fi
-    mkdir -p "$CONFIGS_DIR/ssl"
-    cp -r "$snapshot/ssl/." "$CONFIGS_DIR/ssl/"
+    if [ "$ssl_same" != true ]; then
+        mkdir -p "$CONFIGS_DIR/ssl"
+        cp -r "$snapshot/ssl/." "$CONFIGS_DIR/ssl/"
+    fi
     ok "Restored configs/ssl/ (CA + leaf certificate)"
+
+    # ── LiteLLM runtime config (optional) ──────────────────────────────────────
+    local snap_litellm="$snapshot/litellm_config.yaml.bak"
+    local litellm_target="$CONFIGS_DIR/litellm_config.yaml"
+    if [ -f "$snap_litellm" ]; then
+        if [ -f "$litellm_target" ] && ! cmp -s "$litellm_target" "$snap_litellm"; then
+            if [ "$force" != true ]; then
+                fail "configs/litellm_config.yaml exists and differs from snapshot. Pass --force to overwrite (the existing file will be saved as configs/litellm_config.yaml.before-restore)."
+            fi
+            cp "$litellm_target" "$litellm_target.before-restore"
+            warn "Existing configs/litellm_config.yaml saved to configs/litellm_config.yaml.before-restore"
+        fi
+        if [ ! -f "$litellm_target" ] || ! cmp -s "$litellm_target" "$snap_litellm"; then
+            cp "$snap_litellm" "$litellm_target"
+        fi
+        ok "Restored configs/litellm_config.yaml"
+    fi
 
     # ── versions.lock.env (optional) ───────────────────────────────────────────
     # 不强制覆盖 lock 文件——新仓库自带的 lock 通常更新更全；但记录工作区镜像 tag 以便后续 update-workspace。
     if [ -f "$snapshot/versions.lock.env.bak" ] && [ -f "$LOCK_FILE" ]; then
+        load_config
         local snap_ws_tag
         snap_ws_tag="$(grep -E '^WORKSPACE_IMAGE_TAG=' "$snapshot/versions.lock.env.bak" | head -n1 | cut -d= -f2 || true)"
         if [ -n "$snap_ws_tag" ]; then
@@ -1160,6 +1221,10 @@ upgrade_restore_config() {
     if [ -f "$snapshot/setup-done.bak" ] && [ ! -f "$DOCKER_DIR/.setup-done" ]; then
         cp "$snapshot/setup-done.bak" "$DOCKER_DIR/.setup-done"
         ok "Restored docker/.setup-done (skips first-run admin creation)"
+    fi
+    if [ -f "$DOCKER_DIR/.setup-done" ]; then
+        date > "$UPGRADE_PENDING_FILE"
+        ok "Marked workspace template refresh pending for next up"
     fi
 
     # ── Sanity ─────────────────────────────────────────────────────────────────
@@ -1177,9 +1242,9 @@ upgrade_restore_config() {
     ok "Configuration restored from $snapshot"
     echo
     info "Next steps:"
-    echo -e "  1) Sanity-check ${BLUE}docker/.env${NC} — review any new keys appended from versions.lock.env"
+    echo -e "  1) Sanity-check ${BLUE}docker/.env${NC} and ${BLUE}configs/versions.lock.env${NC}"
     echo -e "  2) ${BLUE}bash scripts/manage.sh load${NC} [--ldap --skillhub …]"
-    echo -e "  3) ${BLUE}bash scripts/manage.sh up${NC}        # new coder migrates the DB schema in-place"
+    echo -e "  3) ${BLUE}bash scripts/manage.sh up${NC} [--ldap --skillhub …]  # new coder migrates the DB schema in-place"
     echo -e "  4) Verify a real user can log in, then build a tagged workspace image:"
     echo -e "     ${BLUE}bash scripts/manage.sh update-workspace --tag v\$(date +%Y%m%d)${NC}"
     echo -e "  5) Have users restart their workspaces in the UI to pick up the new image"
@@ -1553,6 +1618,15 @@ else:
 PY
 }
 
+_rv_repository_from_ref() {
+    local ref="${1%%@*}"
+    if [[ "$ref" == *:* && "${ref##*:}" != */* ]]; then
+        printf '%s\n' "${ref%:*}"
+    else
+        printf '%s\n' "$ref"
+    fi
+}
+
 _rv_latest_provider_version() {
     local namespace="$1"
     local provider_type="$2"
@@ -1605,25 +1679,25 @@ refresh_versions() {
     local OLD_GITEA_IMAGE_REF="${GITEA_IMAGE_REF:-}"
     local OLD_PYPISERVER_IMAGE_REF="${PYPISERVER_IMAGE_REF:-}"
 
-    CODER_IMAGE_REF="$(_rv_resolve_digest "${CODER_IMAGE_REF%%@*}" "$CODER_IMAGE_TAG")"
-    POSTGRES_IMAGE_REF="$(_rv_resolve_digest "${POSTGRES_IMAGE_REF%%@*}" "$POSTGRES_IMAGE_TAG")"
-    NGINX_IMAGE_REF="$(_rv_resolve_digest "${NGINX_IMAGE_REF%%@*}" "$NGINX_IMAGE_TAG")"
-    LITELLM_IMAGE_REF="$(_rv_resolve_digest "${LITELLM_IMAGE_REF%%@*}" "$LITELLM_IMAGE_TAG")"
-    CODE_SERVER_BASE_IMAGE_REF="$(_rv_resolve_digest "${CODE_SERVER_BASE_IMAGE_REF%%@*}" "$CODE_SERVER_BASE_IMAGE_TAG")"
+    CODER_IMAGE_REF="$(_rv_resolve_digest "$(_rv_repository_from_ref "$CODER_IMAGE_REF")" "$CODER_IMAGE_TAG")"
+    POSTGRES_IMAGE_REF="$(_rv_resolve_digest "$(_rv_repository_from_ref "$POSTGRES_IMAGE_REF")" "$POSTGRES_IMAGE_TAG")"
+    NGINX_IMAGE_REF="$(_rv_resolve_digest "$(_rv_repository_from_ref "$NGINX_IMAGE_REF")" "$NGINX_IMAGE_TAG")"
+    LITELLM_IMAGE_REF="$(_rv_resolve_digest "$(_rv_repository_from_ref "$LITELLM_IMAGE_REF")" "$LITELLM_IMAGE_TAG")"
+    CODE_SERVER_BASE_IMAGE_REF="$(_rv_resolve_digest "$(_rv_repository_from_ref "$CODE_SERVER_BASE_IMAGE_REF")" "$CODE_SERVER_BASE_IMAGE_TAG")"
     TF_PROVIDER_CODER_VERSION="$(_rv_latest_provider_version coder coder "$TF_PROVIDER_CODER_VERSION")"
     TF_PROVIDER_DOCKER_VERSION="$(_rv_latest_provider_version kreuzwerker docker "$TF_PROVIDER_DOCKER_VERSION")"
     # Resolve optional service images only when they are present in the lock file
     if [ -n "${MINERU_IMAGE_REF:-}" ]; then
-        MINERU_IMAGE_REF="$(_rv_resolve_digest "${MINERU_IMAGE_REF%%@*}" "$MINERU_IMAGE_TAG")"
+        MINERU_IMAGE_REF="$(_rv_resolve_digest "$(_rv_repository_from_ref "$MINERU_IMAGE_REF")" "$MINERU_IMAGE_TAG")"
     fi
     if [ -n "${DOCCONV_IMAGE_REF:-}" ]; then
-        DOCCONV_IMAGE_REF="$(_rv_resolve_digest "${DOCCONV_IMAGE_REF%%@*}" "$DOCCONV_IMAGE_TAG")"
+        DOCCONV_IMAGE_REF="$(_rv_resolve_digest "$(_rv_repository_from_ref "$DOCCONV_IMAGE_REF")" "$DOCCONV_IMAGE_TAG")"
     fi
     if [ -n "${GITEA_IMAGE_REF:-}" ]; then
-        GITEA_IMAGE_REF="$(_rv_resolve_digest "${GITEA_IMAGE_REF%%@*}" "$GITEA_IMAGE_TAG")"
+        GITEA_IMAGE_REF="$(_rv_resolve_digest "$(_rv_repository_from_ref "$GITEA_IMAGE_REF")" "$GITEA_IMAGE_TAG")"
     fi
     if [ -n "${PYPISERVER_IMAGE_REF:-}" ]; then
-        PYPISERVER_IMAGE_REF="$(_rv_resolve_digest "${PYPISERVER_IMAGE_REF%%@*}" "$PYPISERVER_IMAGE_TAG")"
+        PYPISERVER_IMAGE_REF="$(_rv_resolve_digest "$(_rv_repository_from_ref "$PYPISERVER_IMAGE_REF")" "$PYPISERVER_IMAGE_TAG")"
     fi
 
     echo
@@ -1782,7 +1856,7 @@ skillhub_prepare() {
 _lock_image_digest() {
     local image_ref="$1" ref_key="$2" tag_key="$3"
     local digest tag
-    digest="$(docker image inspect "$image_ref" --format '{{json .RepoDigests}}' | python3 - "${image_ref%%:*}" <<'PY'
+    digest="$(docker image inspect "$image_ref" --format '{{json .RepoDigests}}' | python3 - "$(_rv_repository_from_ref "$image_ref")" <<'PY'
 import json,sys
 repo = sys.argv[1]
 digests = json.load(sys.stdin)
@@ -1794,8 +1868,12 @@ else:
 PY
 )"
     [ -n "$digest" ] || return 0
-    tag="${image_ref##*:}"
-    [ "$tag" = "$image_ref" ] && tag="latest"
+    tag="${image_ref%%@*}"
+    if [[ "$tag" == *:* && "${tag##*:}" != */* ]]; then
+        tag="${tag##*:}"
+    else
+        tag="latest"
+    fi
     if grep -q "^${ref_key}=" "$LOCK_FILE"; then
         sed -i "s|^${ref_key}=.*|${ref_key}=${digest}|" "$LOCK_FILE"
     else

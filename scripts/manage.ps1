@@ -9,6 +9,7 @@ param(
     [switch]$Ldap,
     [switch]$Mineru,
     [switch]$Doctools,
+    [switch]$SkillHub,
     [string]$Tag = "",
     [switch]$Apply,
     [switch]$RequireLlm,
@@ -28,12 +29,14 @@ $DockerDir   = Join-Path $ProjectRoot "docker"
 $ConfigsDir  = Join-Path $ProjectRoot "configs"
 $EnvFile     = Join-Path $DockerDir ".env"
 $SetupDone   = Join-Path $DockerDir ".setup-done"
+$UpgradePending = Join-Path $DockerDir ".upgrade-restore-pending"
 $ImagesDir   = Join-Path $ProjectRoot "images"
 $LockFile    = Join-Path $ConfigsDir "versions.lock.env"
 $script:UseLlm      = $Llm.IsPresent
 $script:UseLdap     = $Ldap.IsPresent
 $script:UseMineru   = $Mineru.IsPresent
 $script:UseDoctools = $Doctools.IsPresent
+$script:UseSkillHub = $SkillHub.IsPresent
 $script:Apply      = $Apply.IsPresent
 $script:RequireLlm = $RequireLlm.IsPresent
 $script:SkipImages = $SkipImages.IsPresent
@@ -77,6 +80,8 @@ function Initialize-Dirs {
         (Join-Path $ConfigsDir "terraform-providers"),
         (Join-Path $ConfigsDir "vsix"),
         (Join-Path $ConfigsDir "provider-mirror\registry.terraform.io"),
+        (Join-Path $ConfigsDir "gitea\seeds"),
+        (Join-Path $ConfigsDir "pypi\packages"),
         (Join-Path $ProjectRoot "images"),
         (Join-Path $ProjectRoot "logs\nginx")
     )) {
@@ -89,6 +94,33 @@ function Get-Config {
         Ensure-EnvDefaults -EnvFile $EnvFile -ConfigsDir $ConfigsDir
     }
     return Get-EffectiveConfig -ConfigsDir $ConfigsDir -EnvFile $EnvFile
+}
+
+function Get-ConfigValueOrDefault {
+    param(
+        [hashtable]$Config,
+        [string]$Key,
+        [string]$Default
+    )
+    if ($Config.ContainsKey($Key) -and $Config[$Key]) { return $Config[$Key] }
+    return $Default
+}
+
+function Get-ImageRepositoryFromRef {
+    param([string]$ImageRef)
+    if (-not $ImageRef) { return '' }
+    $withoutDigest = ($ImageRef -split '@', 2)[0]
+    if ($withoutDigest -match '^(?<repo>.+):[^/:]+$') {
+        return $Matches.repo
+    }
+    return $withoutDigest
+}
+
+function Set-ProcessEnvFromConfig {
+    param([hashtable]$Config)
+    foreach ($entry in $Config.GetEnumerator()) {
+        [System.Environment]::SetEnvironmentVariable($entry.Key, [string]$entry.Value, 'Process')
+    }
 }
 
 function New-RandomHex {
@@ -268,6 +300,10 @@ function Invoke-Pull {
     if ($script:UseLdap)     { $images.Add($cfg['DEX_IMAGE_REF']) }
     if ($script:UseMineru)   { $images.Add($cfg['MINERU_IMAGE_REF']) }
     if ($script:UseDoctools) { $images.Add($cfg['DOCCONV_IMAGE_REF']) }
+    if ($script:UseSkillHub) {
+        $images.Add((Get-ConfigValueOrDefault -Config $cfg -Key 'GITEA_IMAGE_REF' -Default 'gitea/gitea:latest'))
+        $images.Add((Get-ConfigValueOrDefault -Config $cfg -Key 'PYPISERVER_IMAGE_REF' -Default 'pypiserver/pypiserver:latest'))
+    }
 
     foreach ($image in $images) {
         Write-Info "Pulling $image"
@@ -328,6 +364,10 @@ function Invoke-Save {
     if ($script:UseLdap)     { $images.Add($cfg['DEX_IMAGE_REF']) }
     if ($script:UseMineru)   { $images.Add($cfg['MINERU_IMAGE_REF']) }
     if ($script:UseDoctools) { $images.Add($cfg['DOCCONV_IMAGE_REF']) }
+    if ($script:UseSkillHub) {
+        $images.Add((Get-ConfigValueOrDefault -Config $cfg -Key 'GITEA_IMAGE_REF' -Default 'gitea/gitea:latest'))
+        $images.Add((Get-ConfigValueOrDefault -Config $cfg -Key 'PYPISERVER_IMAGE_REF' -Default 'pypiserver/pypiserver:latest'))
+    }
 
     # Build a digest-ref -> name:tag fallback map in case the digest ref is no longer cached
     # (e.g. after pulling a newer version of the tag via refresh-versions without -Apply).
@@ -340,7 +380,9 @@ function Invoke-Save {
         @{ Ref = 'CODE_SERVER_BASE_IMAGE_REF'; Tag = 'CODE_SERVER_BASE_IMAGE_TAG' },
         @{ Ref = 'DEX_IMAGE_REF';              Tag = 'DEX_IMAGE_TAG' },
         @{ Ref = 'MINERU_IMAGE_REF';           Tag = 'MINERU_IMAGE_TAG' },
-        @{ Ref = 'DOCCONV_IMAGE_REF';          Tag = 'DOCCONV_IMAGE_TAG' }
+        @{ Ref = 'DOCCONV_IMAGE_REF';          Tag = 'DOCCONV_IMAGE_TAG' },
+        @{ Ref = 'GITEA_IMAGE_REF';            Tag = 'GITEA_IMAGE_TAG' },
+        @{ Ref = 'PYPISERVER_IMAGE_REF';       Tag = 'PYPISERVER_IMAGE_TAG' }
     )) {
         $r = $cfg[$entry.Ref]; $t = $cfg[$entry.Tag]
         if ($r -and $t -and ($r -match '@sha256:')) {
@@ -411,7 +453,9 @@ function Invoke-Load {
         @{ Ref = 'CODE_SERVER_BASE_IMAGE_REF'; Tag = 'CODE_SERVER_BASE_IMAGE_TAG' },
         @{ Ref = 'DEX_IMAGE_REF';              Tag = 'DEX_IMAGE_TAG' },
         @{ Ref = 'MINERU_IMAGE_REF';           Tag = 'MINERU_IMAGE_TAG' },
-        @{ Ref = 'DOCCONV_IMAGE_REF';          Tag = 'DOCCONV_IMAGE_TAG' }
+        @{ Ref = 'DOCCONV_IMAGE_REF';          Tag = 'DOCCONV_IMAGE_TAG' },
+        @{ Ref = 'GITEA_IMAGE_REF';            Tag = 'GITEA_IMAGE_TAG' },
+        @{ Ref = 'PYPISERVER_IMAGE_REF';       Tag = 'PYPISERVER_IMAGE_TAG' }
     )) {
         $ref = $cfg[$entry.Ref]
         $tag = $cfg[$entry.Tag]
@@ -457,6 +501,7 @@ function Invoke-Up {
     }
 
     $cfg = Get-Config
+    Set-ProcessEnvFromConfig -Config $cfg
     $sslDir = Join-Path $ConfigsDir 'ssl'
     if (-not (Test-Path (Join-Path $sslDir 'server.crt'))) {
         Write-Warn 'TLS leaf certificate not found. Generating one now.'
@@ -511,7 +556,11 @@ function Invoke-Up {
         @{ Ref = 'POSTGRES_IMAGE_REF'; Tag = 'POSTGRES_IMAGE_TAG' },
         @{ Ref = 'NGINX_IMAGE_REF';    Tag = 'NGINX_IMAGE_TAG'    },
         @{ Ref = 'LITELLM_IMAGE_REF';  Tag = 'LITELLM_IMAGE_TAG'  },
-        @{ Ref = 'DEX_IMAGE_REF';      Tag = 'DEX_IMAGE_TAG'      }
+        @{ Ref = 'DEX_IMAGE_REF';      Tag = 'DEX_IMAGE_TAG'      },
+        @{ Ref = 'MINERU_IMAGE_REF';   Tag = 'MINERU_IMAGE_TAG'   },
+        @{ Ref = 'DOCCONV_IMAGE_REF';  Tag = 'DOCCONV_IMAGE_TAG'  },
+        @{ Ref = 'GITEA_IMAGE_REF';    Tag = 'GITEA_IMAGE_TAG'    },
+        @{ Ref = 'PYPISERVER_IMAGE_REF'; Tag = 'PYPISERVER_IMAGE_TAG' }
     )) {
         $ref = $cfg[$mapping.Ref]
         $tag = $cfg[$mapping.Tag]
@@ -534,6 +583,8 @@ function Invoke-Up {
         if (-not $script:UseLdap     -and $img -match 'dexidp')  { continue }
         if (-not $script:UseMineru   -and $img -match 'mineru')   { continue }
         if (-not $script:UseDoctools -and $img -match 'pandoc')   { continue }
+        if (-not $script:UseSkillHub -and $img -match 'gitea')    { continue }
+        if (-not $script:UseSkillHub -and $img -match 'pypiserver') { continue }
         docker image inspect $img 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { $missingImages.Add($img) }
     }
@@ -549,6 +600,7 @@ function Invoke-Up {
     if ($script:UseLdap)     { $composeArgs.AddRange([string[]]@('--profile', 'ldap')) }
     if ($script:UseMineru)   { $composeArgs.AddRange([string[]]@('--profile', 'mineru')) }
     if ($script:UseDoctools) { $composeArgs.AddRange([string[]]@('--profile', 'doctools')) }
+    if ($script:UseSkillHub) { $composeArgs.AddRange([string[]]@('--profile', 'skillhub')) }
     $composeArgs.AddRange([string[]]@('up', '-d'))
     Push-Location $DockerDir
     docker compose @composeArgs
@@ -565,6 +617,10 @@ function Invoke-Up {
         Write-Warn 'First startup detected. Running setup-coder after a short delay.'
         Start-Sleep -Seconds 8
         Invoke-SetupCoder
+    } elseif (Test-Path $UpgradePending) {
+        Write-Warn 'Upgrade restore detected. Refreshing workspace template after startup.'
+        Start-Sleep -Seconds 8
+        Invoke-UpgradeTemplateRefresh
     } else {
         Show-AccessInfo
     }
@@ -572,11 +628,13 @@ function Invoke-Up {
 
 function Invoke-Down {
     Assert-Docker
+    Set-ProcessEnvFromConfig -Config (Get-Config)
     $downArgs = [System.Collections.Generic.List[string]]@()
     if ($script:UseLlm)      { $downArgs.AddRange([string[]]@('--profile', 'llm')) }
     if ($script:UseLdap)     { $downArgs.AddRange([string[]]@('--profile', 'ldap')) }
     if ($script:UseMineru)   { $downArgs.AddRange([string[]]@('--profile', 'mineru')) }
     if ($script:UseDoctools) { $downArgs.AddRange([string[]]@('--profile', 'doctools')) }
+    if ($script:UseSkillHub) { $downArgs.AddRange([string[]]@('--profile', 'skillhub')) }
     $downArgs.Add('down')
     Push-Location $DockerDir
     docker compose @downArgs
@@ -694,6 +752,52 @@ function Invoke-SetupCoder {
     Show-AccessInfo
 }
 
+function Invoke-UpgradeTemplateRefresh {
+    if (-not (Test-Path $EnvFile)) {
+        Write-Fail 'Run init first.'
+        exit 1
+    }
+
+    $cfg = Get-Config
+    $internalPort = if ($cfg['CODER_INTERNAL_PORT']) { $cfg['CODER_INTERNAL_PORT'] } else { '7080' }
+    $baseUrl = "http://localhost:$internalPort"
+
+    Write-Info 'Waiting for Coder health endpoint...'
+    $ready = $false
+    for ($i = 0; $i -lt 60; $i++) {
+        try {
+            $response = Invoke-WebRequest -Uri "$baseUrl/healthz" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+            if ($response.StatusCode -eq 200) {
+                $ready = $true
+                break
+            }
+        } catch {}
+        Start-Sleep -Seconds 3
+    }
+    if (-not $ready) {
+        Write-Fail 'Coder did not become ready within 180 seconds.'
+        exit 1
+    }
+    Write-OK 'Coder is ready.'
+
+    $adminEmail = if ($cfg['CODER_ADMIN_EMAIL']) { $cfg['CODER_ADMIN_EMAIL'] } else { 'admin@company.local' }
+    $adminPassword = if ($cfg['CODER_ADMIN_PASSWORD']) { $cfg['CODER_ADMIN_PASSWORD'] } else { '' }
+    $loginBody = '{"email":"' + $adminEmail + '","password":"' + $adminPassword + '"}'
+    $loginResponse = Invoke-RestMethod -Uri "$baseUrl/api/v2/users/login" -Method POST -ContentType 'application/json' -Body $loginBody
+    $sessionToken = $loginResponse.session_token
+    if (-not $sessionToken) {
+        Write-Fail 'Failed to get Coder session token. Check admin credentials in docker/.env.'
+        exit 1
+    }
+    Write-OK 'Logged in and obtained session token.'
+
+    Invoke-PushTemplate -SessionToken $sessionToken
+    Remove-Item $UpgradePending -Force -ErrorAction SilentlyContinue
+
+    Write-OK 'Upgrade template refresh complete.'
+    Show-AccessInfo
+}
+
 # Shared template push — called by setup-coder, push-template, update-workspace, load-workspace
 function Invoke-PushTemplate {
     param([string]$SessionToken)
@@ -722,7 +826,8 @@ function Invoke-PushTemplate {
 
     $serverHost  = if ($cfg['SERVER_HOST'])  { $cfg['SERVER_HOST'] }  else { 'localhost' }
     $gatewayPort = if ($cfg['GATEWAY_PORT']) { $cfg['GATEWAY_PORT'] } else { '8443' }
-    $pushCmd = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$SessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' --var server_host='$serverHost' --var gateway_port='$gatewayPort' ; rm -rf /tmp/template-push"
+    $skillHubEnabled = if ($script:UseSkillHub) { 'true' } else { 'false' }
+    $pushCmd = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$SessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' --var server_host='$serverHost' --var gateway_port='$gatewayPort' --var skillhub_enabled='$skillHubEnabled' ; rm -rf /tmp/template-push"
     docker exec coder-server sh -c $pushCmd
     if ($LASTEXITCODE -ne 0) {
         Write-Fail 'Template push failed.'
@@ -750,6 +855,10 @@ function Show-AccessInfo {
     }
     if ($script:UseDoctools) {
         Write-Host "  Pandoc docconv:  https://${serverHost}:${gatewayPort}/docconv/  (Markdown -> Word/PDF)" -ForegroundColor White
+    }
+    if ($script:UseSkillHub) {
+        Write-Host "  Skill Hub:       https://${serverHost}:${gatewayPort}/gitea/" -ForegroundColor White
+        Write-Host "  PyPI Mirror:     https://${serverHost}:${gatewayPort}/pypi/" -ForegroundColor White
     }
 }
 
@@ -958,10 +1067,14 @@ function Invoke-UpgradeBackup {
     if (Test-Path $LockFile) {
         Copy-Item $LockFile (Join-Path $Dest 'versions.lock.env.bak')
     }
+    $litellmConfig = Join-Path $ConfigsDir 'litellm_config.yaml'
+    if (Test-Path $litellmConfig) {
+        Copy-Item $litellmConfig (Join-Path $Dest 'litellm_config.yaml.bak')
+    }
     if (Test-Path $SetupDone) {
         Copy-Item $SetupDone (Join-Path $Dest 'setup-done.bak')
     }
-    Write-OK "      env.bak, ssl\, versions.lock.env.bak"
+    Write-OK "      env.bak, ssl\, versions.lock.env.bak, litellm_config.yaml.bak (if present)"
 
     # Step 5: metadata
     Write-Info '[5/5] Writing meta.json'
@@ -1000,7 +1113,7 @@ function Invoke-UpgradeBackup {
     Write-Host '  3) git fetch && git checkout <new-ref>'
     Write-Host '  4) .\scripts\manage.ps1 upgrade-restore-config <snapshot-dir>'
     Write-Host '  5) .\scripts\manage.ps1 load          # plus -Ldap -SkillHub etc as needed'
-    Write-Host '  6) .\scripts\manage.ps1 up            # new coder migrates DB in-place'
+    Write-Host '  6) .\scripts\manage.ps1 up [-Ldap -SkillHub ...]  # new coder migrates DB in-place'
     Write-Host '  7) .\scripts\manage.ps1 update-workspace -Tag v$(Get-Date -Format yyyyMMdd)'
 }
 
@@ -1030,14 +1143,21 @@ function Invoke-UpgradeRestoreConfig {
 
     # .env
     if (Test-Path $EnvFile) {
-        if (-not $Force) {
-            Write-Fail "$EnvFile already exists. Pass -Force to overwrite (the existing file will be saved as .env.before-restore)."
-            exit 1
+        $envMatches = ((Get-FileHash $EnvFile -Algorithm SHA256).Hash -eq (Get-FileHash $envBak -Algorithm SHA256).Hash)
+        if ($envMatches) {
+            Write-Info 'Existing docker/.env already matches snapshot'
+        } else {
+            if (-not $Force) {
+                Write-Fail "$EnvFile already exists and differs from snapshot. Pass -Force to overwrite (the existing file will be saved as .env.before-restore)."
+                exit 1
+            }
+            Copy-Item $EnvFile "$EnvFile.before-restore"
+            Write-Warn "Existing docker/.env saved to $EnvFile.before-restore"
         }
-        Copy-Item $EnvFile "$EnvFile.before-restore"
-        Write-Warn "Existing docker/.env saved to $EnvFile.before-restore"
     }
-    Copy-Item $envBak $EnvFile
+    if ((-not (Test-Path $EnvFile)) -or ((Get-FileHash $EnvFile -Algorithm SHA256).Hash -ne (Get-FileHash $envBak -Algorithm SHA256).Hash)) {
+        Copy-Item $envBak $EnvFile
+    }
     Write-OK 'Restored docker/.env'
     Ensure-EnvDefaults -EnvFile $EnvFile -ConfigsDir $ConfigsDir
 
@@ -1045,31 +1165,69 @@ function Invoke-UpgradeRestoreConfig {
     $sslTarget = Join-Path $ConfigsDir 'ssl'
     $caExisting = Join-Path $sslTarget 'ca.crt'
     $caSnapshot = Join-Path $sslBak 'ca.crt'
-    if ((Test-Path $caExisting) -and (Test-Path $caSnapshot)) {
-        $existingHash = (Get-FileHash $caExisting -Algorithm SHA256).Hash
-        $snapshotHash = (Get-FileHash $caSnapshot -Algorithm SHA256).Hash
-        if ($existingHash -ne $snapshotHash) {
+    $sslSame = $false
+    if ((Test-Path $sslTarget) -and (Get-ChildItem $sslTarget -Force -ErrorAction SilentlyContinue)) {
+        $left = Get-ChildItem $sslTarget -Recurse -File | ForEach-Object {
+            [pscustomobject]@{
+                Path = [System.IO.Path]::GetRelativePath($sslTarget, $_.FullName)
+                Hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+            }
+        } | Sort-Object Path
+        $right = Get-ChildItem $sslBak -Recurse -File | ForEach-Object {
+            [pscustomobject]@{
+                Path = [System.IO.Path]::GetRelativePath($sslBak, $_.FullName)
+                Hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+            }
+        } | Sort-Object Path
+        $sslSame = (-not (Compare-Object $left $right -Property Path,Hash))
+        if ($sslSame) {
+            Write-Info 'Existing configs/ssl already matches snapshot'
+        } elseif ((Test-Path $caExisting) -and (Test-Path $caSnapshot) -and ((Get-FileHash $caExisting -Algorithm SHA256).Hash -ne (Get-FileHash $caSnapshot -Algorithm SHA256).Hash)) {
             if (-not $Force) {
                 Write-Fail 'configs/ssl/ca.crt differs from snapshot. Pass -Force to overwrite. WARNING: workspaces built against the current CA will need to be rebuilt.'
                 exit 1
             }
+        } elseif (-not $Force) {
+            Write-Fail 'configs/ssl already exists and differs from snapshot. Pass -Force to overwrite (the existing tree will be saved as configs/ssl.before-restore).'
+            exit 1
         }
     }
-    if (Test-Path $sslTarget) {
+    if ((Test-Path $sslTarget) -and (-not $sslSame)) {
         $backupSsl = Join-Path $ConfigsDir 'ssl.before-restore'
         Remove-Item -Recurse -Force $backupSsl -ErrorAction SilentlyContinue
         Move-Item $sslTarget $backupSsl
         Write-Warn 'Existing configs/ssl saved to configs/ssl.before-restore'
     }
-    New-Item -ItemType Directory -Path $sslTarget -Force | Out-Null
-    foreach ($item in (Get-ChildItem $sslBak -ErrorAction SilentlyContinue)) {
-        Copy-Item $item.FullName $sslTarget -Recurse -Force
+    if (-not $sslSame) {
+        New-Item -ItemType Directory -Path $sslTarget -Force | Out-Null
+        foreach ($item in (Get-ChildItem $sslBak -ErrorAction SilentlyContinue)) {
+            Copy-Item $item.FullName $sslTarget -Recurse -Force
+        }
     }
     Write-OK 'Restored configs/ssl/ (CA + leaf certificate)'
+
+    # LiteLLM runtime config
+    $litellmBak = Join-Path $SnapshotDir 'litellm_config.yaml.bak'
+    $litellmTarget = Join-Path $ConfigsDir 'litellm_config.yaml'
+    if (Test-Path $litellmBak) {
+        if ((Test-Path $litellmTarget) -and ((Get-FileHash $litellmTarget -Algorithm SHA256).Hash -ne (Get-FileHash $litellmBak -Algorithm SHA256).Hash)) {
+            if (-not $Force) {
+                Write-Fail 'configs/litellm_config.yaml exists and differs from snapshot. Pass -Force to overwrite (the existing file will be saved as litellm_config.yaml.before-restore).'
+                exit 1
+            }
+            Copy-Item $litellmTarget "$litellmTarget.before-restore"
+            Write-Warn 'Existing configs/litellm_config.yaml saved to configs/litellm_config.yaml.before-restore'
+        }
+        if ((-not (Test-Path $litellmTarget)) -or ((Get-FileHash $litellmTarget -Algorithm SHA256).Hash -ne (Get-FileHash $litellmBak -Algorithm SHA256).Hash)) {
+            Copy-Item $litellmBak $litellmTarget
+        }
+        Write-OK 'Restored configs/litellm_config.yaml'
+    }
 
     # versions.lock.env reference
     $lockBak = Join-Path $SnapshotDir 'versions.lock.env.bak'
     if ((Test-Path $lockBak) -and (Test-Path $LockFile)) {
+        $cfg = Get-Config
         $match = Select-String -Path $lockBak -Pattern '^WORKSPACE_IMAGE_TAG=(.*)$' -ErrorAction SilentlyContinue
         if ($match) {
             $bakTag = $match.Matches.Groups[1].Value.Trim()
@@ -1084,6 +1242,10 @@ function Invoke-UpgradeRestoreConfig {
     if ((Test-Path $setupDoneBak) -and (-not (Test-Path $SetupDone))) {
         Copy-Item $setupDoneBak $SetupDone
         Write-OK 'Restored docker/.setup-done (skips first-run admin creation)'
+    }
+    if (Test-Path $SetupDone) {
+        Get-Date | Set-Content $UpgradePending
+        Write-OK 'Marked workspace template refresh pending for next up'
     }
 
     # Sanity
@@ -1106,9 +1268,9 @@ function Invoke-UpgradeRestoreConfig {
     Write-OK "Configuration restored from $SnapshotDir"
     Write-Host ''
     Write-Info 'Next steps:'
-    Write-Host '  1) Sanity-check docker/.env — review any new keys appended from versions.lock.env'
+    Write-Host '  1) Sanity-check docker/.env and configs\versions.lock.env'
     Write-Host '  2) .\scripts\manage.ps1 load [-Ldap -SkillHub …]'
-    Write-Host '  3) .\scripts\manage.ps1 up       # new coder migrates the DB schema in-place'
+    Write-Host '  3) .\scripts\manage.ps1 up [-Ldap -SkillHub ...]  # new coder migrates the DB schema in-place'
     Write-Host '  4) Verify a real user can log in, then build a tagged workspace image:'
     Write-Host '     .\scripts\manage.ps1 update-workspace -Tag v$(Get-Date -Format yyyyMMdd)'
     Write-Host '  5) Have users restart their workspaces in the UI to pick up the new image'
@@ -1375,6 +1537,10 @@ function Invoke-PrepareSavePlatformImages {
     if ($script:UseLlm)      { $images.Add($cfg['LITELLM_IMAGE_REF']) }
     if ($script:UseMineru)   { $images.Add($cfg['MINERU_IMAGE_REF']) }
     if ($script:UseDoctools) { $images.Add($cfg['DOCCONV_IMAGE_REF']) }
+    if ($script:UseSkillHub) {
+        $images.Add((Get-ConfigValueOrDefault -Config $cfg -Key 'GITEA_IMAGE_REF' -Default 'gitea/gitea:latest'))
+        $images.Add((Get-ConfigValueOrDefault -Config $cfg -Key 'PYPISERVER_IMAGE_REF' -Default 'pypiserver/pypiserver:latest'))
+    }
 
     foreach ($image in $images) {
         Write-Info "Pulling $image"
@@ -1434,12 +1600,17 @@ function Invoke-PrepareWriteManifest {
     if ($script:UseLlm)      { $images += (& $imageEntry $cfg['LITELLM_IMAGE_REF']) }
     if ($script:UseMineru)   { $images += (& $imageEntry $cfg['MINERU_IMAGE_REF']) }
     if ($script:UseDoctools) { $images += (& $imageEntry $cfg['DOCCONV_IMAGE_REF']) }
+    if ($script:UseSkillHub) {
+        $images += (& $imageEntry (Get-ConfigValueOrDefault -Config $cfg -Key 'GITEA_IMAGE_REF' -Default 'gitea/gitea:latest'))
+        $images += (& $imageEntry (Get-ConfigValueOrDefault -Config $cfg -Key 'PYPISERVER_IMAGE_REF' -Default 'pypiserver/pypiserver:latest'))
+    }
 
     $manifest = [ordered]@{
         generated_at_utc = (Get-Date).ToUniversalTime().ToString('o')
         include_llm      = [bool]$script:UseLlm
         include_mineru   = [bool]$script:UseMineru
         include_doctools = [bool]$script:UseDoctools
+        include_skillhub = [bool]$script:UseSkillHub
         terraform_cli_config_mount_default = '../configs/terraform-offline.rc'
         ca_sha256 = if (Test-Path $caCert) { (Get-FileHash $caCert -Algorithm SHA256).Hash.ToLowerInvariant() } else { '' }
         images = $images
@@ -1576,9 +1747,17 @@ function Invoke-RefreshVersions {
         @{ RefKey = 'LITELLM_IMAGE_REF';          TagKey = 'LITELLM_IMAGE_TAG' },
         @{ RefKey = 'CODE_SERVER_BASE_IMAGE_REF'; TagKey = 'CODE_SERVER_BASE_IMAGE_TAG' }
     )
+    foreach ($prefix in @('MINERU', 'DOCCONV', 'GITEA', 'PYPISERVER')) {
+        $refKey = "$($prefix)_IMAGE_REF"
+        $tagKey = "$($prefix)_IMAGE_TAG"
+        if ($current.ContainsKey($refKey) -and $current.ContainsKey($tagKey)) {
+            $imageTargets += @{ RefKey = $refKey; TagKey = $tagKey }
+        }
+    }
 
     foreach ($target in $imageTargets) {
-        $repository = ($current[$target.RefKey] -split '@')[0]
+        if (-not $current[$target.RefKey] -or -not $current[$target.TagKey]) { continue }
+        $repository = Get-ImageRepositoryFromRef $current[$target.RefKey]
         $tag = $current[$target.TagKey]
         $tagRef = "${repository}:${tag}"
         Write-Info "Pulling $tagRef"
@@ -1600,7 +1779,12 @@ function Invoke-RefreshVersions {
 
     Write-Host ''
     Write-Host 'Proposed version lock updates:' -ForegroundColor Cyan
-    foreach ($key in @('CODER_IMAGE_REF','POSTGRES_IMAGE_REF','NGINX_IMAGE_REF','LITELLM_IMAGE_REF','CODE_SERVER_BASE_IMAGE_REF','TF_PROVIDER_CODER_VERSION','TF_PROVIDER_DOCKER_VERSION')) {
+    $displayKeys = @('CODER_IMAGE_REF','POSTGRES_IMAGE_REF','NGINX_IMAGE_REF','LITELLM_IMAGE_REF','CODE_SERVER_BASE_IMAGE_REF','TF_PROVIDER_CODER_VERSION','TF_PROVIDER_DOCKER_VERSION')
+    foreach ($prefix in @('MINERU', 'DOCCONV', 'GITEA', 'PYPISERVER')) {
+        $refKey = "$($prefix)_IMAGE_REF"
+        if ($updated.ContainsKey($refKey)) { $displayKeys += $refKey }
+    }
+    foreach ($key in $displayKeys) {
         if ($current[$key] -ne $updated[$key]) {
             Write-Host "  $key" -ForegroundColor Yellow
             Write-Host "    old: $($current[$key])" -ForegroundColor DarkGray
@@ -1611,10 +1795,31 @@ function Invoke-RefreshVersions {
     }
 
     if ($script:Apply) {
-        $orderedKeys = @('CODER_IMAGE_REF','CODER_IMAGE_TAG','POSTGRES_IMAGE_REF','POSTGRES_IMAGE_TAG','NGINX_IMAGE_REF','NGINX_IMAGE_TAG','LITELLM_IMAGE_REF','LITELLM_IMAGE_TAG','CODE_SERVER_BASE_IMAGE_REF','CODE_SERVER_BASE_IMAGE_TAG','WORKSPACE_IMAGE','WORKSPACE_IMAGE_TAG','TF_PROVIDER_CODER_VERSION','TF_PROVIDER_DOCKER_VERSION')
+        $orderedKeys = @(
+            'CODER_IMAGE_REF','CODER_IMAGE_TAG',
+            'POSTGRES_IMAGE_REF','POSTGRES_IMAGE_TAG',
+            'NGINX_IMAGE_REF','NGINX_IMAGE_TAG',
+            'LITELLM_IMAGE_REF','LITELLM_IMAGE_TAG',
+            'DEX_IMAGE_REF','DEX_IMAGE_TAG',
+            'CODE_SERVER_BASE_IMAGE_REF','CODE_SERVER_BASE_IMAGE_TAG',
+            'WORKSPACE_IMAGE','WORKSPACE_IMAGE_TAG',
+            'TF_PROVIDER_CODER_VERSION','TF_PROVIDER_DOCKER_VERSION'
+        )
+        foreach ($prefix in @('MINERU', 'DOCCONV', 'GITEA', 'PYPISERVER')) {
+            $refKey = "$($prefix)_IMAGE_REF"
+            $tagKey = "$($prefix)_IMAGE_TAG"
+            if ($updated.ContainsKey($refKey)) {
+                $orderedKeys += $refKey
+                if ($updated.ContainsKey($tagKey)) { $orderedKeys += $tagKey }
+            }
+        }
         $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add('# Locked versions and digests for reproducible offline bundles.')
-        foreach ($key in $orderedKeys) { $lines.Add("$key=$($updated[$key])") }
+        foreach ($key in $orderedKeys) {
+            if ($updated.ContainsKey($key)) {
+                $lines.Add("$key=$($updated[$key])")
+            }
+        }
         [System.IO.File]::WriteAllText($LockFile, ($lines -join "`r`n") + "`r`n", [System.Text.UTF8Encoding]::new($false))
         Write-OK "Updated $LockFile"
     } else {
@@ -1625,7 +1830,7 @@ function Invoke-RefreshVersions {
 function Show-Help {
     $text = @(
         '',
-        'Usage: .\scripts\manage.ps1 <command> [arg] [-Llm] [-Ldap] [flags]',
+        'Usage: .\scripts\manage.ps1 <command> [arg] [-Llm] [-Ldap] [-SkillHub] [flags]',
         '',
         'Platform lifecycle:',
         '  init                        Create docker/.env from defaults',
@@ -1676,6 +1881,8 @@ function Show-Help {
         '                Requires nvidia-docker2 on host (runtime: nvidia, GPU 0)',
         '  -Doctools     Enable Pandoc Markdown->Word/PDF service (--profile doctools)',
         '                Uses pandoc --server (port 3030), supports mathml + xelatex',
+        '  -SkillHub     Enable Skill Hub marketplace + PyPI mirror (--profile skillhub)',
+        '                Requires Skill Hub images/packages to be prepared first',
         '  -Tag <v>      Workspace image tag for update-workspace',
         '  -Apply        Write changes to disk (refresh-versions)',
         '  -RequireLlm   Fail verify if LiteLLM image is absent',
@@ -1732,7 +1939,7 @@ switch ($Command.ToLower()) {
     'shell'            { Invoke-Shell; break }
     'setup-coder'      { Invoke-SetupCoder; break }
     'push-template'    { Invoke-CmdPushTemplate; break }
-    'update-workspace'      { Invoke-UpdateWorkspace -Tag $Tag; break }
+    'update-workspace'      { Invoke-UpdateWorkspace -NewTag $Tag; break }
     'load-workspace'        { Invoke-LoadWorkspace -TarFile $Arg1; break }
     'upgrade-backup'        { Invoke-UpgradeBackup; break }
     'upgrade-restore-config'{ Invoke-UpgradeRestoreConfig -SnapshotDir $Arg1; break }
