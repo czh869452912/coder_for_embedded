@@ -930,14 +930,24 @@ _workspace_image_profile_key() {
 _update_workspace_image_catalog() {
     local image_name="${1:-workspace-embedded}"
     local tag="${2:-latest}"
+    local requested_profile_key="${3:-}"
+    local requested_profile_name="${4:-}"
     local profile_key image_ref profile_name
-    profile_key="$(_workspace_image_profile_key "$image_name" "$tag")"
-    image_ref="${image_name}:${tag}"
-    local family_for_name=""
-    if family_for_name="$(_workspace_family_from_image_name "$image_name")"; then
-        profile_name="$(_workspace_family_display_name "$family_for_name")"
+    if [ -n "$requested_profile_key" ]; then
+        profile_key="$requested_profile_key"
     else
-        profile_name="${image_name} ${tag}"
+        profile_key="$(_workspace_image_profile_key "$image_name" "$tag")"
+    fi
+    image_ref="${image_name}:${tag}"
+    if [ -n "$requested_profile_name" ]; then
+        profile_name="$requested_profile_name"
+    else
+        local family_for_name=""
+        if family_for_name="$(_workspace_family_from_image_name "$image_name")"; then
+            profile_name="$(_workspace_family_display_name "$family_for_name")"
+        else
+            profile_name="${image_name} ${tag}"
+        fi
     fi
     mkdir -p "$(dirname "$WORKSPACE_IMAGE_CATALOG_FILE")"
     CATALOG_FILE="$WORKSPACE_IMAGE_CATALOG_FILE" \
@@ -1196,7 +1206,7 @@ update_workspace() {
     # Step 3: Update the bundle default and template image catalog after the
     # image artifact exists.
     _update_lock_workspace_family "$family" "$image_name" "$new_tag"
-    _update_workspace_image_catalog "$image_name" "$new_tag"
+    _update_workspace_image_catalog "$image_name" "$new_tag" "$(_workspace_family_profile_key "$family")" "$(_workspace_family_display_name "$family")"
 
     echo
     ok "Workspace image prepared: ${image_name}:${new_tag}"
@@ -1677,7 +1687,7 @@ _prepare_build_workspace() {
         info "Saving ${ws_image}:${ws_tag} -> $(basename "$tar_file")"
         docker save -o "$tar_file" "${ws_image}:${ws_tag}"
         ok "Saved $(basename "$tar_file")"
-        _update_workspace_image_catalog "$ws_image" "$ws_tag"
+        _update_workspace_image_catalog "$ws_image" "$ws_tag" "$(_workspace_family_profile_key "$family")" "$(_workspace_family_display_name "$family")"
     done
 }
 

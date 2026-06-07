@@ -988,14 +988,16 @@ function Get-WorkspaceImageProfileName {
 function Update-WorkspaceImageCatalog {
     param(
         [string]$ImageName,
-        [string]$Tag
+        [string]$Tag,
+        [string]$ProfileKey = '',
+        [string]$DisplayName = ''
     )
     if (-not $ImageName) { $ImageName = 'workspace-embedded' }
     if (-not $Tag) { $Tag = 'latest' }
 
-    $profileKey = Get-WorkspaceImageProfileKey -ImageName $ImageName -Tag $Tag
+    $profileKey = if ($ProfileKey) { $ProfileKey } else { Get-WorkspaceImageProfileKey -ImageName $ImageName -Tag $Tag }
     $imageRef = "${ImageName}:${Tag}"
-    $profileName = Get-WorkspaceImageProfileName -ImageName $ImageName -Tag $Tag -ProfileKey $profileKey
+    $profileName = if ($DisplayName) { $DisplayName } else { Get-WorkspaceImageProfileName -ImageName $ImageName -Tag $Tag -ProfileKey $profileKey }
 
     if (Test-Path $WorkspaceImageCatalogFile) {
         $catalog = Get-Content $WorkspaceImageCatalogFile -Raw | ConvertFrom-Json
@@ -1862,7 +1864,7 @@ function Invoke-UpdateWorkspace {
     # Step 3: Update the bundle default and template image catalog after the
     # image artifact exists.
     Update-LockWorkspaceFamily -FamilySpec $familySpec -ImageName $imageName -NewTag $NewTag
-    Update-WorkspaceImageCatalog -ImageName $imageName -Tag $NewTag | Out-Null
+    Update-WorkspaceImageCatalog -ImageName $imageName -Tag $NewTag -ProfileKey $resolved.ProfileKey -DisplayName $resolved.DisplayName | Out-Null
 
     Write-Host ''
     Write-OK "Workspace image prepared: ${imageName}:${NewTag}"
@@ -2054,7 +2056,7 @@ function Invoke-PrepareBuildWorkspace {
         docker save "$($resolved.ImageName):$($resolved.Tag)" -o $tarFile
         if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to save workspace image: $($resolved.ImageName):$($resolved.Tag)"; exit 1 }
         Write-OK "Saved $(Split-Path $tarFile -Leaf)"
-        Update-WorkspaceImageCatalog -ImageName $resolved.ImageName -Tag $resolved.Tag | Out-Null
+        Update-WorkspaceImageCatalog -ImageName $resolved.ImageName -Tag $resolved.Tag -ProfileKey $resolved.ProfileKey -DisplayName $resolved.DisplayName | Out-Null
     }
 }
 

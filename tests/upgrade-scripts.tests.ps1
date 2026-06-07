@@ -255,6 +255,7 @@ function Test-WorkspaceImageFamilyContracts {
     Assert-True 'PowerShell supports workspace image family flag' ($managePs1 -match '\[string\]\$Family')
     Assert-True 'PowerShell prepare builds all stable workspace images' ($managePs1 -match 'foreach \(\$family in Get-WorkspaceImageFamilies\)')
     Assert-True 'PowerShell manifest includes all stable workspace images' ($managePs1 -match 'Get-WorkspaceImageManifestEntries')
+    Assert-True 'PowerShell catalog updates accept explicit stable profile keys' ($managePs1 -match 'Update-WorkspaceImageCatalog[\s\S]*\[string\]\$ProfileKey' -and $managePs1 -match 'Update-WorkspaceImageCatalog[\s\S]*-ProfileKey \$resolved\.ProfileKey')
 
     Assert-True 'Bash declares workspace image families' ($manageSh -match '_workspace_families\(\)')
     Assert-True 'Bash supports workspace image family flag' ($manageSh -match '--family')
@@ -284,6 +285,8 @@ export WORKSPACE_IMAGE_CATALOG_FILE
 _update_workspace_image_catalog "workspace-embedded" "embedded-v20260608-r1"
 _update_workspace_image_catalog "workspace-python-backend" "python-backend-v20260608-r1"
 _update_workspace_image_catalog "workspace-agent-dev" "agent-dev-v20260608-r1"
+_update_workspace_image_catalog "registry.local/workspace-python-backend" "python-backend-v20260608-r2" "python_backend_stable" "Python Backend Stable"
+_update_workspace_image_catalog "registry.local/workspace-agent-dev" "agent-dev-v20260608-r2" "agent_dev_stable" "Agent Dev Stable"
 _update_workspace_image_catalog "workspace-ai" "ai-v20260608-r1"
 
 python3 - <<'PY'
@@ -297,12 +300,14 @@ assert catalog["default"] == "embedded_stable", catalog
 assert profiles["embedded_stable"]["name"] == "Embedded Stable", profiles
 assert profiles["embedded_stable"]["image"] == "workspace-embedded:embedded-v20260608-r1", profiles
 assert profiles["python_backend_stable"]["name"] == "Python Backend Stable", profiles
-assert profiles["python_backend_stable"]["image"] == "workspace-python-backend:python-backend-v20260608-r1", profiles
+assert profiles["python_backend_stable"]["image"] == "registry.local/workspace-python-backend:python-backend-v20260608-r2", profiles
 assert profiles["agent_dev_stable"]["name"] == "Agent Dev Stable", profiles
-assert profiles["agent_dev_stable"]["image"] == "workspace-agent-dev:agent-dev-v20260608-r1", profiles
+assert profiles["agent_dev_stable"]["image"] == "registry.local/workspace-agent-dev:agent-dev-v20260608-r2", profiles
 assert profiles["workspace_ai_ai_v20260608_r1"]["image"] == "workspace-ai:ai-v20260608-r1", profiles
 assert "workspace_python_backend_python_backend_v20260608_r1" not in profiles, profiles
 assert "workspace_agent_dev_agent_dev_v20260608_r1" not in profiles, profiles
+assert "registry_local_workspace_python_backend_python_backend_v20260608_r2" not in profiles, profiles
+assert "registry_local_workspace_agent_dev_agent_dev_v20260608_r2" not in profiles, profiles
 PY
 '@
     Invoke-BashText $script | Out-Null
