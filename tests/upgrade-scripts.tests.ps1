@@ -304,6 +304,7 @@ assert profiles["python_backend_stable"]["image"] == "registry.local/workspace-p
 assert profiles["agent_dev_stable"]["name"] == "Agent Dev Stable", profiles
 assert profiles["agent_dev_stable"]["image"] == "registry.local/workspace-agent-dev:agent-dev-v20260608-r2", profiles
 assert profiles["workspace_ai_ai_v20260608_r1"]["image"] == "workspace-ai:ai-v20260608-r1", profiles
+assert "workspace_embedded_embedded_v20260608_r1" not in profiles, profiles
 assert "workspace_python_backend_python_backend_v20260608_r1" not in profiles, profiles
 assert "workspace_agent_dev_agent_dev_v20260608_r1" not in profiles, profiles
 assert "registry_local_workspace_python_backend_python_backend_v20260608_r2" not in profiles, profiles

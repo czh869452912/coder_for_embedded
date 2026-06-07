@@ -211,7 +211,7 @@ bash scripts/manage.sh update-workspace --tag v$(date +%Y%m%d)
 - 用当前的 `Dockerfile.workspace` 构建新镜像（例如 `workspace-embedded:v20260427`）。
 - 保存为 `images/workspace-embedded_v20260427.tar`。
 - 更新 `configs/versions.lock.env` 中的 `WORKSPACE_IMAGE_TAG`。
-- 更新 `workspace-template/image-catalog.json`，让下一次 Coder template version 能暴露这个镜像。
+- 更新 `workspace-template/image-catalog.json` 中的稳定渠道 `embedded_stable`，让下一次 Coder template version 能暴露这个镜像。
 
 ### 5.2 推送并激活 Coder template version
 
@@ -228,7 +228,7 @@ coder templates versions promote --template=embedded-dev --template-version=work
 1. **Stop** 自己的工作区。
 2. **Start** 自己的工作区。
 
-Terraform 会重新 evaluate template，使用当前 `image_profile` 选择的镜像创建容器，但**仍然挂载原来的 home volume**。用户的所有文件和配置不受影响，只是容器内的系统工具（GCC、Claude Code、VS Code Server 等）变成了新版本。
+Terraform 会重新 evaluate template，使用当前 `image_profile` 选择的镜像创建容器。已有稳定工作区通常仍是 `image_profile=embedded_stable`，因此会跟随新 template version 中的稳定渠道镜像；同时**仍然挂载原来的 home volume**。用户的所有文件和配置不受影响，只是容器内的系统工具（GCC、Claude Code、VS Code Server 等）变成了新版本。
 
 ### 5.4 保留旧镜像直到全员迁移
 

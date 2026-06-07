@@ -50,7 +50,9 @@ The current template exposes these stable workspace image families:
 
 `embedded_stable` remains the default profile. A full `prepare` builds and saves
 all stable workspace profiles so the offline bundle contains every image a user
-can choose in the template.
+can choose in the template. A family release updates that stable profile key;
+candidate or alternate image names can add their own profiles without taking
+over the stable default.
 
 The current platform lock tracks GitHub latest Coder `v2.33.6`, resolved to a
 pinned digest, the Coder Terraform provider `2.18.0`, and workspace image tag
@@ -92,8 +94,9 @@ bash scripts/manage.sh update-workspace --family agent-dev --tag agent-dev-v2026
 
 Choose one family per workspace-only release. The command builds that workspace
 image, saves the image tarball, updates that family's tag in the version lock,
-and records the stable profile in the template image catalog. It does not
-activate a Coder template version.
+and records the stable profile in the template image catalog. The stable profile
+key remains the same and only its image ref changes. It does not activate a
+Coder template version.
 
 ### 2. Transfer to the offline server
 
@@ -191,7 +194,7 @@ contract is one of the supported families:
 Add more image profiles in the same Coder template when you need release
 channels for an existing workspace contract:
 
-- `embedded-stable-v20260607-r1`
+- `embedded_stable`
 - `embedded-candidate-v20260607-r1`
 
 Use multiple Coder templates when the user experience or toolchain contract is

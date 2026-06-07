@@ -282,7 +282,7 @@ The template exposes three stable workspace profiles:
 | `python_backend_stable` | `workspace-python-backend` | Python backend services, APIs, tests, and database clients |
 | `agent_dev_stable` | `workspace-agent-dev` | Interactive agent, MCP, and AI tooling development |
 
-`embedded_stable` remains the default. `prepare` builds and saves all stable workspace profiles so an offline deployment does not expose a profile whose image was not transferred.
+`embedded_stable` remains the default. `prepare` builds and saves all stable workspace profiles so an offline deployment does not expose a profile whose image was not transferred. A family release updates that stable profile's image ref instead of creating a new default profile for every tag, so existing stable workspaces can pick up the promoted image on restart.
 
 For the operational model behind workspace image tags, pilot releases, rollback, and multi-image planning, see **[docs/offline-image-release-management.md](docs/offline-image-release-management.md)**.
 
@@ -313,7 +313,7 @@ This:
 - Builds the selected image family with its matching workspace Dockerfile
 - Saves it to `images/<image-family>_<tag>.tar`
 - Updates that family's tag in `configs/versions.lock.env`
-- Updates `workspace-template/image-catalog.json` so the next template version can expose the image through Coder
+- Updates the selected stable profile image in `workspace-template/image-catalog.json` so the next template version can expose the image through Coder
 
 **Step 2 — Transfer to the offline server**
 
@@ -366,7 +366,7 @@ Use `-Apply` / `--apply` only when you intentionally want this push to become ac
 
 **Step 5 — Users restart their workspaces**
 
-In the Coder UI, stop then restart each workspace. Coder will rebuild the container using the new image.
+In the Coder UI, stop then restart each workspace. Coder will rebuild the container using the image behind the selected profile; existing stable workspaces keep their `image_profile` value and pick up the promoted stable image for that profile.
 
 ### Push Template Only
 
@@ -851,7 +851,7 @@ Confirm `ANTHROPIC_BASE_URL=http://llm-gateway:4000` in `docker/.env`. The inter
 
 ### Workspace did not pick up the new image after load-workspace
 
-`load-workspace` only loads the Docker image tarball and updates the local template image catalog. Push a staged template version, promote it in the Coder UI/CLI after validation, then stop and start the workspace. Use `push-template --apply` only when you intentionally want a push to become active immediately. The fresh container uses the image profile selected in the Coder workspace parameter.
+`load-workspace` only loads the Docker image tarball and updates the local template image catalog. Push a staged template version, promote it in the Coder UI/CLI after validation, then stop and start the workspace. Use `push-template --apply` only when you intentionally want a push to become active immediately. The fresh container uses the image profile selected in the Coder workspace parameter; existing stable workspaces keep their `image_profile` value and pick up the promoted stable image for that profile.
 
 ### Workspace resource limits look wrong
 
