@@ -33,10 +33,10 @@ function Get-EffectiveConfig {
         [string]$EnvFile
     )
     $config = @{}
-    foreach ($entry in (Read-KeyValueFile (Get-VersionLockFile $ConfigsDir)).GetEnumerator()) {
+    foreach ($entry in (Read-KeyValueFile $EnvFile).GetEnumerator()) {
         $config[$entry.Key] = $entry.Value
     }
-    foreach ($entry in (Read-KeyValueFile $EnvFile).GetEnumerator()) {
+    foreach ($entry in (Read-KeyValueFile (Get-VersionLockFile $ConfigsDir)).GetEnumerator()) {
         $config[$entry.Key] = $entry.Value
     }
     return $config
@@ -48,17 +48,10 @@ function Ensure-EnvDefaults {
         [string]$ConfigsDir
     )
     if (-not (Test-Path $EnvFile)) { return }
-    $defaults = Read-KeyValueFile (Get-VersionLockFile $ConfigsDir)
-    $existing = Read-KeyValueFile $EnvFile
-    $missing = [System.Collections.Generic.List[string]]::new()
-    foreach ($entry in $defaults.GetEnumerator() | Sort-Object Key) {
-        if (-not $existing.ContainsKey($entry.Key)) {
-            $missing.Add("$($entry.Key)=$($entry.Value)")
-        }
-    }
-    if ($missing.Count -eq 0) { return }
-    $suffix = "`r`n# ---- Locked versions ----`r`n" + ($missing -join "`r`n") + "`r`n"
-    [System.IO.File]::AppendAllText($EnvFile, $suffix, [System.Text.UTF8Encoding]::new($false))
+    # Version/image lock values live in configs/versions.lock.env and are merged
+    # after docker/.env so stale keys in an old .env cannot override them.
+    # Keep this hook for backwards-compatible callers, but do not copy lock keys
+    # into .env anymore.
 }
 
 function Get-OpenSSLCommand {
@@ -117,12 +110,13 @@ function Get-LeafAltNames {
     $entries.Add('DNS.1 = localhost')
     $entries.Add('DNS.2 = coder.local')
     $entries.Add('DNS.3 = host.docker.internal')
+    $entries.Add('DNS.4 = provider-mirror')
     $entries.Add('IP.1  = 127.0.0.1')
     if ($ServerHost) {
         if ($ServerHost -match '^\d+\.\d+\.\d+\.\d+$') {
             $entries.Add("IP.2  = $ServerHost")
-        } elseif ($ServerHost -notin @('localhost', 'coder.local', 'host.docker.internal')) {
-            $entries.Add("DNS.4 = $ServerHost")
+        } elseif ($ServerHost -notin @('localhost', 'coder.local', 'host.docker.internal', 'provider-mirror')) {
+            $entries.Add("DNS.5 = $ServerHost")
         }
     }
     return ($entries -join [Environment]::NewLine)

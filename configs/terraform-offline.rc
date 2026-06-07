@@ -1,12 +1,10 @@
 # Terraform CLI config for fully offline environments.
-# Only the local filesystem mirror is allowed.
+# Uses the internal network mirror service (provider-mirror container).
+# No fallback to the public registry — any unlisted provider will fail clearly.
 
 provider_installation {
-  filesystem_mirror {
-    path    = "/opt/terraform-providers"
-    include = [
-      "registry.terraform.io/coder/coder",
-      "registry.terraform.io/kreuzwerker/docker"
-    ]
+  network_mirror {
+    url     = "https://provider-mirror/"
+    include = ["registry.terraform.io/*/*"]
   }
 }

@@ -109,11 +109,16 @@ resource "coder_agent" "main" {
     # Claude Code API 配置（由管理员在模板中统一设置）
     ANTHROPIC_API_KEY   = var.anthropic_api_key
     ANTHROPIC_BASE_URL  = var.anthropic_base_url
+    # OpenAI-compatible API 配置（Codex CLI / Kilo Code / OpenAI-format editor tools）
+    OPENAI_API_KEY      = var.openai_api_key
+    OPENAI_BASE_URL     = var.openai_base_url
     # Git 用户信息（自动从 Coder 用户资料获取）
     GIT_AUTHOR_NAME     = coalesce(data.coder_workspace_owner.me.full_name, data.coder_workspace_owner.me.name)
     GIT_AUTHOR_EMAIL    = data.coder_workspace_owner.me.email
     GIT_COMMITTER_NAME  = coalesce(data.coder_workspace_owner.me.full_name, data.coder_workspace_owner.me.name)
     GIT_COMMITTER_EMAIL = data.coder_workspace_owner.me.email
+    # Skill Hub + PyPI Mirror（--skillhub profile 启用时为 "true"）
+    SKILLHUB_ENABLED    = var.skillhub_enabled
   }
 
   # workspace 启动脚本（在 agent 连接成功后执行一次）
@@ -180,6 +185,48 @@ resource "coder_app" "code_server" {
     interval  = 5
     threshold = 10
   }
+}
+
+# ============================================================
+# MinerU 文档转 Markdown（Gradio UI）
+# 需要 manage.sh up --mineru 启用，否则链接返回 502
+# ============================================================
+resource "coder_app" "mineru" {
+  count        = var.mineru_enabled == "true" ? 1 : 0
+  agent_id     = coder_agent.main.id
+  slug         = "mineru"
+  display_name = "MinerU 文档转 Markdown"
+  icon         = "/icon/pdf.svg"
+  url          = "https://${var.server_host}:${var.gateway_port}/mineru/"
+  external     = true
+}
+
+# ============================================================
+# Pandoc docconv Markdown→Word/PDF 转换
+# 需要 manage.sh up --doctools 启用，否则链接返回 502
+# ============================================================
+resource "coder_app" "docconv" {
+  count        = var.doctools_enabled == "true" ? 1 : 0
+  agent_id     = coder_agent.main.id
+  slug         = "docconv"
+  display_name = "Pandoc Markdown→Word"
+  icon         = "/icon/markdown.svg"
+  url          = "https://${var.server_host}:${var.gateway_port}/docconv/"
+  external     = true
+}
+
+# ============================================================
+# Gitea Skill Hub（Claude Code slash command 市场）
+# 需要 manage.sh up --skillhub 启用，否则链接返回 502
+# ============================================================
+resource "coder_app" "skill_hub" {
+  count        = var.skillhub_enabled == "true" ? 1 : 0
+  agent_id     = coder_agent.main.id
+  slug         = "skill-hub"
+  display_name = "Gitea (Skills)"
+  icon         = "/icon/git.svg"
+  url          = "https://${var.server_host}:${var.gateway_port}/gitea/"
+  external     = true
 }
 
 # ============================================================
@@ -298,4 +345,41 @@ variable "anthropic_api_key" {
 variable "anthropic_base_url" {
   description = "Anthropic API Base URL（内网代理地址，留空使用官方 API）"
   default     = ""
+}
+
+variable "openai_api_key" {
+  description = "OpenAI-compatible API Key（Codex/Kilo Code 使用，统一设置或留空）"
+  default     = ""
+  sensitive   = true
+}
+
+variable "openai_base_url" {
+  description = "OpenAI-compatible Base URL（LiteLLM 建议 http://llm-gateway:4000/v1；留空使用官方 API）"
+  default     = ""
+}
+
+# 平台网关地址（用于生成内网服务快捷链接）
+variable "server_host" {
+  description = "平台服务器 IP 或主机名（与 docker/.env SERVER_HOST 一致）"
+  default     = "localhost"
+}
+
+variable "gateway_port" {
+  description = "HTTPS 网关端口（与 docker/.env GATEWAY_PORT 一致）"
+  default     = "8443"
+}
+
+variable "mineru_enabled" {
+  description = "是否启用 MinerU 文档转 Markdown 服务（manage.sh up --mineru 时设为 true）"
+  default     = "false"
+}
+
+variable "doctools_enabled" {
+  description = "是否启用 Pandoc Markdown→Word/PDF 服务（manage.sh up --doctools 时设为 true）"
+  default     = "false"
+}
+
+variable "skillhub_enabled" {
+  description = "是否启用 Skill Hub + PyPI Mirror（manage.sh up --skillhub 时设为 true）"
+  default     = "false"
 }

@@ -23,6 +23,25 @@ services:
       timeout: 10s
       retries: 3
 
+  provider-mirror:
+    image: ${NGINX_IMAGE_REF:-nginx:alpine}
+    container_name: coder-provider-mirror
+    hostname: provider-mirror
+    volumes:
+      - ../configs/provider-mirror/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../configs/ssl:/etc/nginx/ssl:ro
+      - ../configs/provider-mirror/registry.terraform.io:/srv/mirror/registry.terraform.io:ro
+    networks:
+      coderplatform:
+        aliases:
+          - provider-mirror
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --no-check-certificate --spider https://localhost/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
   coder:
     image: ${CODER_IMAGE_REF:-ghcr.io/coder/coder:latest}
     container_name: coder-server
@@ -39,12 +58,28 @@ services:
       CODER_UPDATE_CHECK: "false"
       TF_CLI_CONFIG_FILE: "/home/coder/.terraformrc"
       CODER_CACHE_DIRECTORY: "/tmp/coder-cache"
+      # Go crypto/x509 reads SSL_CERT_DIR as a colon-separated list of cert directories.
+      # This allows Terraform (a Go binary) to trust the internal provider-mirror TLS cert
+      # without modifying the official Coder image.
+      SSL_CERT_DIR: "/custom-certs:/etc/ssl/certs"
+      # OIDC / LDAP 认证（通过 Dex 桥接，需在 .env 中配置 OIDC_CLIENT_SECRET）
+      # 若 OIDC_CLIENT_SECRET 为空则 OIDC 不生效，保持内置密码认证
+      CODER_OIDC_ISSUER_URL: "https://${SERVER_HOST:-localhost}:${GATEWAY_PORT:-8443}/dex"
+      CODER_OIDC_CLIENT_ID: "coder"
+      CODER_OIDC_CLIENT_SECRET: "${OIDC_CLIENT_SECRET:-}"
+      CODER_OIDC_EMAIL_DOMAIN: "${OIDC_EMAIL_DOMAIN:-*}"
+      CODER_OIDC_ALLOW_SIGNUPS: "${OIDC_ALLOW_SIGNUPS:-true}"
+      CODER_OIDC_SCOPES: "openid,profile,email,groups"
+      CODER_OIDC_IGNORE_EMAIL_VERIFIED: "true"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${TF_CLI_CONFIG_MOUNT:-../configs/terraform-offline.rc}:/home/coder/.terraformrc:ro
       - ../configs/terraform-providers:/opt/terraform-providers:ro
+      - ../configs/ssl/ca.crt:/custom-certs/coder-offline-ca.crt:ro
     depends_on:
       postgres:
+        condition: service_healthy
+      provider-mirror:
         condition: service_healthy
     networks:
       coderplatform:
@@ -63,6 +98,7 @@ services:
       POSTGRES_DB: coder
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ../configs/postgres/init-dex.sql:/docker-entrypoint-initdb.d/10-init-dex.sql:ro
     networks:
       coderplatform:
         aliases:
@@ -73,6 +109,39 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  dex:
+    image: ${DEX_IMAGE_REF:-ghcr.io/dexidp/dex:v2.41.1}
+    container_name: coder-dex
+    hostname: dex
+    profiles:
+      - ldap
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ../configs/dex/config.yaml:/etc/dex/config.yaml:ro
+    environment:
+      SERVER_HOST:            ${SERVER_HOST:-localhost}
+      GATEWAY_PORT:           ${GATEWAY_PORT:-8443}
+      POSTGRES_PASSWORD:      ${POSTGRES_PASSWORD:-changeme_db}
+      OIDC_CLIENT_SECRET:     ${OIDC_CLIENT_SECRET:-changeme_oidc_secret}
+      DEX_LDAP_HOST:          ${DEX_LDAP_HOST:-ldap.company.local:389}
+      DEX_LDAP_BIND_DN:       ${DEX_LDAP_BIND_DN:-}
+      DEX_LDAP_BIND_PW:       ${DEX_LDAP_BIND_PW:-}
+      DEX_LDAP_USER_BASE_DN:  ${DEX_LDAP_USER_BASE_DN:-}
+      DEX_LDAP_GROUP_BASE_DN: ${DEX_LDAP_GROUP_BASE_DN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      coderplatform:
+        aliases:
+          - dex.local
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:5556/dex/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   llm-gateway:
     image: ${LITELLM_IMAGE_REF:-ghcr.io/berriai/litellm:main-latest}
@@ -99,6 +168,126 @@ services:
       timeout: 10s
       retries: 3
 
+  # ── MinerU：GPU 加速文档转 Markdown（Gradio UI）──────────────────────────
+  # 启用方式：manage.sh up --mineru
+  # 依赖：主机已安装 nvidia-docker2；Docker 18.09 用 runtime: nvidia 替代 --gpus
+  # GPU 分配：CUDA_VISIBLE_DEVICES=0（第 0 块 A6000，第 1 块留给 LLM workload）
+  # 首次启动会自动下载模型权重（~5-10 GB），通过 mineru-models volume 持久化
+  mineru:
+    image: ${MINERU_IMAGE_REF:-alexsuntop/mineru:2.7.6}
+    container_name: coder-mineru
+    hostname: mineru
+    profiles:
+      - mineru
+    # Docker 18.09 GPU 方式：runtime + env vars（不支持 deploy.resources.reservations.devices）
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      MINERU_MODEL_SOURCE: local
+    command: ["mineru-gradio", "--server-name", "0.0.0.0", "--server-port", "7860"]
+    ipc: host
+    shm_size: "32g"
+    volumes:
+      - mineru-models:/root/.mineru
+    networks:
+      coderplatform:
+        aliases:
+          - mineru.local
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:7860/ || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 180s
+
+  # ── docconv：Pandoc Markdown→Word/PDF（公式支持丰富）───────────────────────
+  # 启用方式：manage.sh up --doctools
+  # 使用 pandoc --server 模式（Pandoc 3.x 内置，端口 3030）
+  # 支持 --mathml（Word MathML）和 --pdf-engine=xelatex（PDF 公式）
+  docconv:
+    image: ${DOCCONV_IMAGE_REF:-pandoc/latex:latest}
+    container_name: coder-docconv
+    hostname: docconv
+    profiles:
+      - doctools
+    command: ["pandoc", "--server"]
+    networks:
+      coderplatform:
+        aliases:
+          - docconv.local
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3030/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Gitea：内网 Git 平台（Claude Code Skill/Command 市场）──────────────────
+  # 启用方式：manage.sh up --skillhub
+  # 准备阶段：manage.sh skillhub-prepare（镜像社区 skill 仓库到 configs/gitea/seeds/）
+  # 首次启动后自动初始化 admin 用户并导入 seed 仓库
+  # 访问：https://<SERVER>:8443/gitea/
+  gitea:
+    image: ${GITEA_IMAGE_REF:-gitea/gitea:latest}
+    container_name: coder-gitea
+    hostname: gitea
+    profiles:
+      - skillhub
+    environment:
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__server__DOMAIN:    ${SERVER_HOST:-localhost}
+      GITEA__server__ROOT_URL:  "https://${SERVER_HOST:-localhost}:${GATEWAY_PORT:-8443}/gitea/"
+      GITEA__server__HTTP_PORT: "3000"
+      GITEA__server__DISABLE_SSH: "true"
+      GITEA__server__SSH_DOMAIN:  "none"
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__database__PATH:    /data/gitea/gitea.db
+      GITEA__repository__IMPORT_LOCAL_PATHS: "true"
+      GITEA__log__LEVEL: warn
+      USER_UID: "1000"
+      USER_GID: "1000"
+    volumes:
+      - gitea-data:/data
+      - ../configs/gitea/app.ini:/etc/gitea/app.ini:ro
+      - ../configs/gitea/seeds:/repos-seed:ro
+    networks:
+      coderplatform:
+        aliases:
+          - gitea
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/-/ready || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── PyPI Mirror：离线 Python 包服务器（科学/工程常用包，x86_64）────────────
+  # 启用方式：manage.sh up --skillhub
+  # 预下载包：manage.sh skillhub-prepare（约 600MB–1.5GB）
+  # workspace 内 pip 自动配置为此镜像（通过 SKILLHUB_ENABLED 环境变量）
+  pypi-mirror:
+    image: ${PYPISERVER_IMAGE_REF:-pypiserver/pypiserver:latest}
+    container_name: coder-pypi-mirror
+    hostname: pypi-mirror
+    profiles:
+      - skillhub
+    command: ["run", "-p", "8080", "/data/packages", "--fallback-url", ""]
+    volumes:
+      - ../configs/pypi/packages:/data/packages:ro
+    networks:
+      coderplatform:
+        aliases:
+          - pypi-mirror
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/simple/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
 networks:
   coderplatform:
     name: coderplatform
@@ -110,4 +299,6 @@ networks:
 volumes:
   postgres-data:
   litellm-cache:
+  mineru-models:
+  gitea-data:
 

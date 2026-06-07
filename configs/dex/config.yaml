@@ -1,0 +1,84 @@
+# Dex OIDC Provider 配置
+# 作为 LDAP → OIDC 桥接层，使 Coder OSS 能够对接企业 LDAP 认证
+#
+# 所有 ${VAR} 引用均从容器环境变量中替换（docker-compose 注入）
+# 修改 docker/.env 中的 DEX_LDAP_* 变量来适配你的 LDAP 环境
+
+issuer: https://${SERVER_HOST}:${GATEWAY_PORT}/dex
+
+storage:
+  type: postgres
+  config:
+    host: postgres
+    port: 5432
+    database: dex
+    user: coder
+    password: ${POSTGRES_PASSWORD}
+    ssl:
+      mode: disable
+
+web:
+  http: 0.0.0.0:5556
+
+logger:
+  level: "info"
+  format: "json"
+
+connectors:
+  - type: ldap
+    id: ldap
+    name: "企业 LDAP"
+    config:
+      # LDAP 服务器地址（含端口）
+      # 明文:  ldap.company.local:389
+      # LDAPS: ldaps://ldap.company.local:636
+      host: ${DEX_LDAP_HOST}
+
+      # 是否使用 StartTLS（明文 389 端口升级加密）
+      # 若 host 已是 ldaps:// 则设为 false
+      startTLS: false
+
+      # 仅在测试自签证书时临时设为 true，生产环境应保持 false
+      insecureSkipVerify: false
+
+      # 若 LDAP 服务器使用自签 CA，挂载 CA 证书后在此引用：
+      # rootCA: /etc/ssl/certs/ldap-ca.crt
+
+      # Dex 用于搜索用户的服务账号
+      bindDN: ${DEX_LDAP_BIND_DN}
+      bindPW: ${DEX_LDAP_BIND_PW}
+
+      # 用户搜索配置（适配标准 OpenLDAP / RFC 2798 inetOrgPerson）
+      userSearch:
+        baseDN: ${DEX_LDAP_USER_BASE_DN}
+        # 若你的 LDAP 使用 posixAccount，改为: "(objectClass=posixAccount)"
+        filter: "(objectClass=person)"
+        # 登录时用户输入的用户名字段（映射到 LDAP 属性）
+        username: uid
+        # 用作 OIDC sub claim（必须唯一且稳定，不会因改名而变）
+        idAttr: uid
+        # 邮箱 claim
+        emailAttr: mail
+        # 显示名称 claim
+        nameAttr: displayName
+
+      # 组搜索配置（启用 groups claim，可用于 Coder 角色映射）
+      groupSearch:
+        baseDN: ${DEX_LDAP_GROUP_BASE_DN}
+        filter: "(objectClass=groupOfNames)"
+        userAttr: dn
+        groupAttr: member
+        nameAttr: cn
+
+oauth2:
+  # 企业内网 SSO 无需用户确认授权屏幕
+  skipApprovalScreen: true
+  responseTypes:
+    - code
+
+staticClients:
+  - id: coder
+    name: "Coder"
+    secret: ${OIDC_CLIENT_SECRET}
+    redirectURIs:
+      - "https://${SERVER_HOST}:${GATEWAY_PORT}/api/v2/users/oidc/callback"
