@@ -11,7 +11,7 @@
 #   https://<SERVER>:8443/@<username>/<workspace>.main/apps/code-server
 #
 # 离线要求：
-#   - workspace_image 必须已通过 manage.sh build/load 加载到本地 Docker
+#   - image-catalog.json 中列出的 workspace 镜像必须已加载到本地 Docker
 #   - Terraform provider 通过 filesystem_mirror 离线加载（terraform.rc）
 # ============================================================
 
@@ -19,7 +19,7 @@ terraform {
   required_providers {
     coder = {
       source  = "coder/coder"
-      version = "~> 2.1"
+      version = ">= 2.5.3, < 3.0"
     }
     docker = {
       source  = "kreuzwerker/docker"
@@ -48,6 +48,19 @@ locals {
   workspace_name = lower(data.coder_workspace.me.name)
   # 容器名称（Docker 命名规则：小写字母、数字、连字符）
   container_name = "coder-${local.username}-${local.workspace_name}"
+
+  # Workspace 镜像目录是模板版本的一部分。发布/回滚通过 Coder 模板版本
+  # promote 完成，脚本只负责构建、加载镜像并推送新的模板版本。
+  image_catalog = jsondecode(file("${path.module}/image-catalog.json"))
+  workspace_image_profiles = {
+    for profile in local.image_catalog.profiles : profile.key => profile
+  }
+  selected_workspace_image_profile = lookup(
+    local.workspace_image_profiles,
+    data.coder_parameter.image_profile.value,
+    local.workspace_image_profiles[local.image_catalog.default]
+  )
+  selected_workspace_image = local.selected_workspace_image_profile.image
 }
 
 # ============================================================
@@ -94,6 +107,25 @@ data "coder_parameter" "memory_gb" {
   option {
     name  = "16 GB"
     value = "16"
+  }
+}
+
+data "coder_parameter" "image_profile" {
+  name         = "image_profile"
+  display_name = "Workspace 镜像"
+  type         = "string"
+  form_type    = "dropdown"
+  default      = local.image_catalog.default
+  mutable      = true
+  icon         = "/icon/docker.svg"
+  order        = 3
+
+  dynamic "option" {
+    for_each = local.workspace_image_profiles
+    content {
+      name  = option.value.name
+      value = option.key
+    }
   }
 }
 
@@ -265,7 +297,7 @@ resource "docker_volume" "home_volume" {
 # ============================================================
 resource "docker_container" "workspace" {
   count    = data.coder_workspace.me.start_count
-  image    = "${var.workspace_image}:${var.workspace_image_tag}"
+  image    = local.selected_workspace_image
   name     = local.container_name
   hostname = local.workspace_name
 
@@ -323,17 +355,6 @@ resource "docker_container" "workspace" {
 # ============================================================
 # 模板变量（由管理员在推送模板时通过 --var 参数设置）
 # ============================================================
-
-# workspace 镜像名称（使用本地 tag 或内网 registry 地址）
-variable "workspace_image" {
-  description = "workspace Docker 镜像名称（本地 tag 或内网 registry）"
-  default     = "workspace-embedded"
-}
-
-variable "workspace_image_tag" {
-  description = "workspace Docker 镜像 tag"
-  default     = "latest"
-}
 
 # Claude Code API 配置（统一为所有用户设置，或留空让用户自行登录）
 variable "anthropic_api_key" {

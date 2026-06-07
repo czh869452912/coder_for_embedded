@@ -11,6 +11,7 @@ param(
     [switch]$Doctools,
     [switch]$SkillHub,
     [string]$Tag = "",
+    [string]$Name = "",
     [switch]$Apply,
     [switch]$RequireLlm,
     [switch]$SkipImages,
@@ -32,6 +33,7 @@ $SetupDone   = Join-Path $DockerDir ".setup-done"
 $UpgradePending = Join-Path $DockerDir ".upgrade-restore-pending"
 $ImagesDir   = Join-Path $ProjectRoot "images"
 $LockFile    = Join-Path $ConfigsDir "versions.lock.env"
+$WorkspaceImageCatalogFile = Join-Path $ProjectRoot "workspace-template\image-catalog.json"
 $script:UseLlm      = $Llm.IsPresent
 $script:UseLdap     = $Ldap.IsPresent
 $script:UseMineru   = $Mineru.IsPresent
@@ -809,7 +811,7 @@ function Invoke-SetupCoder {
         Write-Info "Template 'embedded-dev' already exists. Pushing a new version to apply current variables."
     }
 
-    Invoke-PushTemplate -SessionToken $sessionToken
+    Invoke-PushTemplate -SessionToken $sessionToken -ActivateTemplate
 
     Get-Date | Set-Content $SetupDone
     Show-AccessInfo
@@ -854,16 +856,94 @@ function Invoke-UpgradeTemplateRefresh {
     }
     Write-OK 'Logged in and obtained session token.'
 
-    Invoke-PushTemplate -SessionToken $sessionToken
+    Invoke-PushTemplate -SessionToken $sessionToken -ActivateTemplate
     Remove-Item $UpgradePending -Force -ErrorAction SilentlyContinue
 
     Write-OK 'Upgrade template refresh complete.'
     Show-AccessInfo
 }
 
-# Shared template push — called by setup-coder, push-template, update-workspace, load-workspace
+# Shared template push — called by setup-coder, push-template, and upgrade refresh.
+function ConvertTo-SafeTemplateVersionName {
+    param([string]$Name)
+    $safe = ($Name -replace '[^A-Za-z0-9_.-]', '-').Trim('-')
+    if (-not $safe) { $safe = "workspace-$(Get-Date -Format 'yyyyMMddHHmmss')" }
+    if ($safe.Length -gt 64) {
+        return $safe.Substring(0, 64).Trim('-')
+    }
+    return $safe
+}
+
+function Get-TemplateVersionName {
+    param(
+        [string]$RequestedName,
+        [string]$WorkspaceImageName,
+        [string]$WorkspaceImageTag
+    )
+    if ($RequestedName) { return ConvertTo-SafeTemplateVersionName -Name $RequestedName }
+    $raw = "workspace-${WorkspaceImageName}-${WorkspaceImageTag}"
+    return ConvertTo-SafeTemplateVersionName -Name $raw
+}
+
+function Get-WorkspaceImageProfileKey {
+    param(
+        [string]$ImageName,
+        [string]$Tag
+    )
+    return (($ImageName + '-' + $Tag).ToLowerInvariant() -replace '[^a-z0-9]+', '_').Trim('_')
+}
+
+function Update-WorkspaceImageCatalog {
+    param(
+        [string]$ImageName,
+        [string]$Tag
+    )
+    if (-not $ImageName) { $ImageName = 'workspace-embedded' }
+    if (-not $Tag) { $Tag = 'latest' }
+
+    $profileKey = Get-WorkspaceImageProfileKey -ImageName $ImageName -Tag $Tag
+    $imageRef = "${ImageName}:${Tag}"
+    $profileName = "${ImageName} ${Tag}"
+
+    if (Test-Path $WorkspaceImageCatalogFile) {
+        $catalog = Get-Content $WorkspaceImageCatalogFile -Raw | ConvertFrom-Json
+    } else {
+        $catalog = [pscustomobject]@{
+            default  = $profileKey
+            profiles = @()
+        }
+    }
+
+    $profiles = @($catalog.profiles)
+    $existing = $profiles | Where-Object { $_.key -eq $profileKey } | Select-Object -First 1
+    if ($existing) {
+        $existing.name = $profileName
+        $existing.image = $imageRef
+    } else {
+        $profiles += [pscustomobject]@{
+            key   = $profileKey
+            name  = $profileName
+            image = $imageRef
+        }
+    }
+
+    $catalog = [pscustomobject]@{
+        default  = $profileKey
+        profiles = @($profiles | Sort-Object key)
+    }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $WorkspaceImageCatalogFile) -Force | Out-Null
+    $json = $catalog | ConvertTo-Json -Depth 8
+    [System.IO.File]::WriteAllText($WorkspaceImageCatalogFile, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+    Write-OK "Registered default workspace image profile ${profileKey} -> ${imageRef}"
+    return $profileKey
+}
+
 function Invoke-PushTemplate {
-    param([string]$SessionToken)
+    param(
+        [string]$SessionToken,
+        [string]$VersionName = "",
+        [switch]$ActivateTemplate
+    )
     $cfg = Get-Config
     $workspaceImageName = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
     $workspaceImageTag  = if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
@@ -887,7 +967,10 @@ function Invoke-PushTemplate {
         }
     }
 
-    Write-Info "Pushing workspace template (image=${workspaceImageName}:${workspaceImageTag})"
+    $safeVersionName = Get-TemplateVersionName -RequestedName $VersionName -WorkspaceImageName $workspaceImageName -WorkspaceImageTag $workspaceImageTag
+    $activateValue = if ($ActivateTemplate.IsPresent) { 'true' } else { 'false' }
+
+    Write-Info "Pushing workspace template version ${safeVersionName} (activate=${activateValue})"
     docker exec coder-server sh -c "rm -rf /tmp/template-push && mkdir -p /tmp/template-push" | Out-Null
     docker cp "$($ProjectRoot)\workspace-template\." "coder-server:/tmp/template-push/"
     if ($LASTEXITCODE -ne 0) {
@@ -900,13 +983,16 @@ function Invoke-PushTemplate {
     $skillHubEnabled = if ($script:UseSkillHub) { 'true' } else { 'false' }
     $mineruEnabled = if ($script:UseMineru) { 'true' } else { 'false' }
     $doctoolsEnabled = if ($script:UseDoctools) { 'true' } else { 'false' }
-    $pushCmd = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$SessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=$workspaceImageName --var workspace_image_tag=$workspaceImageTag --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' --var openai_api_key='$openaiKey' --var openai_base_url='$openaiUrl' --var server_host='$serverHost' --var gateway_port='$gatewayPort' --var mineru_enabled='$mineruEnabled' --var doctools_enabled='$doctoolsEnabled' --var skillhub_enabled='$skillHubEnabled' ; rm -rf /tmp/template-push"
+    $pushCmd = "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=$SessionToken /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate=$activateValue --name=$safeVersionName --var anthropic_api_key='$anthropicKey' --var anthropic_base_url='$anthropicUrl' --var openai_api_key='$openaiKey' --var openai_base_url='$openaiUrl' --var server_host='$serverHost' --var gateway_port='$gatewayPort' --var mineru_enabled='$mineruEnabled' --var doctools_enabled='$doctoolsEnabled' --var skillhub_enabled='$skillHubEnabled' ; rm -rf /tmp/template-push"
     docker exec coder-server sh -c $pushCmd
     if ($LASTEXITCODE -ne 0) {
         Write-Fail 'Template push failed.'
         exit 1
     }
-    Write-OK 'Workspace template pushed.'
+    Write-OK 'Workspace template version pushed.'
+    if (-not $ActivateTemplate.IsPresent) {
+        Write-Info "Promote after validation: coder templates versions promote --template=embedded-dev --template-version=$safeVersionName"
+    }
 }
 
 function Show-AccessInfo {
@@ -1589,7 +1675,8 @@ function Invoke-CmdPushTemplate {
     if (-not $sessionToken) { Write-Fail 'Failed to get Coder session token. Check admin credentials in docker/.env.'; exit 1 }
     Write-OK 'Obtained session token.'
 
-    Invoke-PushTemplate -SessionToken $sessionToken
+    $activateTemplate = [bool]$script:Apply
+    Invoke-PushTemplate -SessionToken $sessionToken -VersionName $Name -ActivateTemplate:$activateTemplate
 }
 
 # ─── update-workspace ─────────────────────────────────────────────────────────
@@ -1620,11 +1707,7 @@ function Invoke-UpdateWorkspace {
     $cfg = Get-Config
     $imageName = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
 
-    # Step 1: Update lock file
-    Update-LockWorkspaceTag -NewTag $NewTag
-    $cfg = Get-Config  # reload
-
-    # Step 2: Ensure CA and build
+    # Step 1: Ensure CA and build
     $sslDir = Join-Path $ConfigsDir 'ssl'
     Ensure-RootCA -SslDir $sslDir | Out-Null
     $codeServerBase = $cfg['CODE_SERVER_BASE_IMAGE_REF']
@@ -1633,7 +1716,7 @@ function Invoke-UpdateWorkspace {
     if ($LASTEXITCODE -ne 0) { Write-Fail 'Workspace image build failed.'; exit 1 }
     Write-OK "Built ${imageName}:${NewTag}"
 
-    # Step 3: Save to tar
+    # Step 2: Save to tar
     New-Item -ItemType Directory -Path $ImagesDir -Force | Out-Null
     $tarFile = Join-Path $ImagesDir "${imageName}_${NewTag}.tar"
     Write-Info "Saving ${imageName}:${NewTag} -> $(Split-Path $tarFile -Leaf)"
@@ -1642,33 +1725,17 @@ function Invoke-UpdateWorkspace {
     $sizeMb = [math]::Round((Get-Item $tarFile).Length / 1MB)
     Write-OK "Saved ${sizeMb} MB  ($(Split-Path $tarFile -Leaf))"
 
-    # Step 4: Push template if Coder is running
-    $port = if ($cfg['CODER_INTERNAL_PORT']) { $cfg['CODER_INTERNAL_PORT'] } else { '7080' }
-    $baseUrl = "http://localhost:$port"
-    $coderRunning = $false
-    try {
-        $h = Invoke-WebRequest -Uri "$baseUrl/healthz" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
-        $coderRunning = ($h.StatusCode -eq 200)
-    } catch {}
-
-    if ($coderRunning) {
-        Write-Info 'Coder is running — pushing updated template.'
-        $adminEmail    = if ($cfg['CODER_ADMIN_EMAIL'])    { $cfg['CODER_ADMIN_EMAIL'] }    else { 'admin@company.local' }
-        $adminPassword = if ($cfg['CODER_ADMIN_PASSWORD']) { $cfg['CODER_ADMIN_PASSWORD'] } else { '' }
-        $loginBody = '{"email":"' + $adminEmail + '","password":"' + $adminPassword + '"}'
-        $loginResponse = Invoke-RestMethod -Uri "$baseUrl/api/v2/users/login" -Method POST -ContentType 'application/json' -Body $loginBody
-        $sessionToken = $loginResponse.session_token
-        if (-not $sessionToken) { Write-Fail 'Failed to get Coder session token.'; exit 1 }
-        Invoke-PushTemplate -SessionToken $sessionToken
-    } else {
-        Write-Warn 'Coder is not running locally — skipping template push.'
-        Write-Info "To push later: .\scripts\manage.ps1 push-template"
-    }
+    # Step 3: Update the bundle default and template image catalog after the
+    # image artifact exists.
+    Update-LockWorkspaceTag -NewTag $NewTag
+    Update-WorkspaceImageCatalog -ImageName $imageName -Tag $NewTag | Out-Null
 
     Write-Host ''
-    Write-OK "Workspace image update complete: ${imageName}:${NewTag}"
-    Write-Info "Transfer $(Split-Path $tarFile -Leaf) and configs\versions.lock.env to the offline server."
+    Write-OK "Workspace image prepared: ${imageName}:${NewTag}"
+    Write-Info "Transfer $(Split-Path $tarFile -Leaf), configs\versions.lock.env, and workspace-template\image-catalog.json to the offline server."
     Write-Info "Then run: .\scripts\manage.ps1 load-workspace -Arg1 $(Split-Path $tarFile -Leaf)"
+    Write-Info "Publish as a staged Coder version: .\scripts\manage.ps1 push-template -Name workspace-${NewTag}"
+    Write-Info "Promote after validation in the Coder UI or with: coder templates versions promote --template=embedded-dev --template-version=workspace-${NewTag}"
 }
 
 # ─── load-workspace ───────────────────────────────────────────────────────────
@@ -1696,34 +1763,13 @@ function Invoke-LoadWorkspace {
     if ($LASTEXITCODE -ne 0) { Write-Fail 'docker load failed.'; exit 1 }
     Write-OK "Loaded ${imageName}:${tag}"
 
-    # Update lock file
-    Update-LockWorkspaceTag -NewTag $tag
-
-    # Reload config
-    $cfg = Get-Config
-    $port = if ($cfg['CODER_INTERNAL_PORT']) { $cfg['CODER_INTERNAL_PORT'] } else { '7080' }
-    $baseUrl = "http://localhost:$port"
-
-    try {
-        $h = Invoke-WebRequest -Uri "$baseUrl/healthz" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-        if ($h.StatusCode -ne 200) { throw "not ready" }
-    } catch {
-        Write-Fail "Coder is not reachable at $baseUrl. Is the platform running?"
-        exit 1
-    }
-
-    Write-Info 'Pushing updated template to Coder.'
-    $adminEmail    = if ($cfg['CODER_ADMIN_EMAIL'])    { $cfg['CODER_ADMIN_EMAIL'] }    else { 'admin@company.local' }
-    $adminPassword = if ($cfg['CODER_ADMIN_PASSWORD']) { $cfg['CODER_ADMIN_PASSWORD'] } else { '' }
-    $loginBody = '{"email":"' + $adminEmail + '","password":"' + $adminPassword + '"}'
-    $loginResponse = Invoke-RestMethod -Uri "$baseUrl/api/v2/users/login" -Method POST -ContentType 'application/json' -Body $loginBody
-    $sessionToken = $loginResponse.session_token
-    if (-not $sessionToken) { Write-Fail 'Failed to get Coder session token.'; exit 1 }
-    Invoke-PushTemplate -SessionToken $sessionToken
+    Update-WorkspaceImageCatalog -ImageName $imageName -Tag $tag | Out-Null
 
     Write-Host ''
-    Write-OK "Workspace image ${imageName}:${tag} is now active."
-    Write-Warn 'Users must stop and restart their workspaces in the Coder UI to pick up the new image.'
+    Write-OK "Workspace image ${imageName}:${tag} is loaded and registered in the template catalog."
+    Write-Info "Publish a staged Coder template version: .\scripts\manage.ps1 push-template -Name workspace-${tag}"
+    Write-Info "Promote after validation in the Coder UI or with: coder templates versions promote --template=embedded-dev --template-version=workspace-${tag}"
+    Write-Warn 'Existing workspaces keep their current container until users stop and restart them.'
 }
 
 # ─── prepare (migrated from prepare-offline.ps1) ──────────────────────────────
@@ -2137,15 +2183,16 @@ function Show-Help {
         '  logs [service]              Follow logs',
         '  shell <service>             Enter a service shell',
         '  setup-coder                 Create admin user and push initial template',
-        '  push-template               Push/update template (platform must be running)',
+        '  push-template [-Name n] [-Apply]',
+        '                              Push a staged Coder template version; -Apply activates this push',
         '  test-api                    Test Anthropic/LiteLLM API access',
         '  test-llm-backend            Test the internal LLM backend base URL',
         '  clean                       Clean Docker build cache',
         '',
         'Workspace image versioning:',
-        '  update-workspace [-Tag v]   Build versioned workspace image, save tar, push template',
+        '  update-workspace [-Tag v]   Build versioned workspace image, save tar, update catalog',
         '                              Auto-generates tag v<YYYYMMDD> when -Tag is omitted',
-        '  load-workspace <tar>        (Offline server) Load workspace tar, update lock, push template',
+        '  load-workspace <tar>        (Offline server) Load workspace tar and update image catalog',
         '',
         'In-place upgrade (preserve users + workspaces across code/image changes):',
         '  upgrade-backup [-Dest dir] [-Force]',
@@ -2178,7 +2225,8 @@ function Show-Help {
         '  -SkillHub     Enable Skill Hub marketplace + PyPI mirror (--profile skillhub)',
         '                Requires Skill Hub images/packages to be prepared first',
         '  -Tag <v>      Workspace image tag for update-workspace',
-        '  -Apply        Write changes to disk (refresh-versions)',
+        '  -Name <n>     Coder template version name for push-template',
+        '  -Apply        Write version locks (refresh-versions) or activate template (push-template)',
         '  -RequireLlm   Fail verify if LiteLLM image is absent',
         '  -SkipImages   Skip pulling/saving runtime images (prepare)',
         '  -SkipBuild    Skip building workspace image (prepare)',
@@ -2199,10 +2247,12 @@ function Show-Help {
         'Workspace update workflow:',
         '  # [Online] build and save new version',
         '  .\scripts\manage.ps1 update-workspace -Tag v20240324',
-        '  # Transfer images\workspace-embedded_v20240324.tar + configs\versions.lock.env',
-        '  # [Offline server] load image and push new template version',
+        '  # Transfer images\workspace-embedded_v20240324.tar + configs\versions.lock.env + workspace-template\image-catalog.json',
+        '  # [Offline server] load image and stage a new template version',
         '  .\scripts\manage.ps1 load-workspace images\workspace-embedded_v20240324.tar',
-        '  # Users stop and restart their workspaces to pick up the new image',
+        '  .\scripts\manage.ps1 push-template -Name workspace-v20240324',
+        '  # Promote in Coder UI/CLI after validation, or use -Apply only for an immediate active push',
+        '  # Users stop and restart their workspaces after the version is promoted',
         '',
         'Notes:',
         '  Pinned image refs are stored in configs/versions.lock.env.',

@@ -1,0 +1,10 @@
+{
+  "default": "embedded_stable",
+  "profiles": [
+    {
+      "key": "embedded_stable",
+      "name": "Embedded Stable",
+      "image": "workspace-embedded:embedded-v20260607-r1"
+    }
+  ]
+}

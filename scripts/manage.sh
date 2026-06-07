@@ -11,6 +11,7 @@ UPGRADE_PENDING_FILE="$DOCKER_DIR/.upgrade-restore-pending"
 MANIFEST_PATH="$PROJECT_ROOT/offline-manifest.json"
 IMAGES_DIR="$PROJECT_ROOT/images"
 LOCK_FILE="$CONFIGS_DIR/versions.lock.env"
+WORKSPACE_IMAGE_CATALOG_FILE="$PROJECT_ROOT/workspace-template/image-catalog.json"
 
 source "$SCRIPT_DIR/lib/offline-common.sh"
 
@@ -82,12 +83,12 @@ Platform lifecycle commands:
   clean                 Clean Docker build cache
 
 Workspace image version management:
-  push-template         Push updated workspace template to running Coder (no admin setup)
+  push-template [--name <name>] [--apply]
+                        Push a staged Coder template version; --apply activates this push
   update-workspace [--tag <tag>]
-                        Build a new versioned workspace image, save tar, update lock file,
-                        and push template (tag defaults to v<YYYYMMDD>)
-  load-workspace <tar>  Load a workspace image tar, update lock, push template
-                        (for applying updates on an already-deployed offline server)
+                        Build a new versioned workspace image, save tar, update lock
+                        default and image catalog (tag defaults to v<YYYYMMDD>)
+  load-workspace <tar>  Load a workspace image tar and update the image catalog
 
 In-place upgrade (preserve users + workspaces across code/image changes):
   upgrade-backup [--dest <dir>] [--force]
@@ -128,9 +129,11 @@ Typical offline deployment workflow:
 
 Workspace image update workflow (online -> offline):
   manage.sh update-workspace --tag v20240324   # on online machine
-  # transfer images/workspace-embedded_v20240324.tar + configs/versions.lock.env
+  # transfer images/workspace-embedded_v20240324.tar + configs/versions.lock.env + workspace-template/image-catalog.json
   manage.sh load-workspace images/workspace-embedded_v20240324.tar  # on offline server
-  # users restart their workspaces in the Coder UI
+  manage.sh push-template --name workspace-v20240324                # stage version
+  # promote in Coder UI/CLI after validation; --apply is only for an immediate active push
+  # users restart their workspaces in the Coder UI after the version is promoted
 
 Notes:
   Deployment uses pinned image refs from configs/versions.lock.env.
@@ -779,13 +782,91 @@ _get_session_token() {
         | python3 -c "import json,sys; print(json.load(sys.stdin)['session_token'])"
 }
 
-# Shared template push logic; called by setup-coder, push-template, update-workspace, load-workspace
+# Shared template push logic; called by setup-coder, push-template, and upgrade refresh.
+_safe_template_version_name() {
+    local name="$1"
+    local safe
+    safe="$(printf '%s\n' "$name" \
+        | sed -E 's/[^A-Za-z0-9_.-]+/-/g; s/^-+//; s/-+$//' \
+        | cut -c1-64 \
+        | sed -E 's/-+$//')"
+    if [ -z "$safe" ]; then
+        safe="workspace-$(date +%Y%m%d%H%M%S)"
+    fi
+    printf '%s\n' "$safe"
+}
+
+_template_version_name() {
+    local requested_name="${1:-}"
+    local workspace_image="${2:-workspace-embedded}"
+    local workspace_tag="${3:-latest}"
+    if [ -n "$requested_name" ]; then
+        _safe_template_version_name "$requested_name"
+        return 0
+    fi
+    _safe_template_version_name "workspace-${workspace_image}-${workspace_tag}"
+}
+
+_workspace_image_profile_key() {
+    local image_name="${1:-workspace-embedded}"
+    local tag="${2:-latest}"
+    printf '%s-%s\n' "$image_name" "$tag" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//'
+}
+
+_update_workspace_image_catalog() {
+    local image_name="${1:-workspace-embedded}"
+    local tag="${2:-latest}"
+    local profile_key image_ref profile_name
+    profile_key="$(_workspace_image_profile_key "$image_name" "$tag")"
+    image_ref="${image_name}:${tag}"
+    profile_name="${image_name} ${tag}"
+    mkdir -p "$(dirname "$WORKSPACE_IMAGE_CATALOG_FILE")"
+    CATALOG_FILE="$WORKSPACE_IMAGE_CATALOG_FILE" \
+    PROFILE_KEY="$profile_key" \
+    PROFILE_NAME="$profile_name" \
+    IMAGE_REF="$image_ref" \
+    python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+path = Path(os.environ["CATALOG_FILE"])
+profile_key = os.environ["PROFILE_KEY"]
+profile_name = os.environ["PROFILE_NAME"]
+image_ref = os.environ["IMAGE_REF"]
+
+if path.exists():
+    catalog = json.loads(path.read_text(encoding="utf-8"))
+else:
+    catalog = {"default": profile_key, "profiles": []}
+
+profiles = catalog.get("profiles") or []
+for profile in profiles:
+    if profile.get("key") == profile_key:
+        profile["name"] = profile_name
+        profile["image"] = image_ref
+        break
+else:
+    profiles.append({"key": profile_key, "name": profile_name, "image": image_ref})
+
+catalog["default"] = profile_key
+catalog["profiles"] = sorted(profiles, key=lambda item: item.get("key", ""))
+path.write_text(json.dumps(catalog, indent=2) + "\n", encoding="utf-8")
+PY
+    ok "Registered default workspace image profile ${profile_key} -> ${image_ref}"
+}
+
 _do_push_template() {
     local token="$1"
+    local version_name="${2:-}"
+    local activate_template="${3:-true}"
     load_config
     local template_dir="$PROJECT_ROOT/workspace-template"
     local workspace_image="${WORKSPACE_IMAGE:-workspace-embedded}"
     local workspace_tag="${WORKSPACE_IMAGE_TAG:-latest}"
+    version_name="$(_template_version_name "$version_name" "$workspace_image" "$workspace_tag")"
     local anthropic_key="${ANTHROPIC_API_KEY:-}"
     local anthropic_url="${ANTHROPIC_BASE_URL:-}"
     local openai_key="${OPENAI_API_KEY:-}"
@@ -806,12 +887,15 @@ _do_push_template() {
         fi
     fi
 
-    info "Pushing workspace template (image=${workspace_image}:${workspace_tag})"
+    info "Pushing workspace template version ${version_name} (activate=${activate_template})"
     docker exec coder-server sh -c 'rm -rf /tmp/template-push && mkdir -p /tmp/template-push' >/dev/null
     docker cp "$template_dir/." 'coder-server:/tmp/template-push/'
 
-    docker exec coder-server sh -c "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=${token} /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate --var workspace_image=${workspace_image} --var workspace_image_tag=${workspace_tag} --var anthropic_api_key='${anthropic_key}' --var anthropic_base_url='${anthropic_url}' --var openai_api_key='${openai_key}' --var openai_base_url='${openai_url}' --var server_host='${SERVER_HOST:-localhost}' --var gateway_port='${GATEWAY_PORT:-8443}' --var mineru_enabled='${USE_MINERU}' --var doctools_enabled='${USE_DOCTOOLS}' --var skillhub_enabled='${USE_SKILLHUB}' ; rm -rf /tmp/template-push"
-    ok "Workspace template pushed"
+    docker exec coder-server sh -c "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=${token} /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate=${activate_template} --name='${version_name}' --var anthropic_api_key='${anthropic_key}' --var anthropic_base_url='${anthropic_url}' --var openai_api_key='${openai_key}' --var openai_base_url='${openai_url}' --var server_host='${SERVER_HOST:-localhost}' --var gateway_port='${GATEWAY_PORT:-8443}' --var mineru_enabled='${USE_MINERU}' --var doctools_enabled='${USE_DOCTOOLS}' --var skillhub_enabled='${USE_SKILLHUB}' ; rm -rf /tmp/template-push"
+    ok "Workspace template version pushed"
+    if [ "$activate_template" != "true" ]; then
+        info "Promote after validation: coder templates versions promote --template=embedded-dev --template-version=${version_name}"
+    fi
 }
 
 run_setup_coder() {
@@ -844,7 +928,7 @@ run_setup_coder() {
         info "Template embedded-dev already exists. Pushing a new version to apply current variables."
     fi
 
-    _do_push_template "$session_token"
+    _do_push_template "$session_token" "" "true"
 
     date > "$SETUP_DONE_FILE"
     echo
@@ -863,7 +947,7 @@ run_upgrade_template_refresh() {
     [ -n "$session_token" ] || fail "Failed to get Coder session token. Check admin credentials in docker/.env."
     ok "Logged in and obtained session token"
 
-    _do_push_template "$session_token"
+    _do_push_template "$session_token" "" "true"
     rm -f "$UPGRADE_PENDING_FILE"
 
     ok "Upgrade template refresh complete"
@@ -873,6 +957,16 @@ run_upgrade_template_refresh() {
 # ─── push-template ────────────────────────────────────────────────────────────
 
 cmd_push_template() {
+    local version_name=""
+    local activate_template=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name) shift; version_name="${1:-}" ;;
+            --apply) activate_template=true ;;
+        esac
+        shift
+    done
+
     check_deps
     [ -f "$ENV_FILE" ] || fail "Run init first."
     load_config
@@ -886,7 +980,7 @@ cmd_push_template() {
     [ -n "$session_token" ] || fail "Failed to get Coder session token. Check admin credentials in docker/.env."
     ok "Obtained session token"
 
-    _do_push_template "$session_token"
+    _do_push_template "$session_token" "$version_name" "$activate_template"
 }
 
 # ─── update-workspace ─────────────────────────────────────────────────────────
@@ -923,12 +1017,7 @@ update_workspace() {
 
     local image_name="${WORKSPACE_IMAGE:-workspace-embedded}"
 
-    # Step 1: Update lock file with new tag
-    _update_lock_workspace_tag "$new_tag"
-    # Reload config so build uses new tag
-    load_effective_config "$CONFIGS_DIR" "$ENV_FILE"
-
-    # Step 2: Ensure CA and build with new tag
+    # Step 1: Ensure CA and build with new tag
     ensure_root_ca "$CONFIGS_DIR/ssl"
     info "Building ${image_name}:${new_tag}"
     docker build \
@@ -938,7 +1027,7 @@ update_workspace() {
         "$PROJECT_ROOT"
     ok "Built ${image_name}:${new_tag}"
 
-    # Step 3: Save to tar
+    # Step 2: Save to tar
     mkdir -p "$IMAGES_DIR"
     local tar_file="$IMAGES_DIR/${image_name}_${new_tag}.tar"
     info "Saving ${image_name}:${new_tag} -> $(basename "$tar_file")"
@@ -947,23 +1036,17 @@ update_workspace() {
     saved_bytes="$(stat -c%s "$tar_file" 2>/dev/null || stat -f%z "$tar_file" 2>/dev/null || echo 0)"
     ok "Saved $(( saved_bytes / 1048576 )) MB  ($(basename "$tar_file"))"
 
-    # Step 4: Push template if Coder is running locally
-    local coder_url="http://localhost:${CODER_INTERNAL_PORT:-7080}"
-    if curl -sf "${coder_url}/healthz" >/dev/null 2>&1; then
-        info "Coder is running — pushing updated template"
-        local session_token
-        session_token="$(_get_session_token)"
-        [ -n "$session_token" ] || fail "Failed to get Coder session token"
-        _do_push_template "$session_token"
-    else
-        warn "Coder is not running locally — skipping template push."
-        info "To push later: bash scripts/manage.sh push-template"
-    fi
+    # Step 3: Update the bundle default and template image catalog after the
+    # image artifact exists.
+    _update_lock_workspace_tag "$new_tag"
+    _update_workspace_image_catalog "$image_name" "$new_tag"
 
     echo
-    ok "Workspace image update complete: ${image_name}:${new_tag}"
-    info "Transfer $(basename "$tar_file") and configs/versions.lock.env to the offline server."
+    ok "Workspace image prepared: ${image_name}:${new_tag}"
+    info "Transfer $(basename "$tar_file"), configs/versions.lock.env, and workspace-template/image-catalog.json to the offline server."
     info "Then run: bash scripts/manage.sh load-workspace $(basename "$tar_file")"
+    info "Publish as a staged Coder version: bash scripts/manage.sh push-template --name workspace-${new_tag}"
+    info "Promote after validation in the Coder UI or with: coder templates versions promote --template=embedded-dev --template-version=workspace-${new_tag}"
 }
 
 # ─── load-workspace ───────────────────────────────────────────────────────────
@@ -990,26 +1073,13 @@ load_workspace() {
     docker load -i "$tar_path"
     ok "Loaded ${image_name}:${tag}"
 
-    # Update lock file with new tag
-    _update_lock_workspace_tag "$tag"
-
-    # Reload config to pick up new WORKSPACE_IMAGE_TAG
-    load_config
-
-    # Push updated template to Coder
-    local coder_url="http://localhost:${CODER_INTERNAL_PORT:-7080}"
-    curl -sf "${coder_url}/healthz" >/dev/null 2>&1 \
-        || fail "Coder is not reachable at ${coder_url}. Is the platform running?"
-
-    info "Pushing updated template to Coder"
-    local session_token
-    session_token="$(_get_session_token)"
-    [ -n "$session_token" ] || fail "Failed to get Coder session token"
-    _do_push_template "$session_token"
+    _update_workspace_image_catalog "$image_name" "$tag"
 
     echo
-    ok "Workspace image ${image_name}:${tag} is now active."
-    warn "Users must stop and restart their workspaces in the Coder UI to pick up the new image."
+    ok "Workspace image ${image_name}:${tag} is loaded and registered in the template catalog."
+    info "Publish a staged Coder template version: bash scripts/manage.sh push-template --name workspace-${tag}"
+    info "Promote after validation in the Coder UI or with: coder templates versions promote --template=embedded-dev --template-version=workspace-${tag}"
+    warn "Existing workspaces keep their current container until users stop and restart them."
 }
 
 # ─── upgrade-backup / upgrade-restore-config ──────────────────────────────────
@@ -2193,4 +2263,6 @@ main() {
     esac
 }
 
-main "$@"
+if [ "${1:-}" != "__test_source_only" ]; then
+    main "$@"
+fi

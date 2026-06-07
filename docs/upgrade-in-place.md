@@ -190,7 +190,7 @@ bash scripts/manage.sh up
 2. **用旧账号密码登录**一个普通用户（不是 admin），确认能进 Dashboard。
 3. **查看 workspace 列表**，确认所有 workspace 名称和状态都在。
 4. 让一个用户**启动**自己的 workspace（点击 Start）：
-   - 容器使用旧的 `workspace-embedded:latest` 镜像（因为 template 里的 `workspace_image_tag` 可能还是 `latest`）。
+   - 容器使用当前已激活 Coder template version 中 `image_profile` 默认指向的镜像。
    - 容器重建，但 `coder-<id>-home` volume 保持不变，用户代码和 `.bashrc` 全在。
 
 如果以上全部通过，说明平台核心数据无损升级成功。
@@ -211,17 +211,26 @@ bash scripts/manage.sh update-workspace --tag v$(date +%Y%m%d)
 - 用当前的 `Dockerfile.workspace` 构建新镜像（例如 `workspace-embedded:v20260427`）。
 - 保存为 `images/workspace-embedded_v20260427.tar`。
 - 更新 `configs/versions.lock.env` 中的 `WORKSPACE_IMAGE_TAG`。
-- 向运行中的 Coder push 一个新的 template version（默认激活）。
+- 更新 `workspace-template/image-catalog.json`，让下一次 Coder template version 能暴露这个镜像。
 
-### 5.2 通知用户重启 workspace
+### 5.2 推送并激活 Coder template version
+
+```bash
+bash scripts/manage.sh push-template --name workspace-v$(date +%Y%m%d)
+coder templates versions promote --template=embedded-dev --template-version=workspace-v$(date +%Y%m%d)
+```
+
+第一条命令只创建未激活的 template version，便于先试点；第二条命令在验证后用 Coder 原生命令激活。也可以在 Coder UI 中 promote 对应 template version。`push-template --apply` 只用于明确希望“这次 push 立即激活”的场景。
+
+### 5.3 通知用户重启 workspace
 
 在 Coder UI 中，用户只需要：
 1. **Stop** 自己的工作区。
 2. **Start** 自己的工作区。
 
-Terraform 会重新 evaluate template，使用新的 `workspace-embedded:v20260427` 镜像创建容器，但**仍然挂载原来的 home volume**。用户的所有文件和配置不受影响，只是容器内的系统工具（GCC、Claude Code、VS Code Server 等）变成了新版本。
+Terraform 会重新 evaluate template，使用当前 `image_profile` 选择的镜像创建容器，但**仍然挂载原来的 home volume**。用户的所有文件和配置不受影响，只是容器内的系统工具（GCC、Claude Code、VS Code Server 等）变成了新版本。
 
-### 5.3 保留旧镜像直到全员迁移
+### 5.4 保留旧镜像直到全员迁移
 
 在用户还没有全部重启 workspace 之前，**不要删除**旧的 `workspace-embedded:latest`（或旧的未打 tag 镜像）。如果有人还在运行旧容器，删除镜像不会立即破坏运行中的容器，但 Docker 会在他们下次启动 workspace 时找不到镜像而报错。
 

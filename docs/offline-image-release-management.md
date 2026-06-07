@@ -13,8 +13,9 @@ There are two image families:
 - Workspace images run user development environments.
 
 Treat them differently. Platform images are upgraded with an in-place upgrade
-and database backup. Workspace images are released more often and are activated
-by pushing a new template version.
+and database backup. Workspace images are released more often and are exposed
+through the Coder template image catalog, then activated by promoting a Coder
+template version.
 
 Never use `latest` for a workspace image in production. Use immutable, meaningful
 tags such as:
@@ -31,7 +32,11 @@ create a new tag.
 
 ## Version Sources
 
-The deployment reads image and provider locks from `configs/versions.lock.env`.
+The deployment reads platform image and provider locks from
+`configs/versions.lock.env`. Workspace image defaults for bundle preparation
+also live there, but the runtime workspace image choices live in
+`workspace-template/image-catalog.json`. That catalog is part of each Coder
+template version.
 
 The current platform lock tracks GitHub latest Coder `v2.33.6`, resolved to a
 pinned digest, the Coder Terraform provider `2.18.0`, and workspace image tag
@@ -45,6 +50,8 @@ Use this rule for future updates:
   provider archive and index.
 - Update the workspace image tag to an immutable release tag before preparing a
   production offline bundle.
+- Push workspace image choices through a Coder template version instead of
+  hard-coding the active image in the management scripts.
 - Run the offline verification command before transferring a bundle.
 
 ## Standard Workspace Release
@@ -66,22 +73,24 @@ bash scripts/manage.sh update-workspace --tag embedded-v20260607-r1
 ```
 
 This builds a workspace image, saves the image tarball, updates the workspace
-image tag in the version lock, and pushes the template if the local Coder service
-is running.
+image tag in the version lock, and records the image in the template image
+catalog. It does not activate a Coder template version.
 
 ### 2. Transfer to the offline server
 
-Transfer the workspace image tarball and the updated version lock. Do not replace
-the offline server's deployment secrets or TLS CA during a workspace-only release.
+Transfer the workspace image tarball, the updated version lock, and the template
+image catalog. Do not replace the offline server's deployment secrets or TLS CA
+during a workspace-only release.
 
 Example:
 
 ```bash
 scp images/workspace-embedded_embedded-v20260607-r1.tar offline:/deploy/images/
 scp configs/versions.lock.env offline:/deploy/configs/
+scp workspace-template/image-catalog.json offline:/deploy/workspace-template/
 ```
 
-### 3. Load and activate on the offline server
+### 3. Load on the offline server
 
 Windows:
 
@@ -95,10 +104,35 @@ Linux:
 bash scripts/manage.sh load-workspace images/workspace-embedded_embedded-v20260607-r1.tar
 ```
 
-The command loads the image, updates the active workspace image tag, and pushes a
-new Coder template version.
+The command loads the image into Docker and records it in the template image
+catalog. It does not change the active Coder template version.
 
-### 4. Restart workspaces
+### 4. Stage and activate a Coder template version
+
+Windows:
+
+```powershell
+.\scripts\manage.ps1 push-template -Name workspace-embedded-v20260607-r1
+```
+
+Linux:
+
+```bash
+bash scripts/manage.sh push-template --name workspace-embedded-v20260607-r1
+```
+
+The first command creates a staged Coder template version with
+`--activate=false`. After the pilot workspace validates the image, activate the
+version with the Coder UI or the Coder CLI promote command:
+
+```bash
+coder templates versions promote --template=embedded-dev --template-version=workspace-embedded-v20260607-r1
+```
+
+Use `-Apply` / `--apply` on `push-template` only when you intentionally want that
+push to become active immediately.
+
+### 5. Restart workspaces
 
 Existing workspace containers keep running on the old image until users stop and
 start them again. Ask a small pilot group to restart first. After the pilot is
@@ -106,11 +140,12 @@ healthy, ask the remaining users to restart.
 
 ## Rollback
 
-Rollback is a template activation, not a data restore.
+Rollback is a Coder template version promotion, not a data restore.
 
 1. Keep at least the previous two workspace image tarballs on the offline server.
 2. Load the older tarball if it is not already present.
-3. Run `load-workspace` with the older tarball.
+3. Promote the older Coder template version, or push a new version whose image
+   catalog default points to the older image and activate that version.
 4. Ask affected users to stop and restart their workspaces.
 
 The home volumes are independent of the workspace image. A rollback changes the
@@ -121,8 +156,8 @@ container image used on the next start, but it does not delete user data.
 Use one workspace image when users need the same toolchain and only resource
 sizes differ. Resource choices already belong in template parameters.
 
-Use multiple tags of the same image when you need release channels for the same
-template:
+Use multiple image profiles in the same Coder template when you need release
+channels for the same workspace contract:
 
 - `embedded-stable-v20260607-r1`
 - `embedded-candidate-v20260607-r1`
@@ -135,10 +170,10 @@ different:
 - Documentation conversion and publishing
 - Minimal terminal-only workspaces
 
-For now, this repository supports one active template and one active workspace
-image tag. Multiple templates should be added as a planned script extension so
-each template can carry its own image name, image tag, variables, and release
-history.
+For now, this repository supports one Coder template with an image catalog and a
+workspace image parameter. Multiple templates should be added only when the
+workspace contract differs enough that a separate template history is clearer
+than another image profile.
 
 ## Release Checklist
 
@@ -153,7 +188,8 @@ Before release:
 During release:
 
 - Load the image on the offline server.
-- Push the template version.
+- Push a staged template version.
+- Activate or promote the template version after pilot validation.
 - Restart one pilot workspace.
 - Verify code-server opens and the Coder agent connects.
 - Verify the expected CLI/toolchain changes inside the pilot workspace.
@@ -206,15 +242,16 @@ Do not use `docker compose down -v` during a platform upgrade.
 ## Future Script Extensions
 
 The current scripts already support the critical path through `update-workspace`,
-`load-workspace`, and `push-template`.
+`load-workspace`, and `push-template`, while leaving template version activation
+to Coder-native version management.
 
 The next useful extension is a workspace image release command group:
 
 - `workspace-images list` shows local tags and saved tarballs.
 - `workspace-images build --tag <tag>` builds and records a release.
-- `workspace-images activate --tag <tag>` updates the version lock and pushes the
-  template.
-- `workspace-images rollback` activates the previous recorded tag.
+- `workspace-images stage --tag <tag>` pushes a non-active template version.
+- `workspace-images promote --version <name>` wraps Coder's template version
+  promotion.
 
 Add these commands only after the release record format is agreed. The release
 record should become the source of truth for rollback.

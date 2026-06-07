@@ -141,6 +141,33 @@ function Test-ManagePowerShellStaticContracts {
     Assert-True 'update-workspace passes Tag to NewTag parameter' ($text -match '''update-workspace''\s*\{\s*Invoke-UpdateWorkspace\s+-NewTag\s+\$Tag')
     Assert-True 'upgrade restore writes pending marker' ($text -match '\.upgrade-restore-pending')
     Assert-True 'backup includes LiteLLM runtime config' ($text -match 'litellm_config\.yaml\.bak')
+
+    $loadWorkspaceBlock = [regex]::Match(
+        $text,
+        'function Invoke-LoadWorkspace[\s\S]*?# ─── prepare'
+    ).Value
+    Assert-True 'load-workspace registers imported image without changing active template state' (
+        $loadWorkspaceBlock -match 'Update-WorkspaceImageCatalog' -and
+        $loadWorkspaceBlock -notmatch 'Update-LockWorkspaceTag' -and
+        $loadWorkspaceBlock -notmatch 'Invoke-PushTemplate' -and
+        $loadWorkspaceBlock -notmatch 'Coder is not reachable'
+    )
+    Assert-True 'push-template supports staged Coder template versions' (
+        $text -match 'ActivateTemplate' -and
+        $text -match 'ConvertTo-SafeTemplateVersionName' -and
+        $text -match '--activate=\$activateValue' -and
+        $text -match '--name=\$safeVersionName' -and
+        $text -match 'Invoke-PushTemplate -SessionToken \$sessionToken -VersionName \$Name -ActivateTemplate:\$activateTemplate'
+    )
+
+    $updateWorkspaceBlock = [regex]::Match(
+        $text,
+        'function Invoke-UpdateWorkspace[\s\S]*?# ─── load-workspace'
+    ).Value
+    Assert-True 'update-workspace prepares image catalog without auto-pushing template state' (
+        $updateWorkspaceBlock -match 'Update-WorkspaceImageCatalog' -and
+        $updateWorkspaceBlock -notmatch 'Invoke-PushTemplate'
+    )
 }
 
 function Test-ManageBashAndDocsStaticContracts {
@@ -158,6 +185,44 @@ function Test-ManageBashAndDocsStaticContracts {
     Assert-True 'manage.sh refresh includes Dex digest target' ($manage -match 'DEX_IMAGE_REF="\$\(_rv_resolve_digest')
     Assert-True 'upgrade docs describe selected load semantics' ($docs -match 'selected optional service' -and $docs -notmatch 'load \[--ldap')
     Assert-True 'docs clarify restore-config does not restore volumes' ($docs -match 'does not restore Docker volumes')
+
+    $loadWorkspaceBlock = [regex]::Match(
+        $manage,
+        'load_workspace\(\) \{[\s\S]*?# ───'
+    ).Value
+    Assert-True 'manage.sh load-workspace registers image without changing active template state' (
+        $loadWorkspaceBlock -match '_update_workspace_image_catalog' -and
+        $loadWorkspaceBlock -notmatch '_update_lock_workspace_tag' -and
+        $loadWorkspaceBlock -notmatch '_do_push_template' -and
+        $loadWorkspaceBlock -notmatch 'Coder is not reachable'
+    )
+    Assert-True 'manage.sh push-template supports staged Coder template versions' (
+        $manage -match 'local activate_template="\$\{3:-true\}"' -and
+        $manage -match '_safe_template_version_name' -and
+        $manage -match '--activate=\$\{activate_template\}' -and
+        $manage -match "--name='\$\{version_name\}'" -and
+        $manage -match 'cmd_push_template\(\)[\s\S]*activate_template=false' -and
+        $manage -match '_do_push_template "\$session_token" "\$version_name" "\$activate_template"'
+    )
+
+    $updateWorkspaceBlock = [regex]::Match(
+        $manage,
+        'update_workspace\(\) \{[\s\S]*?# ─── load-workspace'
+    ).Value
+    Assert-True 'manage.sh update-workspace prepares catalog without auto-pushing template state' (
+        $updateWorkspaceBlock -match '_update_workspace_image_catalog' -and
+        $updateWorkspaceBlock -notmatch '_do_push_template'
+    )
+}
+
+function Test-BashTemplateVersionNameSanitizer {
+    $script = @'
+set -euo pipefail
+source scripts/manage.sh __test_source_only 2>/dev/null || true
+actual="$(_template_version_name 'bad name;rm -rf /' 'workspace/image' 'tag:latest')"
+[ "$actual" = "bad-name-rm--rf" ] || { echo "unexpected sanitized version: $actual" >&2; exit 1; }
+'@
+    Invoke-BashText $script | Out-Null
 }
 
 function Test-WorkspaceAiToolingStaticContracts {
@@ -186,12 +251,20 @@ function Test-WorkspaceAiToolingStaticContracts {
     Assert-True 'workspace template gates SkillHub app' ($template -match 'resource "coder_app" "skill_hub"[\s\S]*count\s*=')
     Assert-True 'manage.sh passes optional app flags into template push' ($manageSh -match "--var mineru_enabled='\$\{USE_MINERU\}'" -and $manageSh -match "--var doctools_enabled='\$\{USE_DOCTOOLS\}'")
     Assert-True 'manage.ps1 passes optional app flags into template push' ($managePs1.Contains("--var mineru_enabled='`$mineruEnabled'") -and $managePs1.Contains("--var doctools_enabled='`$doctoolsEnabled'"))
+    Assert-True 'workspace template uses Coder parameter for image profile selection' (
+        $template -match 'image-catalog\.json' -and
+        $template -match 'data "coder_parameter" "image_profile"' -and
+        $template -match 'form_type\s*=\s*"dropdown"' -and
+        $template -match 'local\.selected_workspace_image' -and
+        $template -match 'image\s*=\s*local\.selected_workspace_image'
+    )
 }
 
 Test-PowerShellEffectiveConfig
 Test-BashEffectiveConfig
 Test-ManagePowerShellStaticContracts
 Test-ManageBashAndDocsStaticContracts
+Test-BashTemplateVersionNameSanitizer
 Test-WorkspaceAiToolingStaticContracts
 
 Write-Host 'upgrade script regression tests passed'

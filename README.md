@@ -269,7 +269,7 @@ Notes:
 
 ## Workspace Image Versioning
 
-Each `manage.sh prepare` / `manage.ps1 prepare` builds the workspace image with the tag stored in `configs/versions.lock.env` (`WORKSPACE_IMAGE_TAG`). When you need to update the workspace toolchain on a running offline deployment, use the update workflow below.
+Each `manage.sh prepare` / `manage.ps1 prepare` builds the workspace image with the tag stored in `configs/versions.lock.env` (`WORKSPACE_IMAGE_TAG`). Runtime workspace image selection lives in the Coder template: `workspace-template/image-catalog.json` is pushed as part of each Coder template version, and users choose an image profile through a Coder template parameter. When you need to update the workspace toolchain on a running offline deployment, use the update workflow below.
 
 For the operational model behind workspace image tags, pilot releases, rollback, and multi-image planning, see **[docs/offline-image-release-management.md](docs/offline-image-release-management.md)**.
 
@@ -296,16 +296,17 @@ This:
 - Builds `workspace-embedded:<tag>` using the current `Dockerfile.workspace`
 - Saves it to `images/workspace-embedded_<tag>.tar`
 - Updates `WORKSPACE_IMAGE_TAG` in `configs/versions.lock.env`
-- Pushes a new template version to Coder if the platform is currently running
+- Updates `workspace-template/image-catalog.json` so the next template version can expose the image through Coder
 
 **Step 2 — Transfer to the offline server**
 
 ```bash
-scp images/workspace-embedded_v20240324.tar  offline-server:/deploy/images/
-scp configs/versions.lock.env                offline-server:/deploy/configs/
+scp images/workspace-embedded_v20240324.tar       offline-server:/deploy/images/
+scp configs/versions.lock.env                     offline-server:/deploy/configs/
+scp workspace-template/image-catalog.json         offline-server:/deploy/workspace-template/
 ```
 
-**Step 3 — Load and activate on the offline server**
+**Step 3 — Load on the offline server**
 
 Windows:
 
@@ -322,10 +323,31 @@ bash scripts/manage.sh load-workspace images/workspace-embedded_v20240324.tar
 This:
 - Loads the image into Docker
 - Parses the tag from the filename (`workspace-embedded_v20240324.tar` → tag `v20240324`)
-- Updates `WORKSPACE_IMAGE_TAG` in `configs/versions.lock.env`
-- Pushes a new template version to Coder (the platform must be running)
+- Registers the image in `workspace-template/image-catalog.json`
 
-**Step 4 — Users restart their workspaces**
+**Step 4 — Stage and activate a Coder template version**
+
+Windows:
+
+```powershell
+.\scripts\manage.ps1 push-template -Name workspace-v20240324
+```
+
+Linux:
+
+```bash
+bash scripts/manage.sh push-template --name workspace-v20240324
+```
+
+Without `-Apply` / `--apply`, the command creates a staged Coder template version with `--activate=false`. After validation, promote the staged version in the Coder UI or with the Coder CLI:
+
+```bash
+coder templates versions promote --template=embedded-dev --template-version=workspace-v20240324
+```
+
+Use `-Apply` / `--apply` only when you intentionally want this push to become active immediately.
+
+**Step 5 — Users restart their workspaces**
 
 In the Coder UI, stop then restart each workspace. Coder will rebuild the container using the new image.
 
@@ -344,6 +366,8 @@ Linux:
 ```bash
 bash scripts/manage.sh push-template
 ```
+
+By default this stages a template version without activating it. Promote the staged version in Coder after validation, or use `-Apply` / `--apply` only when you intentionally want this push to become active immediately.
 
 ## In-Place Upgrade (Preserve Users and Workspaces)
 
@@ -671,6 +695,7 @@ That keeps the existing offline Git workflow while allowing one curated skill so
 # Workspace image versioning
 .\scripts\manage.ps1 update-workspace [-Tag v20240324]
 .\scripts\manage.ps1 load-workspace images\workspace-embedded_v20240324.tar
+.\scripts\manage.ps1 push-template [-Name workspace-v20240324] [-Apply]
 
 # In-place upgrade (preserve users and workspaces across code changes)
 .\scripts\manage.ps1 upgrade-backup [-Dest dir] [-Force]
@@ -693,6 +718,7 @@ bash scripts/manage.sh <command> [--llm] [--ldap] [--mineru] [--doctools] [--ski
 # Workspace image versioning
 bash scripts/manage.sh update-workspace [--tag v20240324]
 bash scripts/manage.sh load-workspace images/workspace-embedded_v20240324.tar
+bash scripts/manage.sh push-template [--name workspace-v20240324] [--apply]
 
 # In-place upgrade (preserve users and workspaces across code changes)
 bash scripts/manage.sh upgrade-backup [--dest <dir>] [--force]
@@ -718,6 +744,7 @@ bash scripts/manage.sh skillhub-refresh
 - `configs/dex/config.yaml`: Dex OIDC + LDAP connector config (--ldap mode)
 - `configs/postgres/init-dex.sql`: auto-creates `dex` database on first postgres start
 - `workspace-template/main.tf`: Coder template that provisions workspace containers
+- `workspace-template/image-catalog.json`: workspace image profiles embedded in each Coder template version
 - `docs/offline-image-release-management.md`: runbook for offline workspace image release, activation, rollback, and multi-image planning
 - `docs/upgrade-in-place.md`: runbook for upgrading an existing deployment without losing users or workspace data
 - `scripts/manage.ps1`: **Windows entry point** — all commands
@@ -801,7 +828,7 @@ Confirm `ANTHROPIC_BASE_URL=http://llm-gateway:4000` in `docker/.env`. The inter
 
 ### Workspace did not pick up the new image after load-workspace
 
-Coder only applies the new template version to workspaces when they are restarted. In the Coder UI, stop the workspace and then start it again. The new image will be used for the fresh container.
+`load-workspace` only loads the Docker image tarball and updates the local template image catalog. Push a staged template version, promote it in the Coder UI/CLI after validation, then stop and start the workspace. Use `push-template --apply` only when you intentionally want a push to become active immediately. The fresh container uses the image profile selected in the Coder workspace parameter.
 
 ### Dex does not start (LDAP mode)
 
