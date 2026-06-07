@@ -141,6 +141,52 @@ The new image profiles should use immutable tags:
 
 The default embedded stable tag format remains unchanged.
 
+## Profile Naming Policy
+
+Use fixed image family names so script parsing, image catalog entries, release
+records, and offline manifests all agree:
+
+| Profile key | Display name | Docker image | Tag pattern | Tarball pattern |
+|-------------|--------------|--------------|-------------|-----------------|
+| `embedded_stable` | `Embedded Stable` | `workspace-embedded` | `embedded-vYYYYMMDD-rN` | `workspace-embedded_embedded-vYYYYMMDD-rN.tar` |
+| `python_backend_stable` | `Python Backend Stable` | `workspace-python-backend` | `python-backend-vYYYYMMDD-rN` | `workspace-python-backend_python-backend-vYYYYMMDD-rN.tar` |
+| `agent_dev_stable` | `Agent Dev Stable` | `workspace-agent-dev` | `agent-dev-vYYYYMMDD-rN` | `workspace-agent-dev_agent-dev-vYYYYMMDD-rN.tar` |
+
+Keep `WORKSPACE_IMAGE` and `WORKSPACE_IMAGE_TAG` as the embedded/default
+workspace lock variables for backward compatibility. Add separate lock variables
+for Python backend and agent development image families. The catalog should be
+updated from these family locks rather than inventing profile keys from arbitrary
+image names and tags.
+
+## Offline Bundle Policy
+
+The default offline bundle should include every stable workspace profile exposed
+by the template image catalog. This prevents an offline deployment from showing
+a selectable Python backend or agent development profile whose Docker image was
+not transferred.
+
+`prepare` should build and save all stable workspace profiles by default:
+
+- embedded stable
+- Python backend stable
+- agent development stable
+
+`offline-manifest.json` should list every workspace image archive included in
+the bundle. `verify` should continue to validate files through the manifest, so
+no extra workspace-image-specific verification path is needed after the manifest
+is complete.
+
+`update-workspace` should support releasing one workspace image family at a
+time. The default remains embedded stable for backward compatibility, but the
+operator can choose Python backend or agent development and provide a matching
+immutable tag. The command should update only that family's lock variables and
+that family's stable catalog entry.
+
+`load-workspace` should parse the fixed tarball naming convention, load the
+image, and update the matching stable catalog entry. Unknown image names may
+still be registered as ad hoc profiles for experimentation, but the three stable
+image families must always map to the stable profile keys above.
+
 ## Implementation Shape
 
 Add separate build definitions for the new images and keep shared workspace
@@ -168,6 +214,9 @@ Automated checks should cover:
 
 - the image catalog contains all three stable profile keys
 - the default profile remains `embedded_stable`
+- the stable profile keys map to the fixed Docker image families
+- `prepare` writes all exposed stable workspace profile images into
+  `offline-manifest.json`
 - loading a Python backend tarball registers or updates
   `python_backend_stable`
 - loading an agent development tarball registers or updates
