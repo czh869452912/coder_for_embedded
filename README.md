@@ -830,6 +830,19 @@ Confirm `ANTHROPIC_BASE_URL=http://llm-gateway:4000` in `docker/.env`. The inter
 
 `load-workspace` only loads the Docker image tarball and updates the local template image catalog. Push a staged template version, promote it in the Coder UI/CLI after validation, then stop and start the workspace. Use `push-template --apply` only when you intentionally want a push to become active immediately. The fresh container uses the image profile selected in the Coder workspace parameter.
 
+### Workspace resource limits look wrong
+
+The `CPU 核心数` and `内存大小` workspace parameters are enforced through Docker container cgroups. Do not rely on `free -m` or `nproc` inside the workspace; those tools may still report the host or VM totals. Verify the actual limits with:
+
+```bash
+docker inspect <workspace-container> --format '{{json .HostConfig}}'
+cat /sys/fs/cgroup/memory.max
+cat /sys/fs/cgroup/memory.swap.max
+cat /sys/fs/cgroup/cpu.max
+```
+
+Template changes apply only after the template version is activated and the workspace is stopped and started, because Coder recreates the Docker container on the next start.
+
 ### Dex does not start (LDAP mode)
 
 Check all of the following:

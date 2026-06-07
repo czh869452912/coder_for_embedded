@@ -258,6 +258,13 @@ function Test-WorkspaceAiToolingStaticContracts {
         $template -match 'local\.selected_workspace_image' -and
         $template -match 'image\s*=\s*local\.selected_workspace_image'
     )
+    Assert-True 'workspace template enforces hard CPU and memory limits' (
+        $template -match 'cpu_period\s*=\s*100000' -and
+        $template -match 'cpu_quota\s*=\s*data\.coder_parameter\.cpu_cores\.value \* 100000' -and
+        $template -notmatch 'cpu_shares\s*=' -and
+        $template -match 'memory\s*=\s*data\.coder_parameter\.memory_gb\.value \* 1024' -and
+        $template -match 'memory_swap\s*=\s*data\.coder_parameter\.memory_gb\.value \* 1024'
+    )
 }
 
 Test-PowerShellEffectiveConfig

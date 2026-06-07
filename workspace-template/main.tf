@@ -323,8 +323,12 @@ resource "docker_container" "workspace" {
   network_mode = "coderplatform"
 
   # 资源限制
-  memory     = data.coder_parameter.memory_gb.value * 1024
-  cpu_shares = data.coder_parameter.cpu_cores.value * 256
+  # Docker provider memory fields are MB. Setting memory_swap equal to memory
+  # disables additional swap allowance so the selected size is the hard ceiling.
+  memory      = data.coder_parameter.memory_gb.value * 1024
+  memory_swap = data.coder_parameter.memory_gb.value * 1024
+  cpu_period  = 100000
+  cpu_quota   = data.coder_parameter.cpu_cores.value * 100000
 
   # 持久化 home 目录
   volumes {
