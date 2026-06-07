@@ -7,15 +7,16 @@ an older image, and decide when multiple images or templates are needed.
 
 ## Release Model
 
-There are two image families:
+There are two image classes:
 
 - Platform images run the Coder control plane and supporting services.
-- Workspace images run user development environments.
+- Workspace images run user development environments and are grouped into
+  stable image families.
 
 Treat them differently. Platform images are upgraded with an in-place upgrade
-and database backup. Workspace images are released more often and are exposed
-through the Coder template image catalog, then activated by promoting a Coder
-template version.
+and database backup. Workspace image families are released more often and are
+exposed through the Coder template image catalog, then activated by promoting a
+Coder template version.
 
 Never use `latest` for a workspace image in production. Use immutable, meaningful
 tags such as:
@@ -23,7 +24,8 @@ tags such as:
 ```text
 embedded-v20260607-r1
 embedded-v20260607-r2
-ai-v20260607-r1
+python-backend-v20260607-r1
+agent-dev-v20260607-r1
 ```
 
 The tag should describe the image purpose, release date, and rebuild number. The
@@ -38,6 +40,18 @@ also live there, but the runtime workspace image choices live in
 `workspace-template/image-catalog.json`. That catalog is part of each Coder
 template version.
 
+The current template exposes these stable workspace image families:
+
+| Profile | Image family | Release command family |
+| --- | --- | --- |
+| `embedded_stable` | `workspace-embedded` | `embedded` |
+| `python_backend_stable` | `workspace-python-backend` | `python-backend` |
+| `agent_dev_stable` | `workspace-agent-dev` | `agent-dev` |
+
+`embedded_stable` remains the default profile. A full `prepare` builds and saves
+all stable workspace profiles so the offline bundle contains every image a user
+can choose in the template.
+
 The current platform lock tracks GitHub latest Coder `v2.33.6`, resolved to a
 pinned digest, the Coder Terraform provider `2.18.0`, and workspace image tag
 `embedded-v20260607-r1`. The provider mirror must contain the same provider
@@ -48,8 +62,8 @@ Use this rule for future updates:
 - Update the Coder image tag and digest together.
 - Update Terraform provider versions only after the mirror contains the matching
   provider archive and index.
-- Update the workspace image tag to an immutable release tag before preparing a
-  production offline bundle.
+- Update the selected workspace image family tag to an immutable release tag
+  before preparing a production offline bundle.
 - Push workspace image choices through a Coder template version instead of
   hard-coding the active image in the management scripts.
 - Run the offline verification command before transferring a bundle.
@@ -63,18 +77,23 @@ Use this flow when the workspace toolchain changes but Coder itself does not.
 Windows:
 
 ```powershell
-.\scripts\manage.ps1 update-workspace -Tag embedded-v20260607-r1
+.\scripts\manage.ps1 update-workspace -Family embedded -Tag embedded-v20260607-r2
+.\scripts\manage.ps1 update-workspace -Family python-backend -Tag python-backend-v20260607-r1
+.\scripts\manage.ps1 update-workspace -Family agent-dev -Tag agent-dev-v20260607-r1
 ```
 
 Linux:
 
 ```bash
-bash scripts/manage.sh update-workspace --tag embedded-v20260607-r1
+bash scripts/manage.sh update-workspace --family embedded --tag embedded-v20260607-r2
+bash scripts/manage.sh update-workspace --family python-backend --tag python-backend-v20260607-r1
+bash scripts/manage.sh update-workspace --family agent-dev --tag agent-dev-v20260607-r1
 ```
 
-This builds a workspace image, saves the image tarball, updates the workspace
-image tag in the version lock, and records the image in the template image
-catalog. It does not activate a Coder template version.
+Choose one family per workspace-only release. The command builds that workspace
+image, saves the image tarball, updates that family's tag in the version lock,
+and records the stable profile in the template image catalog. It does not
+activate a Coder template version.
 
 ### 2. Transfer to the offline server
 
@@ -86,9 +105,15 @@ Example:
 
 ```bash
 scp images/workspace-embedded_embedded-v20260607-r1.tar offline:/deploy/images/
+scp images/workspace-python-backend_python-backend-v20260607-r1.tar offline:/deploy/images/
+scp images/workspace-agent-dev_agent-dev-v20260607-r1.tar offline:/deploy/images/
 scp configs/versions.lock.env offline:/deploy/configs/
 scp workspace-template/image-catalog.json offline:/deploy/workspace-template/
 ```
+
+Transfer only the tarball for the family you released during a workspace-only
+update. Transfer all three stable workspace tarballs when you are moving a fresh
+`prepare` bundle.
 
 ### 3. Load on the offline server
 
@@ -156,33 +181,37 @@ container image used on the next start, but it does not delete user data.
 Use one workspace image when users need the same toolchain and only resource
 sizes differ. Resource choices already belong in template parameters.
 
-Use multiple image profiles in the same Coder template when you need release
-channels for the same workspace contract:
+Use the existing stable profiles in the same Coder template when the workspace
+contract is one of the supported families:
+
+- Embedded C/C++ development: `embedded_stable`
+- Python backend services: `python_backend_stable`
+- Interactive agent development: `agent_dev_stable`
+
+Add more image profiles in the same Coder template when you need release
+channels for an existing workspace contract:
 
 - `embedded-stable-v20260607-r1`
 - `embedded-candidate-v20260607-r1`
 
 Use multiple Coder templates when the user experience or toolchain contract is
-different:
+different enough that a separate template history is clearer:
 
-- Embedded C/C++ development
-- AI-heavy development with extra model tooling
 - Documentation conversion and publishing
 - Minimal terminal-only workspaces
 
-For now, this repository supports one Coder template with an image catalog and a
-workspace image parameter. Multiple templates should be added only when the
-workspace contract differs enough that a separate template history is clearer
-than another image profile.
+This repository supports one Coder template with an image catalog and a workspace
+image parameter. Multiple templates should be added only when another image
+profile would make the operator and user experience harder to reason about.
 
 ## Release Checklist
 
 Before release:
 
 - Pick a new immutable tag.
-- Build the image on a connected machine.
+- Build the selected image family on a connected machine.
 - Save the image tarball.
-- Check that the version lock points at the new tag.
+- Check that the selected family lock points at the new tag.
 - Transfer only the release artifacts needed by the offline server.
 
 During release:

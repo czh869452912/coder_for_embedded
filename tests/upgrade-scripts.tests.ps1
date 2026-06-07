@@ -173,6 +173,8 @@ function Test-ManagePowerShellStaticContracts {
 function Test-ManageBashAndDocsStaticContracts {
     $manage = Get-Content (Join-Path $RepoRoot 'scripts/manage.sh') -Raw
     $docs = Get-Content (Join-Path $RepoRoot 'docs/upgrade-in-place.md') -Raw
+    $readme = Get-Content (Join-Path $RepoRoot 'README.md') -Raw
+    $imageRunbook = Get-Content (Join-Path $RepoRoot 'docs/offline-image-release-management.md') -Raw
 
     Assert-True 'manage.sh uses upgrade pending marker' ($manage -match '\.upgrade-restore-pending')
     Assert-True 'manage.sh refreshes template after pending upgrade restore' ($manage -match 'run_upgrade_template_refresh')
@@ -185,6 +187,16 @@ function Test-ManageBashAndDocsStaticContracts {
     Assert-True 'manage.sh refresh includes Dex digest target' ($manage -match 'DEX_IMAGE_REF="\$\(_rv_resolve_digest')
     Assert-True 'upgrade docs describe selected load semantics' ($docs -match 'selected optional service' -and $docs -notmatch 'load \[--ldap')
     Assert-True 'docs clarify restore-config does not restore volumes' ($docs -match 'does not restore Docker volumes')
+    Assert-True 'README documents stable workspace profiles' (
+        $readme -match 'python_backend_stable' -and
+        $readme -match 'agent_dev_stable' -and
+        $readme -match 'prepare[\s\S]{0,120}all stable workspace profiles'
+    )
+    Assert-True 'image runbook documents workspace family release policy' (
+        $imageRunbook -match 'workspace-python-backend' -and
+        $imageRunbook -match 'workspace-agent-dev' -and
+        $imageRunbook -match 'update-workspace --family'
+    )
 
     $loadWorkspaceBlock = [regex]::Match(
         $manage,

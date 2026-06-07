@@ -272,7 +272,17 @@ Notes:
 
 ## Workspace Image Versioning
 
-Each `manage.sh prepare` / `manage.ps1 prepare` builds the workspace image with the tag stored in `configs/versions.lock.env` (`WORKSPACE_IMAGE_TAG`). Runtime workspace image selection lives in the Coder template: `workspace-template/image-catalog.json` is pushed as part of each Coder template version, and users choose an image profile through a Coder template parameter. When you need to update the workspace toolchain on a running offline deployment, use the update workflow below.
+Each `manage.sh prepare` / `manage.ps1 prepare` builds the stable workspace profiles tracked in `configs/versions.lock.env`. Runtime workspace image selection lives in the Coder template: `workspace-template/image-catalog.json` is pushed as part of each Coder template version, and users choose an image profile through a Coder template parameter. When you need to update one workspace toolchain on a running offline deployment, use the update workflow below.
+
+The template exposes three stable workspace profiles:
+
+| Profile | Image family | Intended use |
+| --- | --- | --- |
+| `embedded_stable` | `workspace-embedded` | Embedded C/C++ development |
+| `python_backend_stable` | `workspace-python-backend` | Python backend services, APIs, tests, and database clients |
+| `agent_dev_stable` | `workspace-agent-dev` | Interactive agent, MCP, and AI tooling development |
+
+`embedded_stable` remains the default. `prepare` builds and saves all stable workspace profiles so an offline deployment does not expose a profile whose image was not transferred.
 
 For the operational model behind workspace image tags, pilot releases, rollback, and multi-image planning, see **[docs/offline-image-release-management.md](docs/offline-image-release-management.md)**.
 
@@ -283,22 +293,26 @@ For the operational model behind workspace image tags, pilot releases, rollback,
 Windows:
 
 ```powershell
-# Auto-generates tag v<YYYYMMDD>, or supply your own with -Tag
+# Auto-generates a family-specific tag, or supply your own with -Tag
 .\scripts\manage.ps1 update-workspace
-.\scripts\manage.ps1 update-workspace -Tag v20240324
+.\scripts\manage.ps1 update-workspace -Family embedded -Tag embedded-v20260608-r1
+.\scripts\manage.ps1 update-workspace -Family python-backend -Tag python-backend-v20260608-r1
+.\scripts\manage.ps1 update-workspace -Family agent-dev -Tag agent-dev-v20260608-r1
 ```
 
 Linux:
 
 ```bash
 bash scripts/manage.sh update-workspace
-bash scripts/manage.sh update-workspace --tag v20240324
+bash scripts/manage.sh update-workspace --family embedded --tag embedded-v20260608-r1
+bash scripts/manage.sh update-workspace --family python-backend --tag python-backend-v20260608-r1
+bash scripts/manage.sh update-workspace --family agent-dev --tag agent-dev-v20260608-r1
 ```
 
 This:
-- Builds `workspace-embedded:<tag>` using the current `Dockerfile.workspace`
-- Saves it to `images/workspace-embedded_<tag>.tar`
-- Updates `WORKSPACE_IMAGE_TAG` in `configs/versions.lock.env`
+- Builds the selected image family with its matching workspace Dockerfile
+- Saves it to `images/<image-family>_<tag>.tar`
+- Updates that family's tag in `configs/versions.lock.env`
 - Updates `workspace-template/image-catalog.json` so the next template version can expose the image through Coder
 
 **Step 2 — Transfer to the offline server**
@@ -700,7 +714,7 @@ That keeps the existing offline Git workflow while allowing one curated skill so
 .\scripts\manage.ps1 test-llm-backend
 
 # Workspace image versioning
-.\scripts\manage.ps1 update-workspace [-Tag v20240324]
+.\scripts\manage.ps1 update-workspace [-Family embedded|python-backend|agent-dev] [-Tag embedded-v20260608-r1]
 .\scripts\manage.ps1 load-workspace images\workspace-embedded_v20240324.tar
 .\scripts\manage.ps1 push-template [-Name workspace-v20240324] [-Apply]
 
@@ -723,7 +737,7 @@ That keeps the existing offline Git workflow while allowing one curated skill so
 bash scripts/manage.sh <command> [--llm] [--ldap] [--mineru] [--doctools] [--skillhub]
 
 # Workspace image versioning
-bash scripts/manage.sh update-workspace [--tag v20240324]
+bash scripts/manage.sh update-workspace [--family embedded|python-backend|agent-dev] [--tag embedded-v20260608-r1]
 bash scripts/manage.sh load-workspace images/workspace-embedded_v20240324.tar
 bash scripts/manage.sh push-template [--name workspace-v20240324] [--apply]
 
@@ -742,8 +756,10 @@ bash scripts/manage.sh skillhub-refresh
 ## Key Files
 
 - `docker/docker-compose.yml`: platform services (gateway, coder, postgres, llm-gateway, dex)
-- `docker/Dockerfile.workspace`: workspace image build
-- `configs/versions.lock.env`: pinned deployment versions and workspace image tag
+- `docker/Dockerfile.workspace`: embedded workspace image build
+- `docker/Dockerfile.workspace-python-backend`: Python backend workspace image build
+- `docker/Dockerfile.workspace-agent-dev`: agent development workspace image build
+- `configs/versions.lock.env`: pinned deployment versions and stable workspace image tags
 - `configs/nginx.conf`: Nginx gateway routing (`/`, `/llm/`, `/dex/`)
 - `configs/terraform-offline.rc`: strict offline Terraform config
 - `configs/terraform.rc`: connected Terraform config with fallback
