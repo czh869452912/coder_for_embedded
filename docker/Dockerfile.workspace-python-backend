@@ -1,0 +1,130 @@
+ARG CODE_SERVER_BASE_IMAGE_REF=codercom/code-server:latest
+FROM ${CODE_SERVER_BASE_IMAGE_REF}
+
+USER root
+
+RUN if [ -f /etc/apt/sources.list ] && grep -q "ubuntu" /etc/apt/sources.list 2>/dev/null; then \
+        sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list && \
+        sed -i 's|http://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list; \
+    elif [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' /etc/apt/sources.list.d/debian.sources && \
+        sed -i 's|http://security.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list.d/debian.sources; \
+    elif [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' /etc/apt/sources.list && \
+        sed -i 's|http://security.debian.org|http://mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list; \
+    fi
+
+RUN printf 'Acquire::http::Timeout "120";\nAcquire::https::Timeout "120";\nAcquire::Retries "5";\n' \
+    > /etc/apt/apt.conf.d/99network-resilience
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    wget \
+    git \
+    git-lfs \
+    vim \
+    nano \
+    htop \
+    tree \
+    jq \
+    unzip \
+    zip \
+    build-essential \
+    pkg-config \
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    pipx \
+    postgresql-client \
+    redis-tools \
+    sqlite3 \
+    libpq-dev \
+    openssh-client \
+    pandoc \
+    graphviz \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir --break-system-packages \
+    uv \
+    ruff \
+    black \
+    pytest \
+    pytest-cov \
+    coverage \
+    ipython \
+    httpie \
+    fastapi \
+    "uvicorn[standard]" \
+    pydantic \
+    sqlalchemy \
+    alembic \
+    "psycopg[binary]" \
+    redis \
+    requests \
+    httpx
+
+ENV CODE_SERVER_EXTENSIONS_SEED=/opt/code-server-extensions-seed
+RUN mkdir -p ${CODE_SERVER_EXTENSIONS_SEED}
+
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension ms-python.python \
+    || echo "[WARN] Python extension not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension charliermarsh.ruff \
+    || echo "[WARN] Ruff extension not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension redhat.vscode-yaml \
+    || echo "[WARN] YAML extension not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension eamodio.gitlens \
+    || echo "[WARN] GitLens not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension mhutchie.git-graph \
+    || echo "[WARN] Git Graph not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension pkief.material-icon-theme \
+    || echo "[WARN] material icon theme not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension usernamehw.errorlens \
+    || echo "[WARN] Error Lens not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension christian-kohler.path-intellisense \
+    || echo "[WARN] path-intellisense not available, skipping"
+RUN code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension yzhang.markdown-all-in-one \
+    || echo "[WARN] markdown-all-in-one not available, skipping"
+
+RUN mkdir -p /tmp/vsix
+COPY configs/vsix/ /tmp/vsix/
+RUN if ls /tmp/vsix/*.vsix 1>/dev/null 2>&1; then \
+        for vsix in /tmp/vsix/*.vsix; do \
+            echo "Installing: $vsix" && \
+            code-server --extensions-dir ${CODE_SERVER_EXTENSIONS_SEED} --install-extension "$vsix" || echo "Failed: $vsix"; \
+        done; \
+    else \
+        echo "[INFO] No VSIX files, skipping offline install"; \
+    fi
+
+RUN mkdir -p /usr/local/share/ca-certificates
+COPY configs/ssl/ca.crt /tmp/coder-root-ca.crt
+RUN if [ -f /tmp/coder-root-ca.crt ]; then \
+        cp /tmp/coder-root-ca.crt /usr/local/share/ca-certificates/coder-platform-root-ca.crt && \
+        update-ca-certificates 2>/dev/null && \
+        echo "[INFO] Coder platform root CA trusted in workspace image"; \
+    else \
+        echo "[INFO] No CA cert found (run manage.ps1 ssl or manage.sh ssl before build)"; \
+    fi && \
+    rm -f /tmp/coder-root-ca.crt
+
+COPY --chown=coder:coder configs/settings-python-backend.json /home/coder/.local/share/code-server/User/settings.json
+
+RUN printf '# ==== Python Backend Dev Environment ====\n\
+alias py="python3"\n\
+alias venv="python3 -m venv .venv"\n\
+alias activate=". .venv/bin/activate"\n\
+alias test="pytest -q"\n\
+alias cov="pytest --cov=. --cov-report=term-missing"\n\
+alias lint="ruff check ."\n\
+alias fmt="ruff format ."\n\
+alias serve="uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"\n\
+' > /etc/profile.d/python-backend-dev.sh \
+    && cat /etc/profile.d/python-backend-dev.sh >> /etc/bash.bashrc
+
+COPY scripts/workspace-startup.sh /opt/workspace-startup.sh
+RUN sed -i 's/\r$//' /opt/workspace-startup.sh && chmod +x /opt/workspace-startup.sh
+
+ENV SHELL=/bin/bash
+WORKDIR /home/coder

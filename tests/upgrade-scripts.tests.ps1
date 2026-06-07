@@ -427,6 +427,10 @@ function Test-WorkspaceAiToolingStaticContracts {
     $template = Get-Content (Join-Path $RepoRoot 'workspace-template/main.tf') -Raw
     $envExample = Get-Content (Join-Path $RepoRoot '.env.example') -Raw
     $vsixReadme = Get-Content (Join-Path $RepoRoot 'configs/vsix/README.md') -Raw
+    $pythonDockerfile = Get-Content (Join-Path $RepoRoot 'docker/Dockerfile.workspace-python-backend') -Raw
+    $agentDockerfile = Get-Content (Join-Path $RepoRoot 'docker/Dockerfile.workspace-agent-dev') -Raw
+    $pythonSettings = Get-Content (Join-Path $RepoRoot 'configs/settings-python-backend.json') -Raw
+    $agentSettings = Get-Content (Join-Path $RepoRoot 'configs/settings-agent-dev.json') -Raw
 
     Assert-True 'workspace image installs Codex CLI' ($dockerfile -match '@openai/codex')
     Assert-True 'workspace image installs Kilo Code CLI' ($dockerfile -match '@kilocode/cli')
@@ -476,6 +480,30 @@ function Test-WorkspaceAiToolingStaticContracts {
         $template -notmatch 'cpu_shares\s*=' -and
         $template -match 'memory\s*=\s*data\.coder_parameter\.memory_gb\.value \* 1024' -and
         $template -match 'memory_swap\s*=\s*data\.coder_parameter\.memory_gb\.value \* 1024'
+    )
+    Assert-True 'Python backend image installs backend tooling' (
+        $pythonDockerfile -match 'uv' -and
+        $pythonDockerfile -match 'ruff' -and
+        $pythonDockerfile -match 'pytest' -and
+        $pythonDockerfile -match 'fastapi' -and
+        $pythonDockerfile -match 'postgresql-client' -and
+        $pythonDockerfile -match 'redis-tools'
+    )
+    Assert-True 'agent dev image installs AI agent tooling' (
+        $agentDockerfile -match '@anthropic-ai/claude-code' -and
+        $agentDockerfile -match '@openai/codex' -and
+        $agentDockerfile -match '@kilocode/cli' -and
+        $agentDockerfile -match '@earendil-works/pi-coding-agent' -and
+        $agentDockerfile -match 'pi install npm:pi-provider-litellm' -and
+        $agentDockerfile -match 'playwright'
+    )
+    Assert-True 'Python backend settings avoid embedded compiler defaults' (
+        $pythonSettings -match 'python.defaultInterpreterPath' -and
+        $pythonSettings -notmatch 'arm-none-eabi'
+    )
+    Assert-True 'agent dev settings avoid embedded compiler defaults' (
+        $agentSettings -match 'python.defaultInterpreterPath' -and
+        $agentSettings -notmatch 'arm-none-eabi'
     )
 }
 
