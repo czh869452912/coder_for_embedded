@@ -1,6 +1,6 @@
 # Coder for Embedded Development
 
-A single-port Coder deployment for embedded software teams. The platform provides browser-based VS Code workspaces, a full embedded C/C++ toolchain, preinstalled Claude Code / Codex / Kilo Code tooling, an optional LiteLLM gateway that adapts existing internal model infrastructure for editor agents, optional LDAP authentication via Dex OIDC, GPU-accelerated document-to-Markdown conversion via MinerU, and Markdown-to-Word/PDF conversion via Pandoc.
+A single-port Coder deployment for embedded software teams. The platform provides browser-based VS Code workspaces, a full embedded C/C++ toolchain, preinstalled Claude Code / Codex / Kilo Code / Pi tooling, an optional LiteLLM gateway that adapts existing internal model infrastructure for editor agents, optional LDAP authentication via Dex OIDC, GPU-accelerated document-to-Markdown conversion via MinerU, and Markdown-to-Word/PDF conversion via Pandoc.
 
 ## What This Repository Guarantees
 
@@ -29,18 +29,21 @@ The workspace image preinstalls:
 - Claude Code CLI plus the Claude Code code-server extension seed
 - OpenAI Codex CLI (`@openai/codex`) plus the official `openai.chatgpt` extension seed when available
 - Kilo Code CLI (`@kilocode/cli`) plus the `kilocode.kilo-code` extension seed when available
+- Pi CLI (`@earendil-works/pi-coding-agent`) plus the `pi-provider-litellm` provider package
 - Cline, Roo Code, opencode, and embedded/C++ helper extensions already provided by the image
 
-For LiteLLM-backed deployments, set both Anthropic-compatible and OpenAI-compatible variables in `docker/.env` before pushing the template:
+For LiteLLM-backed deployments, you can either set the agent variables explicitly in `docker/.env`, or leave them blank and start/push the template with `--llm` / `-Llm`. In LiteLLM mode the manage scripts automatically inject these defaults into workspace template variables:
 
 ```env
 ANTHROPIC_API_KEY=sk-devenv
 ANTHROPIC_BASE_URL=http://llm-gateway:4000
 OPENAI_API_KEY=sk-devenv
 OPENAI_BASE_URL=http://llm-gateway:4000/v1
+LITELLM_API_KEY=sk-devenv
+LITELLM_BASE_URL=http://llm-gateway:4000
 ```
 
-The OpenAI-compatible settings are passed into workspaces for Codex CLI, Kilo Code, and other OpenAI-format tools. Codex currently relies on OpenAI-compatible `/v1` endpoints; confirm your LiteLLM version and internal backend support the model/API surface you expose.
+The OpenAI-compatible settings are passed into workspaces for Codex CLI, Kilo Code, and other OpenAI-format tools. The LiteLLM settings are passed into workspaces for Pi's LiteLLM provider. Codex currently relies on OpenAI-compatible `/v1` endpoints; confirm your LiteLLM version and internal backend support the model/API surface you expose.
 
 ## Architecture
 
@@ -473,11 +476,15 @@ INTERNAL_API_KEY=your-key
 LITELLM_MASTER_KEY=sk-devenv
 ```
 
-3. Set the Claude Code API variables so workspace containers reach LiteLLM directly over the internal Docker network:
+3. Start or push the template with LiteLLM enabled. If `ANTHROPIC_*`, `OPENAI_*`, and `LITELLM_*` are blank, the manage scripts inject the internal gateway defaults automatically:
 
 ```env
 ANTHROPIC_API_KEY=sk-devenv          # must match LITELLM_MASTER_KEY
 ANTHROPIC_BASE_URL=http://llm-gateway:4000
+OPENAI_API_KEY=sk-devenv
+OPENAI_BASE_URL=http://llm-gateway:4000/v1
+LITELLM_API_KEY=sk-devenv
+LITELLM_BASE_URL=http://llm-gateway:4000
 ```
 
 > **Note:** Do not use `https://<host>:8443/llm` as `ANTHROPIC_BASE_URL`. Workspace containers are on the `coderplatform` Docker network and resolve `localhost` as themselves, not as the host or Nginx. The direct internal URL `http://llm-gateway:4000` is the correct address. The `/llm/` Nginx path is for external browser/tool access only.

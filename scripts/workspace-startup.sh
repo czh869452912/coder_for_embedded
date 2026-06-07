@@ -10,6 +10,17 @@
 # ============================================================
 set -e
 
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+write_export_if_set() {
+    local name="$1"
+    local value="$2"
+    [ -n "$value" ] || return 0
+    printf 'export %s=%s\n' "$name" "$(shell_quote "$value")"
+}
+
 # ---- 1. 配置 Claude Code ----
 # 容器以 root 运行，Claude Code 读取 /root/.claude/settings.json
 CLAUDE_DIR="${HOME}/.claude"
@@ -54,7 +65,7 @@ fi
 if [ -n "${OPENAI_API_KEY:-}" ] || [ -n "${OPENAI_BASE_URL:-}" ]; then
     echo "[startup] OpenAI-compatible config present: OPENAI_BASE_URL=${OPENAI_BASE_URL:-<default OpenAI>}"
 else
-    echo "[startup] INFO: OPENAI_* not configured; Codex and Kilo can be configured interactively."
+    echo "[startup] INFO: OPENAI_* not configured; Codex, Kilo, and other OpenAI-compatible tools can be configured interactively."
 fi
 
 if command -v codex >/dev/null 2>&1; then
@@ -67,6 +78,44 @@ if command -v kilo >/dev/null 2>&1; then
     echo "[startup] kilo CLI found at: $(which kilo)"
 else
     echo "[startup] WARNING: kilo CLI not found in PATH"
+fi
+
+# ---- 统一 AI 网关 shell 环境 ----
+# Coder agent env 会传给 startup 进程；这里再写入 profile，保证用户后续打开的新 shell 也继承。
+if [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${ANTHROPIC_BASE_URL:-}" ] \
+    || [ -n "${OPENAI_API_KEY:-}" ] || [ -n "${OPENAI_BASE_URL:-}" ] \
+    || [ -n "${LITELLM_API_KEY:-}" ] || [ -n "${LITELLM_BASE_URL:-}" ]; then
+    AI_GATEWAY_PROFILE_DIR="${AI_GATEWAY_PROFILE_DIR:-/etc/profile.d}"
+    mkdir -p "$AI_GATEWAY_PROFILE_DIR"
+    AI_GATEWAY_PROFILE="$AI_GATEWAY_PROFILE_DIR/ai-gateway.sh"
+    {
+        write_export_if_set "ANTHROPIC_API_KEY" "${ANTHROPIC_API_KEY:-}"
+        write_export_if_set "ANTHROPIC_BASE_URL" "${ANTHROPIC_BASE_URL:-}"
+        write_export_if_set "OPENAI_API_KEY" "${OPENAI_API_KEY:-}"
+        write_export_if_set "OPENAI_BASE_URL" "${OPENAI_BASE_URL:-}"
+        write_export_if_set "LITELLM_API_KEY" "${LITELLM_API_KEY:-}"
+        write_export_if_set "LITELLM_BASE_URL" "${LITELLM_BASE_URL:-}"
+        printf 'export PI_OFFLINE=%s\n' "$(shell_quote "1")"
+        printf 'export PI_SKIP_VERSION_CHECK=%s\n' "$(shell_quote "1")"
+        printf 'export PI_TELEMETRY=%s\n' "$(shell_quote "0")"
+    } > "$AI_GATEWAY_PROFILE"
+
+    if ! grep -q 'ai-gateway.sh' "${HOME}/.bashrc" 2>/dev/null; then
+        cat >> "${HOME}/.bashrc" <<'BASHRC_EOF'
+
+# AI gateway defaults (added by workspace-startup.sh)
+[ -f "${AI_GATEWAY_PROFILE:-/etc/profile.d/ai-gateway.sh}" ] && . "${AI_GATEWAY_PROFILE:-/etc/profile.d/ai-gateway.sh}"
+BASHRC_EOF
+    fi
+    echo "[startup] AI gateway shell environment configured"
+else
+    echo "[startup] INFO: AI gateway env not configured; agent tools can be configured interactively."
+fi
+
+if command -v pi >/dev/null 2>&1; then
+    echo "[startup] pi CLI found at: $(which pi)"
+else
+    echo "[startup] WARNING: pi CLI not found in PATH"
 fi
 
 # ---- 2. 合并内置扩展 seed 到 extensions 目录 ----

@@ -225,6 +225,129 @@ actual="$(_template_version_name 'bad name;rm -rf /' 'workspace/image' 'tag:late
     Invoke-BashText $script | Out-Null
 }
 
+function Test-BashLlmTemplateInjectionDefaults {
+    $script = @'
+set -euo pipefail
+source scripts/manage.sh --llm __test_source_only 2>/dev/null || true
+
+root="$(mktemp -d)"
+trap 'rm -rf "$root"' EXIT
+mkdir -p "$root/configs" "$root/docker"
+cat > "$root/configs/versions.lock.env" <<EOF
+WORKSPACE_IMAGE_TAG=vtest
+EOF
+cat > "$root/docker/.env" <<EOF
+SERVER_HOST=host.test
+GATEWAY_PORT=9443
+LITELLM_MASTER_KEY=sk-test
+ANTHROPIC_API_KEY=
+ANTHROPIC_BASE_URL=
+OPENAI_API_KEY=
+OPENAI_BASE_URL=
+LITELLM_API_KEY=
+LITELLM_BASE_URL=
+EOF
+
+CONFIGS_DIR="$root/configs"
+ENV_FILE="$root/docker/.env"
+capture="$root/docker-calls.txt"
+
+docker() {
+  if [ "$1" = "exec" ] && [ "$2" = "coder-server" ] && [ "$3" = "sh" ] && [ "$4" = "-c" ]; then
+    printf '%s\n' "$5" >> "$capture"
+  fi
+}
+
+_do_push_template "session-token" "llm-defaults-test" "false" >/dev/null
+push_cmd="$(grep '/opt/coder templates push' "$capture")"
+
+case "$push_cmd" in
+  *"--var anthropic_api_key='sk-test'"*) : ;; *) echo "missing Anthropic key injection: $push_cmd" >&2; exit 1 ;;
+esac
+case "$push_cmd" in
+  *"--var anthropic_base_url='http://llm-gateway:4000'"*) : ;; *) echo "missing Anthropic URL injection: $push_cmd" >&2; exit 1 ;;
+esac
+case "$push_cmd" in
+  *"--var openai_api_key='sk-test'"*) : ;; *) echo "missing OpenAI key injection: $push_cmd" >&2; exit 1 ;;
+esac
+case "$push_cmd" in
+  *"--var openai_base_url='http://llm-gateway:4000/v1'"*) : ;; *) echo "missing OpenAI URL injection: $push_cmd" >&2; exit 1 ;;
+esac
+case "$push_cmd" in
+  *"--var litellm_api_key='sk-test'"*) : ;; *) echo "missing Pi LiteLLM key injection: $push_cmd" >&2; exit 1 ;;
+esac
+case "$push_cmd" in
+  *"--var litellm_base_url='http://llm-gateway:4000'"*) : ;; *) echo "missing Pi LiteLLM URL injection: $push_cmd" >&2; exit 1 ;;
+esac
+'@
+    Invoke-BashText $script | Out-Null
+}
+
+function Test-BashWorkspaceStartupAiGatewayProfile {
+    $script = @'
+set -euo pipefail
+
+tmp_home="$(mktemp -d)"
+tmp_profile="$(mktemp -d)"
+tmp_bin="$(mktemp -d)"
+trap 'rm -rf "$tmp_home" "$tmp_profile" "$tmp_bin"' EXIT
+
+cat > "$tmp_bin/code-server" <<'SH'
+#!/bin/sh
+if [ "$1" = "--extensions-dir" ]; then
+  exit 0
+fi
+while [ "$#" -gt 0 ]; do
+  shift
+done
+exit 0
+SH
+cat > "$tmp_bin/dumb-init" <<'SH'
+#!/bin/sh
+shift
+exec "$@"
+SH
+for cmd in claude codex kilo pi curl git; do
+  cat > "$tmp_bin/$cmd" <<'SH'
+#!/bin/sh
+exit 0
+SH
+done
+chmod +x "$tmp_bin"/*
+
+HOME="$tmp_home" \
+PATH="$tmp_bin:$PATH" \
+AI_GATEWAY_PROFILE_DIR="$tmp_profile" \
+ANTHROPIC_API_KEY='sk-ant"quoted$' \
+ANTHROPIC_BASE_URL='http://llm-gateway:4000' \
+OPENAI_API_KEY='' \
+OPENAI_BASE_URL='' \
+LITELLM_API_KEY='sk-lit`tick\slash' \
+LITELLM_BASE_URL='' \
+CODE_SERVER_EXTENSIONS_SEED="$tmp_home/no-seed" \
+bash scripts/workspace-startup.sh >/tmp/workspace-startup-test.log 2>&1
+
+profile="$tmp_profile/ai-gateway.sh"
+[ -f "$profile" ] || { echo "missing profile" >&2; cat /tmp/workspace-startup-test.log >&2; exit 1; }
+
+grep -q '^export ANTHROPIC_API_KEY=' "$profile" || { echo "missing non-empty Anthropic key export" >&2; cat "$profile" >&2; exit 1; }
+grep -q '^export LITELLM_API_KEY=' "$profile" || { echo "missing non-empty LiteLLM key export" >&2; cat "$profile" >&2; exit 1; }
+if grep -q '^export OPENAI_API_KEY=' "$profile" || grep -q '^export OPENAI_BASE_URL=' "$profile" || grep -q '^export LITELLM_BASE_URL=' "$profile"; then
+  echo "empty AI variables should not be exported" >&2
+  cat "$profile" >&2
+  exit 1
+fi
+
+set +u
+. "$profile"
+set -u
+[ "$ANTHROPIC_API_KEY" = 'sk-ant"quoted$' ] || { echo "Anthropic key was not shell-quoted safely" >&2; exit 1; }
+[ "$LITELLM_API_KEY" = 'sk-lit`tick\slash' ] || { echo "LiteLLM key was not shell-quoted safely" >&2; exit 1; }
+[ "$PI_OFFLINE" = '1' ] || { echo "Pi offline flag missing" >&2; exit 1; }
+'@
+    Invoke-BashText $script | Out-Null
+}
+
 function Test-WorkspaceAiToolingStaticContracts {
     $dockerfile = Get-Content (Join-Path $RepoRoot 'docker/Dockerfile.workspace') -Raw
     $startup = Get-Content (Join-Path $RepoRoot 'scripts/workspace-startup.sh') -Raw
@@ -236,15 +359,33 @@ function Test-WorkspaceAiToolingStaticContracts {
 
     Assert-True 'workspace image installs Codex CLI' ($dockerfile -match '@openai/codex')
     Assert-True 'workspace image installs Kilo Code CLI' ($dockerfile -match '@kilocode/cli')
+    Assert-True 'workspace image uses Node 22 for current Pi agent support' ($dockerfile -match 'ENV NODE_MAJOR=22')
+    Assert-True 'workspace image installs Pi CLI' ($dockerfile -match '@earendil-works/pi-coding-agent')
+    Assert-True 'workspace image registers Pi LiteLLM provider package' ($dockerfile -match 'pi install npm:pi-provider-litellm')
+    Assert-NotContains 'workspace image does not ignore Pi install failures' $dockerfile 'pi coding agent install failed|pi LiteLLM provider install failed'
     Assert-True 'workspace image seeds OpenAI Codex extension' ($dockerfile -match 'openai\.chatgpt')
     Assert-True 'workspace image seeds Kilo Code extension' ($dockerfile -match 'kilocode\.kilo-code')
     Assert-True 'workspace startup verifies codex CLI' ($startup -match 'command -v codex')
     Assert-True 'workspace startup verifies kilo CLI' ($startup -match 'command -v kilo')
+    Assert-True 'workspace startup verifies pi CLI' ($startup -match 'command -v pi')
+    Assert-True 'workspace startup writes unified AI gateway shell profile' (
+        $startup -match 'ai-gateway\.sh' -and
+        $startup -match 'ANTHROPIC_API_KEY' -and
+        $startup -match 'OPENAI_API_KEY' -and
+        $startup -match 'LITELLM_BASE_URL' -and
+        $startup -match 'LITELLM_API_KEY' -and
+        $startup -match 'PI_SKIP_VERSION_CHECK'
+    )
     Assert-True 'workspace template exposes OpenAI API key' ($template -match 'OPENAI_API_KEY\s*=\s*var\.openai_api_key')
     Assert-True 'workspace template exposes OpenAI base URL' ($template -match 'OPENAI_BASE_URL\s*=\s*var\.openai_base_url')
+    Assert-True 'workspace template exposes LiteLLM API key' ($template -match 'LITELLM_API_KEY\s*=\s*var\.litellm_api_key')
+    Assert-True 'workspace template exposes LiteLLM base URL' ($template -match 'LITELLM_BASE_URL\s*=\s*var\.litellm_base_url')
     Assert-True 'manage.sh passes OpenAI vars into template push' ($manageSh.Contains("--var openai_api_key='`${openai_key}'") -and $manageSh.Contains("--var openai_base_url='`${openai_url}'"))
+    Assert-True 'manage.sh passes Pi LiteLLM vars into template push' ($manageSh.Contains("--var litellm_api_key='`${litellm_key}'") -and $manageSh.Contains("--var litellm_base_url='`${litellm_url}'"))
     Assert-True 'manage.ps1 passes OpenAI vars into template push' ($managePs1.Contains("--var openai_api_key='`$openaiKey'") -and $managePs1.Contains("--var openai_base_url='`$openaiUrl'"))
-    Assert-True '.env.example documents OpenAI-compatible config for Codex/Kilo' ($envExample -match 'OPENAI_BASE_URL' -and $envExample -match 'Codex / Kilo')
+    Assert-True 'manage.ps1 passes Pi LiteLLM vars into template push' ($managePs1.Contains("--var litellm_api_key='`$litellmKey'") -and $managePs1.Contains("--var litellm_base_url='`$litellmUrl'"))
+    Assert-True '.env.example documents OpenAI-compatible config for Codex/Kilo/Pi' ($envExample -match 'OPENAI_BASE_URL' -and $envExample -match 'Codex / Kilo / Pi')
+    Assert-True '.env.example documents Pi LiteLLM auto-config' ($envExample -match 'LITELLM_BASE_URL' -and $envExample -match 'LITELLM_API_KEY')
     Assert-True 'VSIX README documents Codex and Kilo offline extension fallbacks' ($vsixReadme -match 'openai\.chatgpt' -and $vsixReadme -match 'kilocode\.kilo-code')
     Assert-True 'workspace template gates MinerU app' ($template -match 'variable "mineru_enabled"' -and $template -match 'resource "coder_app" "mineru"[\s\S]*count\s*=')
     Assert-True 'workspace template gates docconv app' ($template -match 'variable "doctools_enabled"' -and $template -match 'resource "coder_app" "docconv"[\s\S]*count\s*=')
@@ -272,6 +413,8 @@ Test-BashEffectiveConfig
 Test-ManagePowerShellStaticContracts
 Test-ManageBashAndDocsStaticContracts
 Test-BashTemplateVersionNameSanitizer
+Test-BashLlmTemplateInjectionDefaults
+Test-BashWorkspaceStartupAiGatewayProfile
 Test-WorkspaceAiToolingStaticContracts
 
 Write-Host 'upgrade script regression tests passed'

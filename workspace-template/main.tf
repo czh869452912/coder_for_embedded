@@ -144,6 +144,9 @@ resource "coder_agent" "main" {
     # OpenAI-compatible API 配置（Codex CLI / Kilo Code / OpenAI-format editor tools）
     OPENAI_API_KEY      = var.openai_api_key
     OPENAI_BASE_URL     = var.openai_base_url
+    # Pi LiteLLM provider 配置（由管理员在模板中统一设置）
+    LITELLM_API_KEY     = var.litellm_api_key
+    LITELLM_BASE_URL    = var.litellm_base_url
     # Git 用户信息（自动从 Coder 用户资料获取）
     GIT_AUTHOR_NAME     = coalesce(data.coder_workspace_owner.me.full_name, data.coder_workspace_owner.me.name)
     GIT_AUTHOR_EMAIL    = data.coder_workspace_owner.me.email
@@ -380,6 +383,17 @@ variable "openai_api_key" {
 
 variable "openai_base_url" {
   description = "OpenAI-compatible Base URL（LiteLLM 建议 http://llm-gateway:4000/v1；留空使用官方 API）"
+  default     = ""
+}
+
+variable "litellm_api_key" {
+  description = "LiteLLM API Key（Pi LiteLLM provider 使用，通常与 LITELLM_MASTER_KEY 一致）"
+  default     = ""
+  sensitive   = true
+}
+
+variable "litellm_base_url" {
+  description = "LiteLLM Base URL（Pi LiteLLM provider 使用，建议 http://llm-gateway:4000）"
   default     = ""
 }
 

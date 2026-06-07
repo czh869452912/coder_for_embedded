@@ -871,6 +871,8 @@ _do_push_template() {
     local anthropic_url="${ANTHROPIC_BASE_URL:-}"
     local openai_key="${OPENAI_API_KEY:-}"
     local openai_url="${OPENAI_BASE_URL:-}"
+    local litellm_key="${LITELLM_API_KEY:-}"
+    local litellm_url="${LITELLM_BASE_URL:-}"
 
     if [ "$USE_LLM" = true ]; then
         if [ -z "$anthropic_key" ]; then
@@ -885,13 +887,19 @@ _do_push_template() {
         if [ -z "$openai_url" ]; then
             openai_url="$(llm_gateway_url)/v1"
         fi
+        if [ -z "$litellm_key" ]; then
+            litellm_key="${LITELLM_MASTER_KEY:-}"
+        fi
+        if [ -z "$litellm_url" ]; then
+            litellm_url="$(llm_gateway_url)"
+        fi
     fi
 
     info "Pushing workspace template version ${version_name} (activate=${activate_template})"
     docker exec coder-server sh -c 'rm -rf /tmp/template-push && mkdir -p /tmp/template-push' >/dev/null
     docker cp "$template_dir/." 'coder-server:/tmp/template-push/'
 
-    docker exec coder-server sh -c "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=${token} /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate=${activate_template} --name='${version_name}' --var anthropic_api_key='${anthropic_key}' --var anthropic_base_url='${anthropic_url}' --var openai_api_key='${openai_key}' --var openai_base_url='${openai_url}' --var server_host='${SERVER_HOST:-localhost}' --var gateway_port='${GATEWAY_PORT:-8443}' --var mineru_enabled='${USE_MINERU}' --var doctools_enabled='${USE_DOCTOOLS}' --var skillhub_enabled='${USE_SKILLHUB}' ; rm -rf /tmp/template-push"
+    docker exec coder-server sh -c "CODER_URL=http://localhost:7080 CODER_SESSION_TOKEN=${token} /opt/coder templates push embedded-dev --directory /tmp/template-push --yes --activate=${activate_template} --name='${version_name}' --var anthropic_api_key='${anthropic_key}' --var anthropic_base_url='${anthropic_url}' --var openai_api_key='${openai_key}' --var openai_base_url='${openai_url}' --var litellm_api_key='${litellm_key}' --var litellm_base_url='${litellm_url}' --var server_host='${SERVER_HOST:-localhost}' --var gateway_port='${GATEWAY_PORT:-8443}' --var mineru_enabled='${USE_MINERU}' --var doctools_enabled='${USE_DOCTOOLS}' --var skillhub_enabled='${USE_SKILLHUB}' ; rm -rf /tmp/template-push"
     ok "Workspace template version pushed"
     if [ "$activate_template" != "true" ]; then
         info "Promote after validation: coder templates versions promote --template=embedded-dev --template-version=${version_name}"

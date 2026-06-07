@@ -153,7 +153,7 @@ RUN mkdir -p /opt/unity /usr/local/src \
 # ============================================================
 # Node.js + Claude Code CLI
 # 缁傝崵鍤庨弸鍕紦閿涙艾鐨?nodesource 鐎瑰顥婇弴鎸庡床娑撳搫鍞寸純?apt 濠ф劖鍨ㄦ０鍕瑓鏉炵晫娈?.deb 閸?# ============================================================
-ENV NODE_MAJOR=20
+ENV NODE_MAJOR=22
 RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -170,6 +170,10 @@ RUN npm install -g @openai/codex \
 
 RUN npm install -g @kilocode/cli \
     || echo "[WARN] kilo-code CLI install failed, skipping"
+
+RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+
+RUN PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 pi install npm:pi-provider-litellm
 
 # ============================================================
 # Ceedling 瀹撳苯鍙嗗?C 濞村鐦鍡樼仸閿涘牆瀵橀崥?Unity, CMock, CException閿?# ============================================================
