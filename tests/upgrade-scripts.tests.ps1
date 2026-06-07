@@ -215,12 +215,83 @@ function Test-ManageBashAndDocsStaticContracts {
     )
 }
 
+function Test-WorkspaceImageFamilyContracts {
+    $catalog = Get-Content (Join-Path $RepoRoot 'workspace-template/image-catalog.json') -Raw | ConvertFrom-Json
+    $profiles = @{}
+    foreach ($profile in @($catalog.profiles)) {
+        $profiles[$profile.key] = $profile
+    }
+    $lock = Get-Content (Join-Path $RepoRoot 'configs/versions.lock.env') -Raw
+    $managePs1 = Get-Content (Join-Path $RepoRoot 'scripts/manage.ps1') -Raw
+    $manageSh = Get-Content (Join-Path $RepoRoot 'scripts/manage.sh') -Raw
+
+    Assert-Equal 'catalog default remains embedded stable' $catalog.default 'embedded_stable'
+    Assert-True 'catalog contains embedded stable profile' $profiles.ContainsKey('embedded_stable')
+    Assert-True 'catalog contains Python backend stable profile' $profiles.ContainsKey('python_backend_stable')
+    Assert-True 'catalog contains agent dev stable profile' $profiles.ContainsKey('agent_dev_stable')
+
+    Assert-Equal 'embedded profile image family' $profiles['embedded_stable'].image 'workspace-embedded:embedded-v20260607-r1'
+    Assert-Equal 'Python backend profile image family' $profiles['python_backend_stable'].image 'workspace-python-backend:python-backend-v20260607-r1'
+    Assert-Equal 'agent dev profile image family' $profiles['agent_dev_stable'].image 'workspace-agent-dev:agent-dev-v20260607-r1'
+
+    Assert-True 'lock tracks Python backend image name' ($lock -match '(?m)^PYTHON_BACKEND_WORKSPACE_IMAGE=workspace-python-backend$')
+    Assert-True 'lock tracks Python backend image tag' ($lock -match '(?m)^PYTHON_BACKEND_WORKSPACE_IMAGE_TAG=python-backend-v20260607-r1$')
+    Assert-True 'lock tracks agent dev image name' ($lock -match '(?m)^AGENT_DEV_WORKSPACE_IMAGE=workspace-agent-dev$')
+    Assert-True 'lock tracks agent dev image tag' ($lock -match '(?m)^AGENT_DEV_WORKSPACE_IMAGE_TAG=agent-dev-v20260607-r1$')
+
+    Assert-True 'PowerShell declares workspace image families' ($managePs1 -match 'function Get-WorkspaceImageFamilies')
+    Assert-True 'PowerShell supports workspace image family flag' ($managePs1 -match '\[string\]\$Family')
+    Assert-True 'PowerShell prepare builds all stable workspace images' ($managePs1 -match 'foreach \(\$family in Get-WorkspaceImageFamilies\)')
+    Assert-True 'PowerShell manifest includes all stable workspace images' ($managePs1 -match 'Get-WorkspaceImageManifestEntries')
+
+    Assert-True 'Bash declares workspace image families' ($manageSh -match '_workspace_families\(\)')
+    Assert-True 'Bash supports workspace image family flag' ($manageSh -match '--family')
+    Assert-True 'Bash prepare builds all stable workspace images' ($manageSh -match 'for family in \$\(_workspace_families\)')
+    Assert-True 'Bash manifest includes all stable workspace images' ($manageSh -match '_workspace_manifest_entries')
+}
+
 function Test-BashTemplateVersionNameSanitizer {
     $script = @'
 set -euo pipefail
 source scripts/manage.sh __test_source_only 2>/dev/null || true
 actual="$(_template_version_name 'bad name;rm -rf /' 'workspace/image' 'tag:latest')"
 [ "$actual" = "bad-name-rm--rf" ] || { echo "unexpected sanitized version: $actual" >&2; exit 1; }
+'@
+    Invoke-BashText $script | Out-Null
+}
+
+function Test-BashWorkspaceImageCatalogChannels {
+    $script = @'
+set -euo pipefail
+source scripts/manage.sh __test_source_only 2>/dev/null || true
+root="$(mktemp -d)"
+trap 'rm -rf "$root"' EXIT
+WORKSPACE_IMAGE_CATALOG_FILE="$root/image-catalog.json"
+export WORKSPACE_IMAGE_CATALOG_FILE
+
+_update_workspace_image_catalog "workspace-embedded" "embedded-v20260608-r1"
+_update_workspace_image_catalog "workspace-python-backend" "python-backend-v20260608-r1"
+_update_workspace_image_catalog "workspace-agent-dev" "agent-dev-v20260608-r1"
+_update_workspace_image_catalog "workspace-ai" "ai-v20260608-r1"
+
+python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+catalog = json.loads(Path(os.environ["WORKSPACE_IMAGE_CATALOG_FILE"]).read_text(encoding="utf-8"))
+profiles = {profile["key"]: profile for profile in catalog["profiles"]}
+assert catalog["default"] == "embedded_stable", catalog
+assert profiles["embedded_stable"]["name"] == "Embedded Stable", profiles
+assert profiles["embedded_stable"]["image"] == "workspace-embedded:embedded-v20260608-r1", profiles
+assert profiles["python_backend_stable"]["name"] == "Python Backend Stable", profiles
+assert profiles["python_backend_stable"]["image"] == "workspace-python-backend:python-backend-v20260608-r1", profiles
+assert profiles["agent_dev_stable"]["name"] == "Agent Dev Stable", profiles
+assert profiles["agent_dev_stable"]["image"] == "workspace-agent-dev:agent-dev-v20260608-r1", profiles
+assert profiles["workspace_ai_ai_v20260608_r1"]["image"] == "workspace-ai:ai-v20260608-r1", profiles
+assert "workspace_python_backend_python_backend_v20260608_r1" not in profiles, profiles
+assert "workspace_agent_dev_agent_dev_v20260608_r1" not in profiles, profiles
+PY
 '@
     Invoke-BashText $script | Out-Null
 }
@@ -413,6 +484,8 @@ Test-BashEffectiveConfig
 Test-ManagePowerShellStaticContracts
 Test-ManageBashAndDocsStaticContracts
 Test-BashTemplateVersionNameSanitizer
+Test-WorkspaceImageFamilyContracts
+Test-BashWorkspaceImageCatalogChannels
 Test-BashLlmTemplateInjectionDefaults
 Test-BashWorkspaceStartupAiGatewayProfile
 Test-WorkspaceAiToolingStaticContracts
