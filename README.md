@@ -271,6 +271,8 @@ Notes:
 
 Each `manage.sh prepare` / `manage.ps1 prepare` builds the workspace image with the tag stored in `configs/versions.lock.env` (`WORKSPACE_IMAGE_TAG`). When you need to update the workspace toolchain on a running offline deployment, use the update workflow below.
 
+For the operational model behind workspace image tags, pilot releases, rollback, and multi-image planning, see **[docs/offline-image-release-management.md](docs/offline-image-release-management.md)**.
+
 ### Update Workflow
 
 **Step 1 — Build a new version on a connected machine**
@@ -379,6 +381,8 @@ bash scripts/manage.sh upgrade-restore-config <snapshot-dir>
 
 Deployment reads pinned refs from `configs/versions.lock.env`.
 
+As of 2026-06-07, the platform lock tracks GitHub latest Coder `v2.33.6` by digest, the Coder Terraform provider `2.18.0`, and workspace image tag `embedded-v20260607-r1`. These values are intentionally explicit so offline deployments do not silently follow mutable upstream tags. For production maintenance, choose the Coder release channel you want to track, then lock the selected image digest before preparing an offline bundle.
+
 Current pinned items include:
 
 - Coder runtime image
@@ -394,7 +398,7 @@ Current pinned items include:
 
 Runtime scripts read `docker/.env` for deployment-specific values and `configs/versions.lock.env` for locked image/provider versions.
 
-## Refreshing to the Latest Stable Versions
+## Refreshing Locked Versions
 
 Version refresh is an explicit maintenance step. It does not happen during deployment.
 
@@ -426,7 +430,7 @@ The refresh command:
 
 - Pulls the tagged upstream images you have chosen to track
 - Resolves their current digests
-- Queries the newest stable provider versions within the current locked major versions
+- Queries the newest stable Terraform provider versions within the current locked major versions
 - Rewrites `configs/versions.lock.env` only when you explicitly apply
 
 ## AI Gateway Setup
@@ -714,6 +718,7 @@ bash scripts/manage.sh skillhub-refresh
 - `configs/dex/config.yaml`: Dex OIDC + LDAP connector config (--ldap mode)
 - `configs/postgres/init-dex.sql`: auto-creates `dex` database on first postgres start
 - `workspace-template/main.tf`: Coder template that provisions workspace containers
+- `docs/offline-image-release-management.md`: runbook for offline workspace image release, activation, rollback, and multi-image planning
 - `docs/upgrade-in-place.md`: runbook for upgrading an existing deployment without losing users or workspace data
 - `scripts/manage.ps1`: **Windows entry point** — all commands
 - `scripts/manage.sh`: **Linux entry point** — all commands
