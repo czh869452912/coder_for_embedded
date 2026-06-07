@@ -85,9 +85,9 @@ Platform lifecycle commands:
 Workspace image version management:
   push-template [--name <name>] [--apply]
                         Push a staged Coder template version; --apply activates this push
-  update-workspace [--tag <tag>]
-                        Build a new versioned workspace image, save tar, update lock
-                        default and image catalog (tag defaults to v<YYYYMMDD>)
+  update-workspace [--family embedded|python-backend|agent-dev] [--tag <tag>]
+                        Build one workspace image family, save tar, update lock
+                        and image catalog (tag defaults to <family>-v<YYYYMMDD>-r1)
   load-workspace <tar>  Load a workspace image tar and update the image catalog
 
 In-place upgrade (preserve users + workspaces across code/image changes):
@@ -128,10 +128,10 @@ Typical offline deployment workflow:
                         # auto-runs setup-coder on first start
 
 Workspace image update workflow (online -> offline):
-  manage.sh update-workspace --tag v20240324   # on online machine
-  # transfer images/workspace-embedded_v20240324.tar + configs/versions.lock.env + workspace-template/image-catalog.json
-  manage.sh load-workspace images/workspace-embedded_v20240324.tar  # on offline server
-  manage.sh push-template --name workspace-v20240324                # stage version
+  manage.sh update-workspace --family python-backend --tag python-backend-v20260608-r1
+  # transfer images/workspace-python-backend_python-backend-v20260608-r1.tar + configs/versions.lock.env + workspace-template/image-catalog.json
+  manage.sh load-workspace images/workspace-python-backend_python-backend-v20260608-r1.tar
+  manage.sh push-template --name workspace-python-backend-v20260608-r1
   # promote in Coder UI/CLI after validation; --apply is only for an immediate active push
   # users restart their workspaces in the Coder UI after the version is promoted
 
@@ -807,9 +807,121 @@ _template_version_name() {
     _safe_template_version_name "workspace-${workspace_image}-${workspace_tag}"
 }
 
+_workspace_families() {
+    printf '%s\n' embedded python-backend agent-dev
+}
+
+_workspace_family_profile_key() {
+    case "${1:-embedded}" in
+        embedded) printf '%s\n' embedded_stable ;;
+        python-backend) printf '%s\n' python_backend_stable ;;
+        agent-dev) printf '%s\n' agent_dev_stable ;;
+        *) fail "Unknown workspace image family '$1'. Valid values: embedded, python-backend, agent-dev" ;;
+    esac
+}
+
+_workspace_family_display_name() {
+    case "${1:-embedded}" in
+        embedded) printf '%s\n' "Embedded Stable" ;;
+        python-backend) printf '%s\n' "Python Backend Stable" ;;
+        agent-dev) printf '%s\n' "Agent Dev Stable" ;;
+        *) fail "Unknown workspace image family '$1'. Valid values: embedded, python-backend, agent-dev" ;;
+    esac
+}
+
+_workspace_family_image_key() {
+    case "${1:-embedded}" in
+        embedded) printf '%s\n' WORKSPACE_IMAGE ;;
+        python-backend) printf '%s\n' PYTHON_BACKEND_WORKSPACE_IMAGE ;;
+        agent-dev) printf '%s\n' AGENT_DEV_WORKSPACE_IMAGE ;;
+        *) fail "Unknown workspace image family '$1'. Valid values: embedded, python-backend, agent-dev" ;;
+    esac
+}
+
+_workspace_family_tag_key() {
+    case "${1:-embedded}" in
+        embedded) printf '%s\n' WORKSPACE_IMAGE_TAG ;;
+        python-backend) printf '%s\n' PYTHON_BACKEND_WORKSPACE_IMAGE_TAG ;;
+        agent-dev) printf '%s\n' AGENT_DEV_WORKSPACE_IMAGE_TAG ;;
+        *) fail "Unknown workspace image family '$1'. Valid values: embedded, python-backend, agent-dev" ;;
+    esac
+}
+
+_workspace_family_default_image() {
+    case "${1:-embedded}" in
+        embedded) printf '%s\n' workspace-embedded ;;
+        python-backend) printf '%s\n' workspace-python-backend ;;
+        agent-dev) printf '%s\n' workspace-agent-dev ;;
+        *) fail "Unknown workspace image family '$1'. Valid values: embedded, python-backend, agent-dev" ;;
+    esac
+}
+
+_workspace_family_default_tag() {
+    case "${1:-embedded}" in
+        embedded) printf '%s\n' embedded-v20260607-r1 ;;
+        python-backend) printf '%s\n' python-backend-v20260607-r1 ;;
+        agent-dev) printf '%s\n' agent-dev-v20260607-r1 ;;
+        *) fail "Unknown workspace image family '$1'. Valid values: embedded, python-backend, agent-dev" ;;
+    esac
+}
+
+_workspace_family_dockerfile() {
+    case "${1:-embedded}" in
+        embedded) printf '%s\n' Dockerfile.workspace ;;
+        python-backend) printf '%s\n' Dockerfile.workspace-python-backend ;;
+        agent-dev) printf '%s\n' Dockerfile.workspace-agent-dev ;;
+        *) fail "Unknown workspace image family '$1'. Valid values: embedded, python-backend, agent-dev" ;;
+    esac
+}
+
+_workspace_family_from_image_name() {
+    case "${1:-}" in
+        workspace-embedded) printf '%s\n' embedded ;;
+        workspace-python-backend) printf '%s\n' python-backend ;;
+        workspace-agent-dev) printf '%s\n' agent-dev ;;
+        *) return 1 ;;
+    esac
+}
+
+_workspace_config_value() {
+    local key="$1"
+    local fallback="$2"
+    local value="${!key:-}"
+    if [ -n "$value" ]; then
+        printf '%s\n' "$value"
+    else
+        printf '%s\n' "$fallback"
+    fi
+}
+
+_workspace_resolved_image_name() {
+    local family="$1"
+    _workspace_config_value "$(_workspace_family_image_key "$family")" "$(_workspace_family_default_image "$family")"
+}
+
+_workspace_resolved_tag() {
+    local family="$1"
+    _workspace_config_value "$(_workspace_family_tag_key "$family")" "$(_workspace_family_default_tag "$family")"
+}
+
+_workspace_manifest_entries() {
+    load_config
+    for family in $(_workspace_families); do
+        local image_name tag
+        image_name="$(_workspace_resolved_image_name "$family")"
+        tag="$(_workspace_resolved_tag "$family")"
+        printf ',\n    {"ref": "%s:%s", "archive": "images/%s_%s.tar"}' "$image_name" "$tag" "$image_name" "$tag"
+    done
+}
+
 _workspace_image_profile_key() {
     local image_name="${1:-workspace-embedded}"
     local tag="${2:-latest}"
+    local family=""
+    if family="$(_workspace_family_from_image_name "$image_name")"; then
+        _workspace_family_profile_key "$family"
+        return 0
+    fi
     printf '%s-%s\n' "$image_name" "$tag" \
         | tr '[:upper:]' '[:lower:]' \
         | sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//'
@@ -821,7 +933,12 @@ _update_workspace_image_catalog() {
     local profile_key image_ref profile_name
     profile_key="$(_workspace_image_profile_key "$image_name" "$tag")"
     image_ref="${image_name}:${tag}"
-    profile_name="${image_name} ${tag}"
+    local family_for_name=""
+    if family_for_name="$(_workspace_family_from_image_name "$image_name")"; then
+        profile_name="$(_workspace_family_display_name "$family_for_name")"
+    else
+        profile_name="${image_name} ${tag}"
+    fi
     mkdir -p "$(dirname "$WORKSPACE_IMAGE_CATALOG_FILE")"
     CATALOG_FILE="$WORKSPACE_IMAGE_CATALOG_FILE" \
     PROFILE_KEY="$profile_key" \
@@ -851,11 +968,14 @@ for profile in profiles:
 else:
     profiles.append({"key": profile_key, "name": profile_name, "image": image_ref})
 
-catalog["default"] = profile_key
+if profile_key == "embedded_stable":
+    catalog["default"] = "embedded_stable"
+elif not catalog.get("default"):
+    catalog["default"] = profile_key
 catalog["profiles"] = sorted(profiles, key=lambda item: item.get("key", ""))
 path.write_text(json.dumps(catalog, indent=2) + "\n", encoding="utf-8")
 PY
-    ok "Registered default workspace image profile ${profile_key} -> ${image_ref}"
+    ok "Registered workspace image profile ${profile_key} -> ${image_ref}"
 }
 
 _do_push_template() {
@@ -993,28 +1113,54 @@ cmd_push_template() {
 
 # ─── update-workspace ─────────────────────────────────────────────────────────
 
-_update_lock_workspace_tag() {
-    local new_tag="$1"
+_update_lock_workspace_family() {
+    local family="$1"
+    local image_name="$2"
+    local new_tag="$3"
+    local image_key tag_key
     [ -f "$LOCK_FILE" ] || fail "versions.lock.env not found: $LOCK_FILE"
-    if grep -q '^WORKSPACE_IMAGE_TAG=' "$LOCK_FILE"; then
-        sed -i "s|^WORKSPACE_IMAGE_TAG=.*|WORKSPACE_IMAGE_TAG=${new_tag}|" "$LOCK_FILE"
+    image_key="$(_workspace_family_image_key "$family")"
+    tag_key="$(_workspace_family_tag_key "$family")"
+
+    if grep -q "^${image_key}=" "$LOCK_FILE"; then
+        sed -i "s|^${image_key}=.*|${image_key}=${image_name}|" "$LOCK_FILE"
     else
-        echo "WORKSPACE_IMAGE_TAG=${new_tag}" >> "$LOCK_FILE"
+        printf '\n%s=%s\n' "$image_key" "$image_name" >> "$LOCK_FILE"
     fi
-    ok "Updated WORKSPACE_IMAGE_TAG=${new_tag} in $(basename "$LOCK_FILE")"
+    if grep -q "^${tag_key}=" "$LOCK_FILE"; then
+        sed -i "s|^${tag_key}=.*|${tag_key}=${new_tag}|" "$LOCK_FILE"
+    else
+        printf '%s=%s\n' "$tag_key" "$new_tag" >> "$LOCK_FILE"
+    fi
+    ok "Updated ${image_key}=${image_name} and ${tag_key}=${new_tag} in $(basename "$LOCK_FILE")"
+}
+
+_new_workspace_family_tag() {
+    local family="$1"
+    local date_part
+    date_part="$(date +%Y%m%d)"
+    case "$family" in
+        embedded) printf 'embedded-v%s-r1\n' "$date_part" ;;
+        python-backend) printf 'python-backend-v%s-r1\n' "$date_part" ;;
+        agent-dev) printf 'agent-dev-v%s-r1\n' "$date_part" ;;
+        *) fail "Unknown workspace image family '$family'. Valid values: embedded, python-backend, agent-dev" ;;
+    esac
 }
 
 update_workspace() {
     local new_tag=""
+    local family="embedded"
     while [ $# -gt 0 ]; do
         case "$1" in
             --tag) shift; new_tag="${1:-}" ;;
+            --family) shift; family="${1:-embedded}" ;;
         esac
         shift
     done
 
+    _workspace_family_profile_key "$family" >/dev/null
     if [ -z "$new_tag" ]; then
-        new_tag="v$(date +%Y%m%d)"
+        new_tag="$(_new_workspace_family_tag "$family")"
         info "No tag specified, using auto-generated: $new_tag"
     fi
 
@@ -1023,13 +1169,16 @@ update_workspace() {
     [ -f "$ENV_FILE" ] || fail "Run init first."
     load_config
 
-    local image_name="${WORKSPACE_IMAGE:-workspace-embedded}"
+    local image_name dockerfile
+    image_name="$(_workspace_resolved_image_name "$family")"
+    dockerfile="$DOCKER_DIR/$(_workspace_family_dockerfile "$family")"
+    [ -f "$dockerfile" ] || fail "Workspace Dockerfile missing: $dockerfile"
 
     # Step 1: Ensure CA and build with new tag
     ensure_root_ca "$CONFIGS_DIR/ssl"
-    info "Building ${image_name}:${new_tag}"
+    info "Building ${image_name}:${new_tag} from $(basename "$dockerfile")"
     docker build \
-        -f "$DOCKER_DIR/Dockerfile.workspace" \
+        -f "$dockerfile" \
         --build-arg "CODE_SERVER_BASE_IMAGE_REF=${CODE_SERVER_BASE_IMAGE_REF}" \
         -t "${image_name}:${new_tag}" \
         "$PROJECT_ROOT"
@@ -1046,7 +1195,7 @@ update_workspace() {
 
     # Step 3: Update the bundle default and template image catalog after the
     # image artifact exists.
-    _update_lock_workspace_tag "$new_tag"
+    _update_lock_workspace_family "$family" "$image_name" "$new_tag"
     _update_workspace_image_catalog "$image_name" "$new_tag"
 
     echo
@@ -1510,19 +1659,26 @@ _prepare_build_workspace() {
     info "Pulling build base image $CODE_SERVER_BASE_IMAGE_REF"
     docker pull "$CODE_SERVER_BASE_IMAGE_REF"
 
-    local ws_image="${WORKSPACE_IMAGE:-workspace-embedded}"
-    local ws_tag="${WORKSPACE_IMAGE_TAG:-latest}"
-    info "Building ${ws_image}:${ws_tag}"
-    docker build \
-        -f "$DOCKER_DIR/Dockerfile.workspace" \
-        --build-arg "CODE_SERVER_BASE_IMAGE_REF=${CODE_SERVER_BASE_IMAGE_REF}" \
-        -t "${ws_image}:${ws_tag}" \
-        "$PROJECT_ROOT"
+    for family in $(_workspace_families); do
+        local ws_image ws_tag ws_dockerfile tar_file
+        ws_image="$(_workspace_resolved_image_name "$family")"
+        ws_tag="$(_workspace_resolved_tag "$family")"
+        ws_dockerfile="$DOCKER_DIR/$(_workspace_family_dockerfile "$family")"
+        [ -f "$ws_dockerfile" ] || fail "Workspace Dockerfile missing: $ws_dockerfile"
 
-    local tar_file="$IMAGES_DIR/${ws_image}_${ws_tag}.tar"
-    info "Saving ${ws_image}:${ws_tag} -> $(basename "$tar_file")"
-    docker save -o "$tar_file" "${ws_image}:${ws_tag}"
-    ok "Saved $(basename "$tar_file")"
+        info "Building ${ws_image}:${ws_tag} from $(basename "$ws_dockerfile")"
+        docker build \
+            -f "$ws_dockerfile" \
+            --build-arg "CODE_SERVER_BASE_IMAGE_REF=${CODE_SERVER_BASE_IMAGE_REF}" \
+            -t "${ws_image}:${ws_tag}" \
+            "$PROJECT_ROOT"
+
+        tar_file="$IMAGES_DIR/${ws_image}_${ws_tag}.tar"
+        info "Saving ${ws_image}:${ws_tag} -> $(basename "$tar_file")"
+        docker save -o "$tar_file" "${ws_image}:${ws_tag}"
+        ok "Saved $(basename "$tar_file")"
+        _update_workspace_image_catalog "$ws_image" "$ws_tag"
+    done
 }
 
 _prepare_write_manifest() {
@@ -1537,9 +1693,8 @@ PY
 )"
     fi
 
-    local ws_image="${WORKSPACE_IMAGE:-workspace-embedded}"
-    local ws_tag="${WORKSPACE_IMAGE_TAG:-latest}"
-    local ws_tar="${ws_image}_${ws_tag}.tar"
+    local workspace_entries
+    workspace_entries="$(_workspace_manifest_entries)"
     local coder_tar postgres_tar nginx_tar
     coder_tar="$(printf '%s' "$CODER_IMAGE_REF" | tr '/:@' '_').tar"
     postgres_tar="$(printf '%s' "$POSTGRES_IMAGE_REF" | tr '/:@' '_').tar"
@@ -1597,8 +1752,7 @@ PY
   "images": [
     {"ref": "${CODER_IMAGE_REF}", "archive": "images/${coder_tar}"},
     {"ref": "${POSTGRES_IMAGE_REF}", "archive": "images/${postgres_tar}"},
-    {"ref": "${NGINX_IMAGE_REF}", "archive": "images/${nginx_tar}"},
-    {"ref": "${ws_image}:${ws_tag}", "archive": "images/${ws_tar}"}${llm_entry}${dex_entry}${mineru_entry}${docconv_entry}${skillhub_entry}
+    {"ref": "${NGINX_IMAGE_REF}", "archive": "images/${nginx_tar}"}${workspace_entries}${llm_entry}${dex_entry}${mineru_entry}${docconv_entry}${skillhub_entry}
   ],
   "providers": [
     {"source": "registry.terraform.io/coder/coder", "version": "${TF_PROVIDER_CODER_VERSION}", "archive": "configs/provider-mirror/registry.terraform.io/coder/coder/${TF_PROVIDER_CODER_VERSION}/linux_amd64/terraform-provider-coder_${TF_PROVIDER_CODER_VERSION}_linux_amd64.zip"},

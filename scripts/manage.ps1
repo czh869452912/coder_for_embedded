@@ -11,6 +11,7 @@ param(
     [switch]$Doctools,
     [switch]$SkillHub,
     [string]$Tag = "",
+    [string]$Family = "embedded",
     [string]$Name = "",
     [switch]$Apply,
     [switch]$RequireLlm,
@@ -885,12 +886,103 @@ function Get-TemplateVersionName {
     return ConvertTo-SafeTemplateVersionName -Name $raw
 }
 
+function Get-WorkspaceImageFamilies {
+    return @(
+        [pscustomobject]@{
+            Family       = 'embedded'
+            ProfileKey   = 'embedded_stable'
+            DisplayName  = 'Embedded Stable'
+            ImageKey     = 'WORKSPACE_IMAGE'
+            TagKey       = 'WORKSPACE_IMAGE_TAG'
+            DefaultImage = 'workspace-embedded'
+            DefaultTag   = 'embedded-v20260607-r1'
+            Dockerfile   = 'Dockerfile.workspace'
+        },
+        [pscustomobject]@{
+            Family       = 'python-backend'
+            ProfileKey   = 'python_backend_stable'
+            DisplayName  = 'Python Backend Stable'
+            ImageKey     = 'PYTHON_BACKEND_WORKSPACE_IMAGE'
+            TagKey       = 'PYTHON_BACKEND_WORKSPACE_IMAGE_TAG'
+            DefaultImage = 'workspace-python-backend'
+            DefaultTag   = 'python-backend-v20260607-r1'
+            Dockerfile   = 'Dockerfile.workspace-python-backend'
+        },
+        [pscustomobject]@{
+            Family       = 'agent-dev'
+            ProfileKey   = 'agent_dev_stable'
+            DisplayName  = 'Agent Dev Stable'
+            ImageKey     = 'AGENT_DEV_WORKSPACE_IMAGE'
+            TagKey       = 'AGENT_DEV_WORKSPACE_IMAGE_TAG'
+            DefaultImage = 'workspace-agent-dev'
+            DefaultTag   = 'agent-dev-v20260607-r1'
+            Dockerfile   = 'Dockerfile.workspace-agent-dev'
+        }
+    )
+}
+
+function Get-WorkspaceImageFamily {
+    param([string]$Family)
+    $normalized = if ($Family) { $Family.ToLowerInvariant() } else { 'embedded' }
+    foreach ($item in Get-WorkspaceImageFamilies) {
+        if ($item.Family -eq $normalized) { return $item }
+    }
+    $valid = ((Get-WorkspaceImageFamilies | ForEach-Object { $_.Family }) -join ', ')
+    Write-Fail "Unknown workspace image family '$Family'. Valid values: $valid"
+    exit 1
+}
+
+function Resolve-WorkspaceImageFamily {
+    param(
+        [object]$FamilySpec,
+        [hashtable]$Config
+    )
+    $imageName = if ($Config[$FamilySpec.ImageKey]) { $Config[$FamilySpec.ImageKey] } else { $FamilySpec.DefaultImage }
+    $tag = if ($Config[$FamilySpec.TagKey]) { $Config[$FamilySpec.TagKey] } else { $FamilySpec.DefaultTag }
+    return [pscustomobject]@{
+        Family      = $FamilySpec.Family
+        ProfileKey  = $FamilySpec.ProfileKey
+        DisplayName = $FamilySpec.DisplayName
+        ImageName   = $imageName
+        Tag         = $tag
+        Dockerfile  = $FamilySpec.Dockerfile
+    }
+}
+
+function Get-WorkspaceImageManifestEntries {
+    param([hashtable]$Config)
+    $entries = @()
+    foreach ($family in Get-WorkspaceImageFamilies) {
+        $resolved = Resolve-WorkspaceImageFamily -FamilySpec $family -Config $Config
+        $entries += [ordered]@{
+            ref     = "$($resolved.ImageName):$($resolved.Tag)"
+            archive = "images/$($resolved.ImageName)_$($resolved.Tag).tar"
+        }
+    }
+    return $entries
+}
+
 function Get-WorkspaceImageProfileKey {
     param(
         [string]$ImageName,
         [string]$Tag
     )
+    foreach ($family in Get-WorkspaceImageFamilies) {
+        if ($ImageName -eq $family.DefaultImage) { return $family.ProfileKey }
+    }
     return (($ImageName + '-' + $Tag).ToLowerInvariant() -replace '[^a-z0-9]+', '_').Trim('_')
+}
+
+function Get-WorkspaceImageProfileName {
+    param(
+        [string]$ImageName,
+        [string]$Tag,
+        [string]$ProfileKey
+    )
+    foreach ($family in Get-WorkspaceImageFamilies) {
+        if ($ProfileKey -eq $family.ProfileKey) { return $family.DisplayName }
+    }
+    return "${ImageName} ${Tag}"
 }
 
 function Update-WorkspaceImageCatalog {
@@ -903,7 +995,7 @@ function Update-WorkspaceImageCatalog {
 
     $profileKey = Get-WorkspaceImageProfileKey -ImageName $ImageName -Tag $Tag
     $imageRef = "${ImageName}:${Tag}"
-    $profileName = "${ImageName} ${Tag}"
+    $profileName = Get-WorkspaceImageProfileName -ImageName $ImageName -Tag $Tag -ProfileKey $profileKey
 
     if (Test-Path $WorkspaceImageCatalogFile) {
         $catalog = Get-Content $WorkspaceImageCatalogFile -Raw | ConvertFrom-Json
@@ -927,14 +1019,21 @@ function Update-WorkspaceImageCatalog {
         }
     }
 
+    $defaultProfileKey = if ($profileKey -eq 'embedded_stable') {
+        'embedded_stable'
+    } elseif ($catalog.default) {
+        $catalog.default
+    } else {
+        $profileKey
+    }
     $catalog = [pscustomobject]@{
-        default  = $profileKey
+        default  = $defaultProfileKey
         profiles = @($profiles | Sort-Object key)
     }
     New-Item -ItemType Directory -Path (Split-Path -Parent $WorkspaceImageCatalogFile) -Force | Out-Null
     $json = $catalog | ConvertTo-Json -Depth 8
     [System.IO.File]::WriteAllText($WorkspaceImageCatalogFile, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
-    Write-OK "Registered default workspace image profile ${profileKey} -> ${imageRef}"
+    Write-OK "Registered workspace image profile ${profileKey} -> ${imageRef}"
     return $profileKey
 }
 
@@ -1689,23 +1788,47 @@ function Invoke-CmdPushTemplate {
 
 # ─── update-workspace ─────────────────────────────────────────────────────────
 
-function Update-LockWorkspaceTag {
-    param([string]$NewTag)
+function Update-LockWorkspaceFamily {
+    param(
+        [object]$FamilySpec,
+        [string]$ImageName,
+        [string]$NewTag
+    )
     $lockContent = Get-Content $LockFile -Raw
-    if ($lockContent -match 'WORKSPACE_IMAGE_TAG=') {
-        $lockContent = $lockContent -replace 'WORKSPACE_IMAGE_TAG=.*', "WORKSPACE_IMAGE_TAG=$NewTag"
-    } else {
-        $lockContent += "`r`nWORKSPACE_IMAGE_TAG=$NewTag"
+    foreach ($pair in @(
+        @{ Key = $FamilySpec.ImageKey; Value = $ImageName },
+        @{ Key = $FamilySpec.TagKey; Value = $NewTag }
+    )) {
+        if ($lockContent -match "(?m)^$($pair.Key)=") {
+            $lockContent = $lockContent -replace "(?m)^$($pair.Key)=.*", "$($pair.Key)=$($pair.Value)"
+        } else {
+            $lockContent += "`r`n$($pair.Key)=$($pair.Value)"
+        }
     }
     [System.IO.File]::WriteAllText($LockFile, $lockContent, [System.Text.UTF8Encoding]::new($false))
-    Write-OK "Updated WORKSPACE_IMAGE_TAG=$NewTag in versions.lock.env"
+    Write-OK "Updated $($FamilySpec.ImageKey)=$ImageName and $($FamilySpec.TagKey)=$NewTag in versions.lock.env"
+}
+
+function New-WorkspaceFamilyTag {
+    param([object]$FamilySpec)
+    $date = Get-Date -Format 'yyyyMMdd'
+    switch ($FamilySpec.Family) {
+        'embedded'       { return "embedded-v${date}-r1" }
+        'python-backend' { return "python-backend-v${date}-r1" }
+        'agent-dev'      { return "agent-dev-v${date}-r1" }
+        default          { return "workspace-v${date}-r1" }
+    }
 }
 
 function Invoke-UpdateWorkspace {
-    param([string]$NewTag = '')
+    param(
+        [string]$NewTag = '',
+        [string]$FamilyName = 'embedded'
+    )
 
+    $familySpec = Get-WorkspaceImageFamily -Family $FamilyName
     if (-not $NewTag) {
-        $NewTag = "v$(Get-Date -Format 'yyyyMMdd')"
+        $NewTag = New-WorkspaceFamilyTag -FamilySpec $familySpec
         Write-Info "No tag specified, using auto-generated: $NewTag"
     }
 
@@ -1713,14 +1836,17 @@ function Invoke-UpdateWorkspace {
     Initialize-Dirs
     if (-not (Test-Path $EnvFile)) { Write-Fail 'Run init first.'; exit 1 }
     $cfg = Get-Config
-    $imageName = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
+    $resolved = Resolve-WorkspaceImageFamily -FamilySpec $familySpec -Config $cfg
+    $imageName = $resolved.ImageName
 
     # Step 1: Ensure CA and build
     $sslDir = Join-Path $ConfigsDir 'ssl'
     Ensure-RootCA -SslDir $sslDir | Out-Null
     $codeServerBase = $cfg['CODE_SERVER_BASE_IMAGE_REF']
-    Write-Info "Building ${imageName}:${NewTag}"
-    docker build -f "$DockerDir\Dockerfile.workspace" --build-arg "CODE_SERVER_BASE_IMAGE_REF=$codeServerBase" -t "${imageName}:${NewTag}" $ProjectRoot
+    $dockerfile = Join-Path $DockerDir $familySpec.Dockerfile
+    if (-not (Test-Path $dockerfile)) { Write-Fail "Workspace Dockerfile missing: $dockerfile"; exit 1 }
+    Write-Info "Building ${imageName}:${NewTag} from $($familySpec.Dockerfile)"
+    docker build -f $dockerfile --build-arg "CODE_SERVER_BASE_IMAGE_REF=$codeServerBase" -t "${imageName}:${NewTag}" $ProjectRoot
     if ($LASTEXITCODE -ne 0) { Write-Fail 'Workspace image build failed.'; exit 1 }
     Write-OK "Built ${imageName}:${NewTag}"
 
@@ -1735,13 +1861,13 @@ function Invoke-UpdateWorkspace {
 
     # Step 3: Update the bundle default and template image catalog after the
     # image artifact exists.
-    Update-LockWorkspaceTag -NewTag $NewTag
+    Update-LockWorkspaceFamily -FamilySpec $familySpec -ImageName $imageName -NewTag $NewTag
     Update-WorkspaceImageCatalog -ImageName $imageName -Tag $NewTag | Out-Null
 
     Write-Host ''
     Write-OK "Workspace image prepared: ${imageName}:${NewTag}"
     Write-Info "Transfer $(Split-Path $tarFile -Leaf), configs\versions.lock.env, and workspace-template\image-catalog.json to the offline server."
-    Write-Info "Then run: .\scripts\manage.ps1 load-workspace -Arg1 $(Split-Path $tarFile -Leaf)"
+    Write-Info "Then run: .\scripts\manage.ps1 load-workspace $(Split-Path $tarFile -Leaf)"
     Write-Info "Publish as a staged Coder version: .\scripts\manage.ps1 push-template -Name workspace-${NewTag}"
     Write-Info "Promote after validation in the Coder UI or with: coder templates versions promote --template=embedded-dev --template-version=workspace-${NewTag}"
 }
@@ -1899,12 +2025,10 @@ function Invoke-PrepareSavePlatformImages {
 }
 
 function Invoke-PrepareBuildWorkspace {
-    Write-Info '=== Step 3: Building and saving workspace image ==='
+    Write-Info '=== Step 3: Building and saving workspace images ==='
     $cfg = Get-Config
     $sslDir = Join-Path $ConfigsDir 'ssl'
     $serverHost = if ($cfg['SERVER_HOST']) { $cfg['SERVER_HOST'] } else { 'localhost' }
-    $workspaceImage = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
-    $workspaceTag   = if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
 
     if (-not (Test-Path (Join-Path $sslDir 'ca.crt')) -or -not (Test-Path (Join-Path $sslDir 'server.crt'))) {
         Write-Warn 'Missing CA or leaf certificate. Generating them now.'
@@ -1915,31 +2039,37 @@ function Invoke-PrepareBuildWorkspace {
     docker pull $cfg['CODE_SERVER_BASE_IMAGE_REF']
     if ($LASTEXITCODE -ne 0) { Write-Fail 'Failed to pull code-server base image'; exit 1 }
 
-    Write-Info "Building ${workspaceImage}:${workspaceTag}"
-    docker build -f "$DockerDir\Dockerfile.workspace" --build-arg "CODE_SERVER_BASE_IMAGE_REF=$($cfg['CODE_SERVER_BASE_IMAGE_REF'])" -t "${workspaceImage}:${workspaceTag}" $ProjectRoot
-    if ($LASTEXITCODE -ne 0) { Write-Fail 'Workspace image build failed'; exit 1 }
-
     New-Item -ItemType Directory -Path $ImagesDir -Force | Out-Null
-    $tarFile = Join-Path $ImagesDir "${workspaceImage}_${workspaceTag}.tar"
-    Write-Info "Saving ${workspaceImage}:${workspaceTag} -> $(Split-Path $tarFile -Leaf)"
-    docker save "${workspaceImage}:${workspaceTag}" -o $tarFile
-    if ($LASTEXITCODE -ne 0) { Write-Fail 'Failed to save workspace image'; exit 1 }
-    Write-OK "Saved $(Split-Path $tarFile -Leaf)"
+    foreach ($family in Get-WorkspaceImageFamilies) {
+        $resolved = Resolve-WorkspaceImageFamily -FamilySpec $family -Config $cfg
+        $dockerfile = Join-Path $DockerDir $resolved.Dockerfile
+        if (-not (Test-Path $dockerfile)) { Write-Fail "Workspace Dockerfile missing: $dockerfile"; exit 1 }
+
+        Write-Info "Building $($resolved.ImageName):$($resolved.Tag) from $($resolved.Dockerfile)"
+        docker build -f $dockerfile --build-arg "CODE_SERVER_BASE_IMAGE_REF=$($cfg['CODE_SERVER_BASE_IMAGE_REF'])" -t "$($resolved.ImageName):$($resolved.Tag)" $ProjectRoot
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Workspace image build failed: $($resolved.ImageName):$($resolved.Tag)"; exit 1 }
+
+        $tarFile = Join-Path $ImagesDir "$($resolved.ImageName)_$($resolved.Tag).tar"
+        Write-Info "Saving $($resolved.ImageName):$($resolved.Tag) -> $(Split-Path $tarFile -Leaf)"
+        docker save "$($resolved.ImageName):$($resolved.Tag)" -o $tarFile
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Failed to save workspace image: $($resolved.ImageName):$($resolved.Tag)"; exit 1 }
+        Write-OK "Saved $(Split-Path $tarFile -Leaf)"
+        Update-WorkspaceImageCatalog -ImageName $resolved.ImageName -Tag $resolved.Tag | Out-Null
+    }
 }
 
 function Invoke-PrepareWriteManifest {
     $cfg = Get-Config
     $caCert = Join-Path $ConfigsDir 'ssl\ca.crt'
-    $wsImage = if ($cfg['WORKSPACE_IMAGE']) { $cfg['WORKSPACE_IMAGE'] } else { 'workspace-embedded' }
-    $wsTag   = if ($cfg['WORKSPACE_IMAGE_TAG']) { $cfg['WORKSPACE_IMAGE_TAG'] } else { 'latest' }
+    $workspaceImageEntries = Get-WorkspaceImageManifestEntries -Config $cfg
 
     $imageEntry = { param([string]$Ref) [ordered]@{ ref = $Ref; archive = "images/$(($Ref -replace '[:/@]','_') + '.tar')" } }
     $images = @(
         (& $imageEntry $cfg['CODER_IMAGE_REF']),
         (& $imageEntry $cfg['POSTGRES_IMAGE_REF']),
-        (& $imageEntry $cfg['NGINX_IMAGE_REF']),
-        [ordered]@{ ref = "${wsImage}:${wsTag}"; archive = "images/${wsImage}_${wsTag}.tar" }
+        (& $imageEntry $cfg['NGINX_IMAGE_REF'])
     )
+    $images += $workspaceImageEntries
     if ($script:UseLlm)      { $images += (& $imageEntry $cfg['LITELLM_IMAGE_REF']) }
     if ($script:UseLdap)     { $images += (& $imageEntry $cfg['DEX_IMAGE_REF']) }
     if ($script:UseMineru)   { $images += (& $imageEntry $cfg['MINERU_IMAGE_REF']) }
@@ -2198,8 +2328,8 @@ function Show-Help {
         '  clean                       Clean Docker build cache',
         '',
         'Workspace image versioning:',
-        '  update-workspace [-Tag v]   Build versioned workspace image, save tar, update catalog',
-        '                              Auto-generates tag v<YYYYMMDD> when -Tag is omitted',
+        '  update-workspace [-Family embedded|python-backend|agent-dev] [-Tag v]',
+        '                              Build one workspace image family, save tar, update catalog',
         '  load-workspace <tar>        (Offline server) Load workspace tar and update image catalog',
         '',
         'In-place upgrade (preserve users + workspaces across code/image changes):',
@@ -2232,6 +2362,7 @@ function Show-Help {
         '                Uses pandoc --server (port 3030), supports mathml + xelatex',
         '  -SkillHub     Enable Skill Hub marketplace + PyPI mirror (--profile skillhub)',
         '                Requires Skill Hub images/packages to be prepared first',
+        '  -Family <f>   Workspace image family for update-workspace: embedded, python-backend, agent-dev',
         '  -Tag <v>      Workspace image tag for update-workspace',
         '  -Name <n>     Coder template version name for push-template',
         '  -Apply        Write version locks (refresh-versions) or activate template (push-template)',
@@ -2254,11 +2385,11 @@ function Show-Help {
         '',
         'Workspace update workflow:',
         '  # [Online] build and save new version',
-        '  .\scripts\manage.ps1 update-workspace -Tag v20240324',
-        '  # Transfer images\workspace-embedded_v20240324.tar + configs\versions.lock.env + workspace-template\image-catalog.json',
+        '  .\scripts\manage.ps1 update-workspace -Family python-backend -Tag python-backend-v20260608-r1',
+        '  # Transfer images\workspace-python-backend_python-backend-v20260608-r1.tar + configs\versions.lock.env + workspace-template\image-catalog.json',
         '  # [Offline server] load image and stage a new template version',
-        '  .\scripts\manage.ps1 load-workspace images\workspace-embedded_v20240324.tar',
-        '  .\scripts\manage.ps1 push-template -Name workspace-v20240324',
+        '  .\scripts\manage.ps1 load-workspace images\workspace-python-backend_python-backend-v20260608-r1.tar',
+        '  .\scripts\manage.ps1 push-template -Name workspace-python-backend-v20260608-r1',
         '  # Promote in Coder UI/CLI after validation, or use -Apply only for an immediate active push',
         '  # Users stop and restart their workspaces after the version is promoted',
         '',
@@ -2291,8 +2422,8 @@ switch ($Command.ToLower()) {
     'shell'            { Invoke-Shell; break }
     'setup-coder'      { Invoke-SetupCoder; break }
     'push-template'    { Invoke-CmdPushTemplate; break }
-    'update-workspace'      { Invoke-UpdateWorkspace -NewTag $Tag; break }
-    'load-workspace'        { Invoke-LoadWorkspace -TarFile $Arg1; break }
+    'update-workspace'      { Invoke-UpdateWorkspace -NewTag $Tag -FamilyName $Family; break }
+    'load-workspace'        { Invoke-LoadWorkspace -TarPath $Arg1; break }
     'upgrade-backup'        { Invoke-UpgradeBackup; break }
     'upgrade-restore-config'{ Invoke-UpgradeRestoreConfig -SnapshotDir $Arg1; break }
     'prepare'               { Invoke-Prepare; break }
