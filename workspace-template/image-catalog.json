@@ -5,6 +5,16 @@
       "key": "embedded_stable",
       "name": "Embedded Stable",
       "image": "workspace-embedded:embedded-v20260607-r1"
+    },
+    {
+      "key": "python_backend_stable",
+      "name": "Python Backend Stable",
+      "image": "workspace-python-backend:python-backend-v20260607-r1"
+    },
+    {
+      "key": "agent_dev_stable",
+      "name": "Agent Dev Stable",
+      "image": "workspace-agent-dev:agent-dev-v20260607-r1"
     }
   ]
 }
