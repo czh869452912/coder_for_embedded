@@ -28,6 +28,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Claude Code local permissions (machine-specific)
+.claude/settings.local.json
+
 # Python
 __pycache__/
 *.pyc
